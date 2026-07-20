@@ -13,7 +13,8 @@ import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.FullBlockApplie
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.LocallyGeneratedTransaction
 import org.ergoplatform.nodeView.ErgoReadersHolder.{GetReaders, Readers}
 import org.ergoplatform.nodeView.history.ErgoHistoryReader
-import org.ergoplatform.nodeView.state.StateType
+import org.ergoplatform.nodeView.mempool.ErgoMemPool
+import org.ergoplatform.nodeView.state.{StateType, UtxoStateReader}
 import org.ergoplatform.nodeView.{ErgoNodeViewRef, ErgoReadersHolderRef}
 import org.ergoplatform.settings.NetworkType.DevNet60
 import org.ergoplatform.settings.{ErgoSettings, ErgoSettingsReader}
@@ -255,6 +256,132 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
             regeneratedCandidate.candidateBlock shouldNot be(
               candidate.candidateBlock
             )
+        }
+    }
+    system.terminate()
+  }
+
+  it should "flag an emission-only candidate for regeneration only while the mempool has txs it lacks" in new TestKit(
+    ActorSystem()
+  ) {
+    // exercises the decision predicate directly (no actor) via the pure `generateCandidate`
+    val viewHolderRef: ActorRef    = ErgoNodeViewRef(defaultSettings)
+    val readersHolderRef: ActorRef = ErgoReadersHolderRef(viewHolderRef)
+
+    // Build a real emission-only candidate against an empty mempool.
+    val (candidate, utxoReader) = eventually {
+      val readers = await((readersHolderRef ? GetReaders).mapTo[Readers])
+      val s       = readers.s.asInstanceOf[UtxoStateReader]
+      val gen = CandidateGenerator.generateCandidate(
+        readers.h, s, readers.m, defaultMinerSecret.publicImage, Seq.empty, defaultSettings
+      )
+      gen.map(_.get._1).map(c => (c, s)).getOrElse(fail("chain not synced yet"))
+    }
+
+    // an emission-only candidate carries only node-synthesized txs, none of which are in the mempool
+    candidate.candidateBlock.transactions should not be empty
+
+    val emptyMp = ErgoMemPool.empty(defaultSettings)
+
+    // a stranger tx (not in the candidate) makes the mempool non-empty -> regeneration is flagged
+    val strangerTx = ErgoTransaction(
+      IndexedSeq(new Input(utxoReader.emissionBoxOpt.get.id, emptyProverResult)),
+      IndexedSeq(new ErgoBoxCandidate(1000000L, ErgoTree.fromSigmaBoolean(defaultMinerSecret.publicImage), 1))
+    )
+    val mpWithStranger = emptyMp.put(UnconfirmedTransaction(strangerTx, None))
+    mpWithStranger.size shouldBe 1
+    CandidateGenerator.candidateMissesMempoolTxs(Some(candidate), None, mpWithStranger) shouldBe true
+
+    // empty mempool -> not flagged
+    CandidateGenerator.candidateMissesMempoolTxs(Some(candidate), None, emptyMp) shouldBe false
+
+    // a mempool that already contains one of the candidate's txs -> not flagged (candidate is not empty)
+    val candTx = candidate.candidateBlock.transactions.head
+    val mpWithCandidateTx = emptyMp.put(UnconfirmedTransaction(candTx, None))
+    CandidateGenerator.candidateMissesMempoolTxs(Some(candidate), None, mpWithCandidateTx) shouldBe false
+
+    // no cached candidate -> not flagged
+    CandidateGenerator.candidateMissesMempoolTxs(None, None, mpWithStranger) shouldBe false
+
+    system.terminate()
+  }
+
+  it should "regenerate empty candidate on mempool change without waiting out the generation interval" in new TestKit(
+    ActorSystem()
+  ) {
+    val testProbe = new TestProbe(system)
+    system.eventStream.subscribe(testProbe.ref, newBlockSignal)
+
+    // at the DEFAULT 60s interval the old age-only gate would not regenerate the emission-only
+    // candidate; the fix regenerates as soon as the mempool holds a tx the candidate lacks
+    defaultSettings.nodeSettings.blockCandidateGenerationInterval shouldBe 60.seconds
+
+    val viewHolderRef: ActorRef    = ErgoNodeViewRef(defaultSettings)
+    val readersHolderRef: ActorRef = ErgoReadersHolderRef(viewHolderRef)
+
+    val candidateGenerator: ActorRef =
+      CandidateGenerator(
+        defaultMinerSecret.publicImage,
+        readersHolderRef,
+        viewHolderRef,
+        defaultSettings
+      )
+
+    val readers: Readers = await((readersHolderRef ? GetReaders).mapTo[Readers])
+
+    // generate block to use reward as our tx input
+    candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false), testProbe.ref)
+    testProbe.expectMsgPF(candidateGenDelay) {
+      case StatusReply.Success(candidate: Candidate) =>
+        val block = defaultSettings.chainSettings.powScheme
+          .proveCandidate(candidate.candidateBlock, defaultMinerSecret.w, 0, 1000)
+          .get
+        candidateGenerator.tell(block.header.powSolution, testProbe.ref)
+        // we fish either for ack or SSM as the order is non-deterministic
+        testProbe.fishForMessage(blockValidationDelay) {
+          case StatusReply.Success(()) =>
+            testProbe.expectMsgPF(candidateGenDelay) {
+              case FullBlockApplied(header) if header.id != block.header.parentId =>
+            }
+            true
+          case FullBlockApplied(header) if header.id != block.header.parentId =>
+            testProbe.expectMsg(StatusReply.Success(()))
+            true
+        }
+    }
+
+    // build new transaction that uses miner's reward as input
+    val prop: ProveDlog =
+      DLogProverInput(BigIntegers.fromUnsignedByteArray("test".getBytes())).publicImage
+    val newlyMinedBlock    = readers.h.bestFullBlockOpt.get
+    val rewardBox: ErgoBox = newlyMinedBlock.transactions.last.outputs.last
+    val input = Input(rewardBox.id, emptyProverResult)
+    val outputs = IndexedSeq(
+      new ErgoBoxCandidate(rewardBox.value, ErgoTree.fromSigmaBoolean(prop), readers.s.stateContext.currentHeight)
+    )
+    val unsignedTx = new UnsignedErgoTransaction(IndexedSeq(input), IndexedSeq(), outputs)
+    val tx = ErgoTransaction(
+      defaultProver
+        .sign(unsignedTx, IndexedSeq(rewardBox), IndexedSeq(), readers.s.stateContext)
+        .get
+    )
+
+    // fetch the current (emission-only) candidate; it must not contain our tx yet
+    candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false), testProbe.ref)
+    testProbe.expectMsgPF(candidateGenDelay) {
+      case StatusReply.Success(candidate: Candidate) =>
+        candidate.candidateBlock.transactions.map(_.id) shouldNot contain(tx.id)
+
+        // this triggers a mempool change; the fix must regenerate the candidate immediately, well
+        // within the 60s interval
+        viewHolderRef ! LocallyGeneratedTransaction(UnconfirmedTransaction(tx, None))
+        expectNoMessage(candidateGenDelay)
+
+        candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false), testProbe.ref)
+        testProbe.expectMsgPF(candidateGenDelay) {
+          case StatusReply.Success(regeneratedCandidate: Candidate) =>
+            // regenerated candidate now includes the new mempool transaction
+            regeneratedCandidate.candidateBlock.transactions.map(_.id) should contain(tx.id)
         }
     }
     system.terminate()
