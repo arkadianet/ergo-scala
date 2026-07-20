@@ -14,6 +14,7 @@ import org.ergoplatform.validation.MalformedModifierError
 import scorex.crypto.authds.avltree.batch.{Lookup, PersistentBatchAVLProver, VersionedLDBAVLStorage}
 import scorex.crypto.authds.{ADDigest, ADKey, SerializedAdProof}
 import scorex.crypto.hash.Digest32
+import scorex.db.ByteArrayWrapper
 
 import scala.util.{Failure, Success, Try}
 
@@ -181,6 +182,18 @@ trait UtxoStateReader extends ErgoStateReader with UtxoSetSnapshotPersistence {
 
       override def boxById(id: ADKey): Option[ErgoBox] = {
         super.boxById(id).orElse(createdBoxes.find(box => box.id.sameElements(id)))
+      }
+    }
+  }
+
+  /**
+    * Producing a copy of the state whose `boxById` also resolves boxes from `createdBoxes`,
+    * a map-backed overlay of transaction outputs keyed by box id (persisted state takes precedence).
+    */
+  def withCreatedBoxes(createdBoxes: Map[ByteArrayWrapper, ErgoBox]): UtxoState = {
+    new UtxoState(persistentProver, version, store, ergoSettings) {
+      override def boxById(id: ADKey): Option[ErgoBox] = {
+        super.boxById(id).orElse(createdBoxes.get(ByteArrayWrapper(id)))
       }
     }
   }

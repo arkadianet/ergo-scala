@@ -197,6 +197,41 @@ class CandidateGeneratorPropSpec extends ErgoCorePropertyTest {
 
   }
 
+  property("should collect dependent (chained) transactions in dependency order") {
+    val bh       = boxesHolderGen.sample.get
+    val rnd      = new RandomWrapper
+    val us       = createUtxoState(bh, parameters)
+    val minValue = BoxUtils.sufficientAmount(parameters)
+    val input    = bh.boxes.values.toIndexedSeq.filter(_.value >= minValue * 4).last
+
+    // tx2 spends an output of tx1 (only available via the in-block overlay) and pays a fee
+    val tx1 = validTransactionFromBoxes(IndexedSeq(input), rnd, issueNew = false)
+    val tx2 = validTransactionFromBoxes(tx1.outputs, rnd, issueNew = false, feeProp)
+
+    val h = validFullBlock(None, us, bh, rnd).header
+    val upcomingContext = us.stateContext.upcoming(
+      h.minerPk, h.timestamp, h.nBits, h.votes, emptyVSUpdate, h.version
+    )
+
+    val (collected, invalid) = CandidateGenerator.collectTxs(
+      defaultMinerPk, Int.MaxValue, Int.MaxValue, us, upcomingContext, Seq(tx1, tx2)
+    )
+    invalid shouldBe empty
+    collected should contain(tx1)
+    collected should contain(tx2)
+    collected.indexOf(tx1) should be < collected.indexOf(tx2)
+    // fee-collecting tx spends tx2's fee output
+    collected.exists(t => t.inputs.exists(i => tx2.outputs.exists(_.id.sameElements(i.boxId)))) shouldBe true
+
+    // child is dropped when offered before its parent
+    val (collectedReversed, invalidReversed) = CandidateGenerator.collectTxs(
+      defaultMinerPk, Int.MaxValue, Int.MaxValue, us, upcomingContext, Seq(tx2, tx1)
+    )
+    invalidReversed should contain(tx2.id)
+    collectedReversed should contain(tx1)
+    collectedReversed should not contain tx2
+  }
+
   property("should not be able to spend recent fee boxes") {
 
     val delta          = 1
