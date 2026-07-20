@@ -26,10 +26,12 @@ import scala.util.{Failure, Success, Try}
   * @param stats    - Mempool statistics, that allows to track
   *                 information about mempool's state and transactions in it.
   * @param sortingOption - this input sets how transactions are sorted in the pool, by fee-per-byte or fee-per-cycle
+  * @param revision - monotonic counter bumped on every content change (add/remove/invalidate)
   */
 class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
                                    private[mempool] val stats: MemPoolStatistics,
-                                   private[mempool] val sortingOption: SortingOption)
+                                   private[mempool] val sortingOption: SortingOption,
+                                   override val revision: Long = 0L)
                                   (implicit settings: ErgoSettings)
   extends ErgoMemPoolReader with ScorexLogging {
 
@@ -94,7 +96,7 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
     */
   def put(unconfirmedTx: UnconfirmedTransaction): ErgoMemPool = {
     val updatedPool = pool.put(unconfirmedTx, feeFactor(unconfirmedTx))
-    new ErgoMemPool(updatedPool, stats, sortingOption)
+    new ErgoMemPool(updatedPool, stats, sortingOption, revision + 1)
   }
 
   def put(txs: TraversableOnce[UnconfirmedTransaction]): ErgoMemPool = {
@@ -113,7 +115,7 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
   def removeTxAndDoubleSpends(tx: ErgoTransaction): ErgoMemPool = {
     def removeTx(mp: ErgoMemPool, tx: ErgoTransaction): ErgoMemPool = {
       log.debug(s"Removing transaction ${tx.id} from the mempool")
-      new ErgoMemPool(mp.pool.remove(tx), mp.updateStatsOnRemoval(tx), sortingOption)
+      new ErgoMemPool(mp.pool.remove(tx), mp.updateStatsOnRemoval(tx), sortingOption, mp.revision + 1)
     }
 
     val poolWithoutTx = removeTx(this, tx)
@@ -148,7 +150,7 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
     */
   def invalidate(unconfirmedTx: UnconfirmedTransaction): ErgoMemPool = {
     log.debug(s"Invalidating mempool transaction ${unconfirmedTx.id}")
-    new ErgoMemPool(pool.invalidate(unconfirmedTx), updateStatsOnRemoval(unconfirmedTx.transaction), sortingOption)
+    new ErgoMemPool(pool.invalidate(unconfirmedTx), updateStatsOnRemoval(unconfirmedTx.transaction), sortingOption, revision + 1)
   }
 
   def invalidate(unconfirmedTransactionId: ModifierId): ErgoMemPool = {
@@ -204,7 +206,7 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
       if (ownWtx.weight > doubleSpendingTotalWeight) {
         val doubleSpendingTxs = doubleSpendingWtxs.map(wtx => pool.orderedTransactions(wtx)).toSeq
         val p = pool.remove(doubleSpendingTxs).put(unconfirmedTransaction, feeF)
-        val updPool = new ErgoMemPool(p, stats, sortingOption)
+        val updPool = new ErgoMemPool(p, stats, sortingOption, revision + 1)
         updPool -> new ProcessingOutcome.Accepted(unconfirmedTransaction, validationStartTime)
       } else {
         this -> new ProcessingOutcome.DoubleSpendingLoser(doubleSpendingWtxs.map(_.id), validationStartTime)
@@ -216,7 +218,7 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
         val exc = new Exception("Transaction pays less than any other in the pool being full")
         this -> new ProcessingOutcome.Declined(exc, validationStartTime)
       } else {
-        val updPool = new ErgoMemPool(pool.put(unconfirmedTransaction, feeF), stats, sortingOption)
+        val updPool = new ErgoMemPool(pool.put(unconfirmedTransaction, feeF), stats, sortingOption, revision + 1)
         updPool -> new ProcessingOutcome.Accepted(unconfirmedTransaction, validationStartTime)
       }
     }

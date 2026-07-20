@@ -55,6 +55,9 @@ class CandidateGenerator(
   private val candidateGenInterval =
     ergoSettings.nodeSettings.blockCandidateGenerationInterval
 
+  /** min interval between content-triggered regenerations, debouncing bursts of new transactions */
+  private val mempoolRevisionRegenInterval: FiniteDuration = 1.second
+
   /** retrieve Readers once on start and then get updated by events */
   override def preStart(): Unit = {
     log.info("CandidateGenerator is starting")
@@ -127,15 +130,19 @@ class CandidateGenerator(
     case ChangedState(s: UtxoStateReader) =>
       context.become(initialized(state.copy(sr = s)))
     case ChangedMempool(mp: ErgoMemPoolReader) =>
-      if (hasCandidateExpired(
-        state.cachedCandidate,
-        state.solvedBlock,
-        candidateGenInterval
-      )) {
+      val shouldRegenerate =
+        candidateBelowMempoolRevision(
+          state.cachedCandidate,
+          state.solvedBlock,
+          state.builtAtRevision,
+          mp,
+          mempoolRevisionRegenInterval
+        ) ||
+          hasCandidateExpired(state.cachedCandidate, state.solvedBlock, candidateGenInterval)
+      // coalesce bursts: at most one forced regeneration in flight (cleared on next build)
+      if (shouldRegenerate && !state.forcedRegenPending) {
         log.debug(s"Regenerating candidate block")
-        // with forced = true, state.cachedCandidate will be ignored in GenerateCandidate processing,
-        // but state.previousCachedCandidate will be set to cachedCandidate
-        context.become(initialized(state.copy(mpr = mp)))
+        context.become(initialized(state.copy(mpr = mp, forcedRegenPending = true)))
         self ! GenerateCandidate(txsToInclude = Seq.empty, reply = false, forced = true)
       } else {
         context.become(initialized(state.copy(mpr = mp)))
@@ -178,6 +185,8 @@ class CandidateGenerator(
         ) match {
           case Some(Failure(ex)) =>
             log.error(s"Candidate generation failed", ex)
+            // clear the flag so a failed forced regen does not disable later regeneration
+            context.become(initialized(state.copy(forcedRegenPending = false)))
             senderOpt.foreach(
               _ ! StatusReply.error(s"Candidate generation failed : ${ex.getMessage}")
             )
@@ -189,7 +198,7 @@ class CandidateGenerator(
             log.info(s"Generated new candidate in $generationTook ms")
             context.become(
               initialized(
-                state.copy(cachedCandidate = Some(candidate), cachedPreviousCandidate = state.cachedCandidate, avgGenTime = generationTook.millis)
+                state.copy(cachedCandidate = Some(candidate), cachedPreviousCandidate = state.cachedCandidate, avgGenTime = generationTook.millis, builtAtRevision = state.mpr.revision, forcedRegenPending = false)
               )
             )
             senderOpt.foreach(_ ! StatusReply.success(candidate))
@@ -197,6 +206,8 @@ class CandidateGenerator(
             log.warn(
               "Can not generate block candidate: either mempool is empty or chain is not synced (maybe last block not fully applied yet"
             )
+            // clear the flag so a forced regen that could not build does not disable later regeneration
+            context.become(initialized(state.copy(forcedRegenPending = false)))
             senderOpt.foreach { s =>
               context.system.scheduler.scheduleOnce(state.avgGenTime, self, gen)(
                 context.system.dispatcher,
@@ -280,7 +291,9 @@ object CandidateGenerator extends ScorexLogging {
     hr: ErgoHistoryReader,
     sr: UtxoStateReader,
     mpr: ErgoMemPoolReader,
-    avgGenTime: FiniteDuration // approximation of average block generation time for more efficient retries
+    avgGenTime: FiniteDuration, // approximation of average block generation time for more efficient retries
+    builtAtRevision: Long = 0L, // mempool revision the cached candidate was built against
+    forcedRegenPending: Boolean = false // a forced regeneration is enqueued but not yet rebuilt
   )
 
   def apply(
@@ -361,6 +374,30 @@ object CandidateGenerator extends ScorexLogging {
         case Some(c) if candidateGenInterval.compare(candidateAge(c)) <= 0 =>
           log.info(s"Regenerating block candidate")
           true
+        case _ =>
+          false
+      }
+    }
+  }
+
+  /** True when the mempool content changed since the cached candidate was built, subject to a short
+    * min-interval debounce (measured from the candidate's build time) to coalesce bursts of new transactions.
+    */
+  def candidateBelowMempoolRevision(
+    cachedCandidate: Option[Candidate],
+    solvedBlock: Option[ErgoFullBlock],
+    builtAtRevision: Long,
+    mp: ErgoMemPoolReader,
+    minRegenInterval: FiniteDuration
+  ): Boolean = {
+    def candidateAge(c: Candidate): FiniteDuration =
+      (System.currentTimeMillis() - c.candidateBlock.timestamp).millis
+    if (solvedBlock.isDefined) {
+      false
+    } else {
+      cachedCandidate match {
+        case Some(c) if mp.revision != builtAtRevision =>
+          minRegenInterval.compare(candidateAge(c)) <= 0
         case _ =>
           false
       }

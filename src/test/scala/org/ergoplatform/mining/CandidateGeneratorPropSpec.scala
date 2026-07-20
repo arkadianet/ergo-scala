@@ -1,17 +1,21 @@
 package org.ergoplatform.mining
 
 import org.ergoplatform.ErgoTreePredef
+import org.ergoplatform.mining.CandidateGenerator.Candidate
+import org.ergoplatform.modifiers.history.extension.ExtensionCandidate
+import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.nodeView.history.ErgoHistoryUtils._
 import org.ergoplatform.nodeView.state.ErgoStateContext
 import org.ergoplatform.settings.MonetarySettings
-import org.ergoplatform.utils.{BoxUtils, ErgoCorePropertyTest, RandomWrapper}
+import org.ergoplatform.utils.{BoxUtils, ErgoCorePropertyTest, MempoolTestHelpers, RandomWrapper}
 import org.ergoplatform.wallet.interpreter.ErgoInterpreter
 import org.scalacheck.Gen
+import scorex.crypto.authds.{ADDigest, SerializedAdProof}
 import sigma.data.ProveDlog
 
 import scala.concurrent.duration._
 
-class CandidateGeneratorPropSpec extends ErgoCorePropertyTest {
+class CandidateGeneratorPropSpec extends ErgoCorePropertyTest with MempoolTestHelpers {
   import org.ergoplatform.utils.ErgoNodeTestConstants._
   import org.ergoplatform.utils.ErgoCoreTestConstants._
   import org.ergoplatform.utils.generators.ErgoCoreGenerators._
@@ -24,6 +28,22 @@ class CandidateGeneratorPropSpec extends ErgoCorePropertyTest {
     ErgoTreePredef.rewardOutputScript(delta, pk).bytes
 
   implicit private val verifier: ErgoInterpreter = ErgoInterpreter(parameters)
+
+  private def candidateAt(timestamp: Long): Candidate = {
+    val cb = CandidateBlock(
+      parentOpt = None,
+      version = Header.InitialVersion,
+      nBits = settings.chainSettings.initialNBits,
+      stateRoot = ADDigest @@ Array.fill(33)(0: Byte),
+      adProofBytes = SerializedAdProof @@ Array.emptyByteArray,
+      transactions = Seq.empty,
+      timestamp = timestamp,
+      extension = ExtensionCandidate(Seq.empty),
+      votes = Array(0: Byte, 0: Byte, 0: Byte)
+    )
+    val wm = WorkMessage(Array.emptyByteArray, BigInt(0), None, defaultMinerPk, None)
+    Candidate(cb, wm, Seq.empty)
+  }
 
   property("minersRewardAtHeight test vectors") {
     emission.minersRewardAtHeight(525000) shouldBe 67500000000L
@@ -278,6 +298,28 @@ class CandidateGeneratorPropSpec extends ErgoCorePropertyTest {
         defaultMinerPk
       )
     }
+  }
+
+  property("candidateBelowMempoolRevision triggers on content change, debounced") {
+    val mp       = new FakeMempool(Seq.empty) // revision == 0
+    val interval = 1.second
+    val aged     = candidateAt(System.currentTimeMillis() - 5000)
+    val fresh    = candidateAt(System.currentTimeMillis())
+
+    // mempool revision moved past the one the candidate was built at -> regenerate
+    CandidateGenerator.candidateBelowMempoolRevision(Some(aged), None, builtAtRevision = 1L, mp, interval) shouldBe true
+    // revision unchanged (no-op event) -> no regeneration
+    CandidateGenerator.candidateBelowMempoolRevision(Some(aged), None, builtAtRevision = 0L, mp, interval) shouldBe false
+    // content changed but within the debounce window -> suppressed
+    CandidateGenerator.candidateBelowMempoolRevision(Some(fresh), None, builtAtRevision = 1L, mp, interval) shouldBe false
+    // no cached candidate -> nothing to regenerate
+    CandidateGenerator.candidateBelowMempoolRevision(None, None, builtAtRevision = 1L, mp, interval) shouldBe false
+
+    // a solved block is pending application -> never regenerate
+    val us          = createUtxoState(settings)._1
+    val emissionTxs = CandidateGenerator.collectEmission(us, defaultMinerPk, emptyStateContext).toSeq
+    val solved      = validFullBlock(None, us, emissionTxs)
+    CandidateGenerator.candidateBelowMempoolRevision(Some(aged), Some(solved), builtAtRevision = 1L, mp, interval) shouldBe false
   }
 
   property("it should calculate average block mining time from creation timestamps") {
