@@ -16,6 +16,8 @@ trait MempoolTestHelpers {
 
     override def size: Int = ???
 
+    override def revision: Long = 0L
+
     override def weightedTransactionIds(limit: Int): Seq[OrderedTxPool.WeightedTxId] = ???
 
     override def getAll: Seq[UnconfirmedTransaction] = ???

@@ -20,6 +20,11 @@ trait ErgoMemPoolReader extends NodeViewComponent with ContainsModifiers[ErgoTra
   def size: Int
 
   /**
+    * @return monotonic counter bumped on every content change (add/remove/invalidate)
+    */
+  def revision: Long
+
+  /**
     * @return inputs spent by the mempool transactions
     */
   def spentInputs: Iterator[BoxId]

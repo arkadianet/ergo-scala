@@ -51,6 +51,32 @@ class ErgoMemPoolSpec extends AnyFlatSpec
     }
   }
 
+  it should "bump revision on content change and keep it stable on a no-op" in {
+    val (us, bh) = createUtxoState(settings)
+    val genesis = validFullBlock(None, us, bh)
+    val wus = WrappedUtxoState(us, bh, settings).applyModifier(genesis)(_ => ()).get
+    val txs = validTransactionsFromUtxoState(wus)
+
+    val pool0 = ErgoMemPool.empty(settings)
+    pool0.revision shouldBe 0L
+
+    val poolAfter = txs.foldLeft(pool0) { case (pool, tx) =>
+      val (p, outcome) = pool.process(UnconfirmedTransaction(tx, None), us)
+      outcome shouldBe a[ProcessingOutcome.Accepted]
+      p
+    }
+    poolAfter.revision should be > pool0.revision
+
+    // re-processing an already-pooled tx is declined and does not bump revision
+    val (poolNoop, outcome) = poolAfter.process(UnconfirmedTransaction(txs.head, None), us)
+    outcome shouldBe a[ProcessingOutcome.Declined]
+    poolNoop.revision shouldBe poolAfter.revision
+
+    // removal bumps revision
+    val poolRemoved = poolAfter.removeTxAndDoubleSpends(txs.head)
+    poolRemoved.revision should be > poolAfter.revision
+  }
+
   it should "respect given sorting order" in {
     implicit val ms = settings.chainSettings.monetary
     val (us, bh) = createUtxoState(settings)
