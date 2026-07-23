@@ -8,11 +8,11 @@ import org.ergoplatform.utils.{BoxUtils, ErgoTestHelpers, RandomWrapper}
   * Run: `sbt "Test/runMain org.ergoplatform.tools.CollectTxsOverlayBench"`
   *
   * Does not claim full O(n) candidate generation; stop-on-first-overflow / HOL packing
-  * remain out of scope.
+  * remain out of scope (see ergoplatform/ergo#2357).
   */
 object CollectTxsOverlayBench extends App with ErgoTestHelpers {
   import org.ergoplatform.utils.ErgoCoreTestConstants._
-  import org.ergoplatform.utils.ErgoNodeTestConstants._
+  import org.ergoplatform.utils.generators.ErgoNodeTransactionGenerators._
   import org.ergoplatform.utils.generators.ValidBlocksGenerators._
 
   val bh       = boxesHolderGen.sample.get
@@ -25,7 +25,12 @@ object CollectTxsOverlayBench extends App with ErgoTestHelpers {
   )
   val h = validFullBlock(None, us, bh, rnd).header
   val upcomingContext = us.stateContext.upcoming(
-    h.minerPk, h.timestamp, h.nBits, h.votes, emptyVSUpdate, h.version
+    h.minerPk,
+    h.timestamp,
+    h.nBits,
+    h.votes,
+    emptyVSUpdate,
+    h.version
   )
   val maxCost = parameters.maxBlockCost
   val maxSize = parameters.maxBlockSize
@@ -47,7 +52,7 @@ object CollectTxsOverlayBench extends App with ErgoTestHelpers {
 
   println(
     s"collectTxs map-overlay: $rounds rounds, pool=${txs.size}, collected~=$collected, " +
-      s"$ms ms total (${ms / rounds} ms/round)"
+      f"$ms%.1f ms total (${ms / rounds}%.2f ms/round)"
   )
   println(
     "Note: overlay lookup optimization only; not a claim of full O(n) candidate generation."
