@@ -1,6 +1,6 @@
 package org.ergoplatform.mining
 
-import akka.actor.{Actor, ActorRef, ActorRefFactory, Props}
+import akka.actor.{Actor, ActorRef, ActorRefFactory, Cancellable, Props}
 import akka.pattern.StatusReply
 import com.google.common.primitives.Longs
 import org.ergoplatform.ErgoBox.TokenId
@@ -124,29 +124,63 @@ class CandidateGenerator(
         .scheduleOnce(100.millis, self, m)(context.dispatcher, sender())
   }
 
+  private def cancelRevisionRetry(state: CandidateGeneratorState): CandidateGeneratorState = {
+    state.revisionRetry.foreach(_.cancel())
+    state.copy(revisionRetry = None)
+  }
+
+  /** Start a forced regen, or if debounce still suppresses it, schedule a one-shot retry. */
+  private def onMempoolContentChange(
+    state: CandidateGeneratorState,
+    mp: ErgoMemPoolReader
+  ): Unit = {
+    val cleared = cancelRevisionRetry(state)
+    val shouldRegenerateNow =
+      candidateBelowMempoolRevision(
+        cleared.cachedCandidate,
+        cleared.solvedBlock,
+        cleared.builtAtRevision,
+        mp,
+        mempoolRevisionRegenInterval
+      ) ||
+        hasCandidateExpired(cleared.cachedCandidate, cleared.solvedBlock, candidateGenInterval)
+
+    if (shouldRegenerateNow && !cleared.forcedRegenPending) {
+      log.debug("Regenerating candidate block after mempool content change")
+      context.become(initialized(cleared.copy(mpr = mp, forcedRegenPending = true)))
+      self ! GenerateCandidate(txsToInclude = Seq.empty, reply = false, forced = true)
+    } else if (
+      mempoolRevisionDrifted(
+        cleared.cachedCandidate,
+        cleared.solvedBlock,
+        cleared.builtAtRevision,
+        mp
+      ) && !cleared.forcedRegenPending
+    ) {
+      // Debounce suppressed an immediate regen; guarantee a revision-aware retry once the
+      // min interval elapses so a silent single-tx arrival cannot leave the candidate stale.
+      val delay = remainingRevisionDebounce(cleared.cachedCandidate, mempoolRevisionRegenInterval)
+      log.debug(s"Scheduling mempool-revision candidate retry in $delay")
+      val retry = context.system.scheduler.scheduleOnce(delay, self, CheckMempoolRevision)(
+        context.dispatcher
+      )
+      context.become(initialized(cleared.copy(mpr = mp, revisionRetry = Some(retry))))
+    } else {
+      // forcedRegenPending: coalesce further arrivals into the in-flight regen via updated mpr
+      context.become(initialized(cleared.copy(mpr = mp)))
+    }
+  }
+
   private def initialized(state: CandidateGeneratorState): Receive = {
     case ChangedHistory(h: ErgoHistoryReader) =>
       context.become(initialized(state.copy(hr = h)))
     case ChangedState(s: UtxoStateReader) =>
       context.become(initialized(state.copy(sr = s)))
     case ChangedMempool(mp: ErgoMemPoolReader) =>
-      val shouldRegenerate =
-        candidateBelowMempoolRevision(
-          state.cachedCandidate,
-          state.solvedBlock,
-          state.builtAtRevision,
-          mp,
-          mempoolRevisionRegenInterval
-        ) ||
-          hasCandidateExpired(state.cachedCandidate, state.solvedBlock, candidateGenInterval)
-      // coalesce bursts: at most one forced regeneration in flight (cleared on next build)
-      if (shouldRegenerate && !state.forcedRegenPending) {
-        log.debug(s"Regenerating candidate block")
-        context.become(initialized(state.copy(mpr = mp, forcedRegenPending = true)))
-        self ! GenerateCandidate(txsToInclude = Seq.empty, reply = false, forced = true)
-      } else {
-        context.become(initialized(state.copy(mpr = mp)))
-      }
+      onMempoolContentChange(state, mp)
+    case CheckMempoolRevision =>
+      // Timer fired; drop the handle then re-evaluate against the latest pool revision.
+      onMempoolContentChange(state.copy(revisionRetry = None), state.mpr)
     case _: NodeViewChange =>
     // Just ignore all other NodeView Changes
 
@@ -158,20 +192,32 @@ class CandidateGenerator(
       log.info(
         s"Preparing new candidate on getting new block at ${header.height}"
       )
-      if (needNewCandidate(state.cachedCandidate, header)) {
-        if (needNewSolution(state.solvedBlock, header.id))
-          context.become(initialized(state.copy(cachedCandidate = None, cachedPreviousCandidate = None, solvedBlock = None)))
+      val cleared = cancelRevisionRetry(state)
+      if (needNewCandidate(cleared.cachedCandidate, header)) {
+        if (needNewSolution(cleared.solvedBlock, header.id))
+          context.become(initialized(cleared.copy(cachedCandidate = None, cachedPreviousCandidate = None, solvedBlock = None)))
         else
-          context.become(initialized(state.copy(cachedCandidate = None, cachedPreviousCandidate = None)))
+          context.become(initialized(cleared.copy(cachedCandidate = None, cachedPreviousCandidate = None)))
         self ! GenerateCandidate(txsToInclude = Seq.empty, reply = false, forced = false)
       } else {
-        context.become(initialized(state))
+        context.become(initialized(cleared))
       }
 
     case gen @ GenerateCandidate(txsToInclude, reply, forced, optPk) =>
       val senderOpt = if (reply) Some(sender()) else None
       val effectiveMinerPk = optPk.getOrElse(minerPk)
-      if (!forced && cachedFor(state.cachedCandidate, txsToInclude, effectiveMinerPk)) {
+      // Age check (ergoplatform/ergo#2443): a cache hit must still be within the generation
+      // interval, otherwise a mempool change that arrived before expiry can leave requests
+      // serving a stale candidate forever if the pool then stays quiet.
+      if (
+        !forced &&
+        cachedFor(state.cachedCandidate, txsToInclude, effectiveMinerPk) &&
+        !hasCandidateExpired(
+          state.cachedCandidate,
+          state.solvedBlock,
+          candidateGenInterval
+        )
+      ) {
         senderOpt.foreach(_ ! StatusReply.success(state.cachedCandidate.get))
       } else {
         val start = System.currentTimeMillis()
@@ -186,7 +232,7 @@ class CandidateGenerator(
           case Some(Failure(ex)) =>
             log.error(s"Candidate generation failed", ex)
             // clear the flag so a failed forced regen does not disable later regeneration
-            context.become(initialized(state.copy(forcedRegenPending = false)))
+            context.become(initialized(cancelRevisionRetry(state).copy(forcedRegenPending = false)))
             senderOpt.foreach(
               _ ! StatusReply.error(s"Candidate generation failed : ${ex.getMessage}")
             )
@@ -198,7 +244,13 @@ class CandidateGenerator(
             log.info(s"Generated new candidate in $generationTook ms")
             context.become(
               initialized(
-                state.copy(cachedCandidate = Some(candidate), cachedPreviousCandidate = state.cachedCandidate, avgGenTime = generationTook.millis, builtAtRevision = state.mpr.revision, forcedRegenPending = false)
+                cancelRevisionRetry(state).copy(
+                  cachedCandidate = Some(candidate),
+                  cachedPreviousCandidate = state.cachedCandidate,
+                  avgGenTime = generationTook.millis,
+                  builtAtRevision = state.mpr.revision,
+                  forcedRegenPending = false
+                )
               )
             )
             senderOpt.foreach(_ ! StatusReply.success(candidate))
@@ -207,7 +259,7 @@ class CandidateGenerator(
               "Can not generate block candidate: either mempool is empty or chain is not synced (maybe last block not fully applied yet"
             )
             // clear the flag so a forced regen that could not build does not disable later regeneration
-            context.become(initialized(state.copy(forcedRegenPending = false)))
+            context.become(initialized(cancelRevisionRetry(state).copy(forcedRegenPending = false)))
             senderOpt.foreach { s =>
               context.system.scheduler.scheduleOnce(state.avgGenTime, self, gen)(
                 context.system.dispatcher,
@@ -283,6 +335,9 @@ object CandidateGenerator extends ScorexLogging {
     optPk: Option[ProveDlog] = None
   )
 
+  /** One-shot follow-up after debounce suppressed a revision-driven regen. */
+  case object CheckMempoolRevision
+
   /** Local state of candidate generator to avoid mutable vars */
   case class CandidateGeneratorState(
     cachedCandidate: Option[Candidate],
@@ -293,7 +348,8 @@ object CandidateGenerator extends ScorexLogging {
     mpr: ErgoMemPoolReader,
     avgGenTime: FiniteDuration, // approximation of average block generation time for more efficient retries
     builtAtRevision: Long = 0L, // mempool revision the cached candidate was built against
-    forcedRegenPending: Boolean = false // a forced regeneration is enqueued but not yet rebuilt
+    forcedRegenPending: Boolean = false, // a forced regeneration is enqueued but not yet rebuilt
+    revisionRetry: Option[Cancellable] = None // delayed revision re-check while debounce holds
   )
 
   def apply(
@@ -390,17 +446,34 @@ object CandidateGenerator extends ScorexLogging {
     mp: ErgoMemPoolReader,
     minRegenInterval: FiniteDuration
   ): Boolean = {
-    def candidateAge(c: Candidate): FiniteDuration =
-      (System.currentTimeMillis() - c.candidateBlock.timestamp).millis
-    if (solvedBlock.isDefined) {
-      false
-    } else {
-      cachedCandidate match {
-        case Some(c) if mp.revision != builtAtRevision =>
-          minRegenInterval.compare(candidateAge(c)) <= 0
-        case _ =>
-          false
-      }
+    mempoolRevisionDrifted(cachedCandidate, solvedBlock, builtAtRevision, mp) &&
+      remainingRevisionDebounce(cachedCandidate, minRegenInterval) <= Duration.Zero
+  }
+
+  /** Mempool membership changed since the cached candidate was assembled (ignore while a solved block is pending). */
+  def mempoolRevisionDrifted(
+    cachedCandidate: Option[Candidate],
+    solvedBlock: Option[ErgoFullBlock],
+    builtAtRevision: Long,
+    mp: ErgoMemPoolReader
+  ): Boolean = {
+    solvedBlock.isEmpty &&
+      cachedCandidate.isDefined &&
+      mp.revision != builtAtRevision
+  }
+
+  /** Time left before a revision-driven regen is allowed; Duration.Zero once the debounce window has elapsed. */
+  def remainingRevisionDebounce(
+    cachedCandidate: Option[Candidate],
+    minRegenInterval: FiniteDuration
+  ): FiniteDuration = {
+    cachedCandidate match {
+      case Some(c) =>
+        val age = (System.currentTimeMillis() - c.candidateBlock.timestamp).millis
+        val remaining = minRegenInterval - age
+        if (remaining > Duration.Zero) remaining else Duration.Zero
+      case None =>
+        Duration.Zero
     }
   }
 

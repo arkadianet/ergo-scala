@@ -9,10 +9,12 @@ import org.ergoplatform.mining.CandidateGenerator.{Candidate, GenerateCandidate}
 import org.ergoplatform.modifiers.ErgoFullBlock
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction, UnsignedErgoTransaction}
+import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.ChangedMempool
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.FullBlockApplied
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.LocallyGeneratedTransaction
 import org.ergoplatform.nodeView.ErgoReadersHolder.{GetReaders, Readers}
 import org.ergoplatform.nodeView.history.ErgoHistoryReader
+import org.ergoplatform.nodeView.mempool.ErgoMemPool
 import org.ergoplatform.nodeView.state.StateType
 import org.ergoplatform.nodeView.{ErgoNodeViewRef, ErgoReadersHolderRef}
 import org.ergoplatform.settings.NetworkType.DevNet60
@@ -257,6 +259,365 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
             )
         }
     }
+    system.terminate()
+  }
+
+  it should "regenerate after a silent single-tx mempool change once debounce elapses" in new TestKit(
+    ActorSystem()
+  ) {
+    val testProbe = new TestProbe(system)
+    system.eventStream.subscribe(testProbe.ref, newBlockSignal)
+
+    // Long wall-clock backstop so only the revision debounce (~1s) drives regeneration.
+    val testDir =
+      s"${defaultSettings.directory}-silent-single-tx-${System.currentTimeMillis()}"
+    val testSettings = ErgoSettingsReader.read()
+      .copy(
+        nodeSettings = defaultSettings.nodeSettings
+          .copy(blockCandidateGenerationInterval = 1.minute),
+        chainSettings = defaultSettings.chainSettings.copy(blockInterval = 1.seconds),
+        directory = testDir
+      )
+
+    val viewHolderRef: ActorRef = ErgoNodeViewRef(testSettings)
+    val readersHolderRef: ActorRef = ErgoReadersHolderRef(viewHolderRef)
+    val candidateGenerator: ActorRef = CandidateGenerator(
+      defaultMinerSecret.publicImage,
+      readersHolderRef,
+      viewHolderRef,
+      testSettings
+    )
+    val powScheme = testSettings.chainSettings.powScheme
+
+    // Establish a parent tip so a subsequent candidate can spend the miner reward.
+    candidateGenerator.tell(
+      GenerateCandidate(Seq.empty, reply = true, forced = false),
+      testProbe.ref
+    )
+    val initialCandidate = testProbe.expectMsgPF(candidateGenDelay) {
+      case StatusReply.Success(c: Candidate) => c
+    }
+    val initialBlock = powScheme
+      .proveCandidate(initialCandidate.candidateBlock, defaultMinerSecret.w, 0, 1000)
+      .get
+    candidateGenerator.tell(initialBlock.header.powSolution, testProbe.ref)
+
+    var ackSeen     = false
+    var appliedSeen = false
+    testProbe.fishForMessage(blockValidationDelay) {
+      case StatusReply.Success(()) =>
+        ackSeen = true
+        ackSeen && appliedSeen
+      case FullBlockApplied(header) if header.id == initialBlock.header.id =>
+        appliedSeen = true
+        ackSeen && appliedSeen
+      case _ => false
+    }
+
+    val readers: Readers = await((readersHolderRef ? GetReaders).mapTo[Readers])
+    val prop = DLogProverInput(
+      BigIntegers.fromUnsignedByteArray("silent-single-tx".getBytes())
+    ).publicImage
+    val rewardBox = readers.h.bestFullBlockOpt.get.transactions.last.outputs.last
+    val unsignedTx = new UnsignedErgoTransaction(
+      IndexedSeq(Input(rewardBox.id, emptyProverResult)),
+      IndexedSeq(),
+      IndexedSeq(
+        new ErgoBoxCandidate(
+          rewardBox.value,
+          ErgoTree.fromSigmaBoolean(prop),
+          readers.s.stateContext.currentHeight
+        )
+      )
+    )
+    val tx = ErgoTransaction(
+      defaultProver
+        .sign(unsignedTx, IndexedSeq(rewardBox), IndexedSeq(), readers.s.stateContext)
+        .get
+    )
+
+    // Fresh candidate (age << 1s debounce) built against an empty pool.
+    candidateGenerator.tell(
+      GenerateCandidate(Seq.empty, reply = true, forced = true),
+      testProbe.ref
+    )
+    val freshCandidate = testProbe.expectMsgPF(candidateGenDelay) {
+      case StatusReply.Success(c: Candidate) => c
+    }
+    freshCandidate.candidateBlock.transactions.map(_.id) should not contain tx.id
+
+    // Single silent mempool arrival within the debounce window: must not leave the
+    // candidate permanently stale — a delayed revision retry regenerates after ~1s.
+    val poolWithTx = ErgoMemPool.empty(testSettings).put(UnconfirmedTransaction(tx, None))
+    poolWithTx.revision should be > 0L
+    candidateGenerator.tell(ChangedMempool(poolWithTx), testProbe.ref)
+
+    candidateGenerator.tell(
+      GenerateCandidate(Seq.empty, reply = true, forced = false),
+      testProbe.ref
+    )
+    val stillCached = testProbe.expectMsgPF(candidateGenDelay) {
+      case StatusReply.Success(c: Candidate) => c
+    }
+    stillCached.candidateBlock shouldBe freshCandidate.candidateBlock
+    stillCached.candidateBlock.transactions.map(_.id) should not contain tx.id
+
+    // Debounce is 1s from candidate build; allow the one-shot retry to fire and rebuild.
+    testProbe.expectNoMessage(1500.millis)
+
+    eventually(timeout(5.seconds), interval(200.millis)) {
+      candidateGenerator.tell(
+        GenerateCandidate(Seq.empty, reply = true, forced = false),
+        testProbe.ref
+      )
+      val regenerated = testProbe.expectMsgPF(candidateGenDelay) {
+        case StatusReply.Success(c: Candidate) => c
+      }
+      regenerated.candidateBlock.transactions.map(_.id) should contain(tx.id)
+    }
+
+    system.terminate()
+  }
+
+  it should "coalesce a burst of mempool revisions into one deferred regeneration" in new TestKit(
+    ActorSystem()
+  ) {
+    val testProbe = new TestProbe(system)
+    system.eventStream.subscribe(testProbe.ref, newBlockSignal)
+
+    val testDir =
+      s"${defaultSettings.directory}-burst-coalesce-${System.currentTimeMillis()}"
+    val testSettings = ErgoSettingsReader.read()
+      .copy(
+        nodeSettings = defaultSettings.nodeSettings
+          .copy(blockCandidateGenerationInterval = 1.minute),
+        chainSettings = defaultSettings.chainSettings.copy(blockInterval = 1.seconds),
+        directory = testDir
+      )
+
+    val viewHolderRef: ActorRef = ErgoNodeViewRef(testSettings)
+    val readersHolderRef: ActorRef = ErgoReadersHolderRef(viewHolderRef)
+    val candidateGenerator: ActorRef = CandidateGenerator(
+      defaultMinerSecret.publicImage,
+      readersHolderRef,
+      viewHolderRef,
+      testSettings
+    )
+    val powScheme = testSettings.chainSettings.powScheme
+
+    candidateGenerator.tell(
+      GenerateCandidate(Seq.empty, reply = true, forced = false),
+      testProbe.ref
+    )
+    val initialCandidate = testProbe.expectMsgPF(candidateGenDelay) {
+      case StatusReply.Success(c: Candidate) => c
+    }
+    val initialBlock = powScheme
+      .proveCandidate(initialCandidate.candidateBlock, defaultMinerSecret.w, 0, 1000)
+      .get
+    candidateGenerator.tell(initialBlock.header.powSolution, testProbe.ref)
+
+    var ackSeen     = false
+    var appliedSeen = false
+    testProbe.fishForMessage(blockValidationDelay) {
+      case StatusReply.Success(()) =>
+        ackSeen = true
+        ackSeen && appliedSeen
+      case FullBlockApplied(header) if header.id == initialBlock.header.id =>
+        appliedSeen = true
+        ackSeen && appliedSeen
+      case _ => false
+    }
+
+    val readers: Readers = await((readersHolderRef ? GetReaders).mapTo[Readers])
+    val rewardBox = readers.h.bestFullBlockOpt.get.transactions.last.outputs.last
+
+    def spendReward(label: String): ErgoTransaction = {
+      val prop = DLogProverInput(
+        BigIntegers.fromUnsignedByteArray(label.getBytes())
+      ).publicImage
+      val unsignedTx = new UnsignedErgoTransaction(
+        IndexedSeq(Input(rewardBox.id, emptyProverResult)),
+        IndexedSeq(),
+        IndexedSeq(
+          new ErgoBoxCandidate(
+            rewardBox.value,
+            ErgoTree.fromSigmaBoolean(prop),
+            readers.s.stateContext.currentHeight
+          )
+        )
+      )
+      ErgoTransaction(
+        defaultProver
+          .sign(unsignedTx, IndexedSeq(rewardBox), IndexedSeq(), readers.s.stateContext)
+          .get
+      )
+    }
+
+    val txA = spendReward("burst-a")
+    val txB = spendReward("burst-b")
+    val txC = spendReward("burst-c")
+
+    candidateGenerator.tell(
+      GenerateCandidate(Seq.empty, reply = true, forced = true),
+      testProbe.ref
+    )
+    val freshCandidate = testProbe.expectMsgPF(candidateGenDelay) {
+      case StatusReply.Success(c: Candidate) => c
+    }
+    val freshTs = freshCandidate.candidateBlock.timestamp
+
+    // Competing spends of the same box: each ChangedMempool bumps revision; the deferred
+    // retry must coalesce to a single regen that sees the latest pool (txC).
+    val poolA = ErgoMemPool.empty(testSettings).put(UnconfirmedTransaction(txA, None))
+    val poolB = ErgoMemPool.empty(testSettings).put(UnconfirmedTransaction(txB, None))
+    val poolC = ErgoMemPool.empty(testSettings).put(UnconfirmedTransaction(txC, None))
+    candidateGenerator.tell(ChangedMempool(poolA), testProbe.ref)
+    candidateGenerator.tell(ChangedMempool(poolB), testProbe.ref)
+    candidateGenerator.tell(ChangedMempool(poolC), testProbe.ref)
+
+    // While debounce holds, the served candidate must stay put; retries coalesce to one.
+    candidateGenerator.tell(
+      GenerateCandidate(Seq.empty, reply = true, forced = false),
+      testProbe.ref
+    )
+    val stillCached = testProbe.expectMsgPF(candidateGenDelay) {
+      case StatusReply.Success(c: Candidate) => c
+    }
+    stillCached.candidateBlock shouldBe freshCandidate.candidateBlock
+
+    testProbe.expectNoMessage(1500.millis)
+
+    eventually(timeout(5.seconds), interval(200.millis)) {
+      candidateGenerator.tell(
+        GenerateCandidate(Seq.empty, reply = true, forced = false),
+        testProbe.ref
+      )
+      val regenerated = testProbe.expectMsgPF(candidateGenDelay) {
+        case StatusReply.Success(c: Candidate) => c
+      }
+      regenerated.candidateBlock.timestamp should be > freshTs
+      regenerated.candidateBlock.transactions.map(_.id) should contain(txC.id)
+      regenerated.candidateBlock.transactions.map(_.id) should contain noneOf (txA.id, txB.id)
+    }
+
+    system.terminate()
+  }
+
+  it should "refresh an expired candidate after an earlier mempool change" in new TestKit(
+    ActorSystem()
+  ) {
+    val testProbe = new TestProbe(system)
+    system.eventStream.subscribe(testProbe.ref, newBlockSignal)
+
+    val regenerationInterval = 5.seconds
+    val testDir =
+      s"${defaultSettings.directory}-expired-cache-${System.currentTimeMillis()}"
+    val testSettings = ErgoSettingsReader.read()
+      .copy(
+        nodeSettings = defaultSettings.nodeSettings
+          .copy(blockCandidateGenerationInterval = regenerationInterval),
+        chainSettings = defaultSettings.chainSettings.copy(blockInterval = 1.seconds),
+        directory = testDir
+      )
+
+    val viewHolderRef: ActorRef = ErgoNodeViewRef(testSettings)
+    val readersHolderRef: ActorRef = ErgoReadersHolderRef(viewHolderRef)
+    val candidateGenerator: ActorRef = CandidateGenerator(
+      defaultMinerSecret.publicImage,
+      readersHolderRef,
+      viewHolderRef,
+      testSettings
+    )
+
+    val powScheme = testSettings.chainSettings.powScheme
+
+    candidateGenerator.tell(
+      GenerateCandidate(Seq.empty, reply = true, forced = false),
+      testProbe.ref
+    )
+    val initialCandidate = testProbe.expectMsgPF(candidateGenDelay) {
+      case StatusReply.Success(c: Candidate) => c
+    }
+    val initialBlock = powScheme
+      .proveCandidate(initialCandidate.candidateBlock, defaultMinerSecret.w, 0, 1000)
+      .get
+    candidateGenerator.tell(initialBlock.header.powSolution, testProbe.ref)
+
+    var ackSeen     = false
+    var appliedSeen = false
+    testProbe.fishForMessage(blockValidationDelay) {
+      case StatusReply.Success(()) =>
+        ackSeen = true
+        ackSeen && appliedSeen
+      case FullBlockApplied(header) if header.id == initialBlock.header.id =>
+        appliedSeen = true
+        ackSeen && appliedSeen
+      case _ => false
+    }
+
+    val readers: Readers = await((readersHolderRef ? GetReaders).mapTo[Readers])
+    val prop = DLogProverInput(
+      BigIntegers.fromUnsignedByteArray("expired-cache-test".getBytes())
+    ).publicImage
+    val rewardBox = readers.h.bestFullBlockOpt.get.transactions.last.outputs.last
+    val unsignedTx = new UnsignedErgoTransaction(
+      IndexedSeq(Input(rewardBox.id, emptyProverResult)),
+      IndexedSeq(),
+      IndexedSeq(
+        new ErgoBoxCandidate(
+          rewardBox.value,
+          ErgoTree.fromSigmaBoolean(prop),
+          readers.s.stateContext.currentHeight
+        )
+      )
+    )
+    val tx = ErgoTransaction(
+      defaultProver
+        .sign(unsignedTx, IndexedSeq(rewardBox), IndexedSeq(), readers.s.stateContext)
+        .get
+    )
+
+    candidateGenerator.tell(
+      GenerateCandidate(Seq.empty, reply = true, forced = true),
+      testProbe.ref
+    )
+    val freshCandidate = testProbe.expectMsgPF(candidateGenDelay) {
+      case StatusReply.Success(c: Candidate) => c
+    }
+
+    // Inject the tx after the candidate is built. With a long regen interval this would
+    // previously leave later polls serving the expired cache (#2443); with revision
+    // debounce the delayed retry may already have packed the tx before expiry — either
+    // way the post-expiry request must include it.
+    val poolWithTx = ErgoMemPool.empty(testSettings).put(UnconfirmedTransaction(tx, None))
+    candidateGenerator.tell(ChangedMempool(poolWithTx), testProbe.ref)
+    candidateGenerator.tell(
+      GenerateCandidate(Seq.empty, reply = true, forced = false),
+      testProbe.ref
+    )
+    val unexpiredCandidate = testProbe.expectMsgPF(candidateGenDelay) {
+      case StatusReply.Success(c: Candidate) => c
+    }
+    // Still inside the 5s generation interval: either the fresh cache or a revision-driven
+    // regen that already included the tx. Do not require the tx to be absent here.
+    unexpiredCandidate.candidateBlock.timestamp should be >= freshCandidate.candidateBlock.timestamp
+
+    val remainingMillis = regenerationInterval.toMillis -
+      (System.currentTimeMillis() - freshCandidate.candidateBlock.timestamp) + 200
+    if (remainingMillis > 200L) {
+      testProbe.expectNoMessage(remainingMillis.millis)
+    }
+
+    candidateGenerator.tell(
+      GenerateCandidate(Seq.empty, reply = true, forced = false),
+      testProbe.ref
+    )
+    val regeneratedCandidate = testProbe.expectMsgPF(candidateGenDelay) {
+      case StatusReply.Success(c: Candidate) => c
+    }
+
+    regeneratedCandidate.candidateBlock.transactions.map(_.id) should contain(tx.id)
     system.terminate()
   }
 
@@ -760,17 +1121,17 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
     system.eventStream.subscribe(testProbe.ref, newBlockSignal)
 
     val testDir = s"${defaultSettings.directory}-ignore-cache-${System.currentTimeMillis()}"
-    val settingsWithShortRegeneration: ErgoSettings =
+    val settingsWithLongCache: ErgoSettings =
       ErgoSettingsReader.read()
         .copy(
           nodeSettings = defaultSettings.nodeSettings
-            .copy(blockCandidateGenerationInterval = 1.millis),
+            .copy(blockCandidateGenerationInterval = 1.minute),
           chainSettings =
             ErgoSettingsReader.read().chainSettings.copy(blockInterval = 1.seconds),
           directory = testDir
         )
 
-    val viewHolderRef: ActorRef = ErgoNodeViewRef(settingsWithShortRegeneration)
+    val viewHolderRef: ActorRef = ErgoNodeViewRef(settingsWithLongCache)
     val readersHolderRef: ActorRef = ErgoReadersHolderRef(viewHolderRef)
 
     val candidateGenerator: ActorRef =
@@ -778,10 +1139,10 @@ class CandidateGeneratorSpec extends AnyFlatSpec with Matchers with ErgoTestHelp
         defaultMinerSecret.publicImage,
         readersHolderRef,
         viewHolderRef,
-        settingsWithShortRegeneration
+        settingsWithLongCache
       )
 
-    val powScheme = settingsWithShortRegeneration.chainSettings.powScheme
+    val powScheme = settingsWithLongCache.chainSettings.powScheme
 
     // First mine a block to establish chain (needed for avg mining time calculation)
     candidateGenerator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false), testProbe.ref)

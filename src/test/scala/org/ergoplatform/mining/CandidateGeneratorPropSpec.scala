@@ -310,16 +310,20 @@ class CandidateGeneratorPropSpec extends ErgoCorePropertyTest with MempoolTestHe
     CandidateGenerator.candidateBelowMempoolRevision(Some(aged), None, builtAtRevision = 1L, mp, interval) shouldBe true
     // revision unchanged (no-op event) -> no regeneration
     CandidateGenerator.candidateBelowMempoolRevision(Some(aged), None, builtAtRevision = 0L, mp, interval) shouldBe false
-    // content changed but within the debounce window -> suppressed
+    // content changed but within the debounce window -> suppressed (caller must schedule a retry)
     CandidateGenerator.candidateBelowMempoolRevision(Some(fresh), None, builtAtRevision = 1L, mp, interval) shouldBe false
+    CandidateGenerator.mempoolRevisionDrifted(Some(fresh), None, builtAtRevision = 1L, mp) shouldBe true
+    CandidateGenerator.remainingRevisionDebounce(Some(fresh), interval) should be > Duration.Zero
     // no cached candidate -> nothing to regenerate
     CandidateGenerator.candidateBelowMempoolRevision(None, None, builtAtRevision = 1L, mp, interval) shouldBe false
+    CandidateGenerator.mempoolRevisionDrifted(None, None, builtAtRevision = 1L, mp) shouldBe false
 
     // a solved block is pending application -> never regenerate
     val us          = createUtxoState(settings)._1
     val emissionTxs = CandidateGenerator.collectEmission(us, defaultMinerPk, emptyStateContext).toSeq
     val solved      = validFullBlock(None, us, emissionTxs)
     CandidateGenerator.candidateBelowMempoolRevision(Some(aged), Some(solved), builtAtRevision = 1L, mp, interval) shouldBe false
+    CandidateGenerator.mempoolRevisionDrifted(Some(aged), Some(solved), builtAtRevision = 1L, mp) shouldBe false
   }
 
   property("it should calculate average block mining time from creation timestamps") {
