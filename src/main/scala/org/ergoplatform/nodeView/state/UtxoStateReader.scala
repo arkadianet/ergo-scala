@@ -189,6 +189,8 @@ trait UtxoStateReader extends ErgoStateReader with UtxoSetSnapshotPersistence {
   /**
     * Producing a copy of the state whose `boxById` also resolves boxes from `createdBoxes`,
     * a map-backed overlay of transaction outputs keyed by box id (persisted state takes precedence).
+    * Prefer this over repeatedly calling `withTransactions` when assembling a candidate: overlay
+    * lookups avoid a linear scan of already-accepted outputs on each `boxById`.
     */
   def withCreatedBoxes(createdBoxes: Map[ByteArrayWrapper, ErgoBox]): UtxoState = {
     new UtxoState(persistentProver, version, store, ergoSettings) {

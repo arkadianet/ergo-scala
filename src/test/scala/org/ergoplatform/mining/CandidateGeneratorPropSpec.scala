@@ -1,15 +1,19 @@
 package org.ergoplatform.mining
 
 import org.ergoplatform.ErgoTreePredef
+import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.nodeView.history.ErgoHistoryUtils._
-import org.ergoplatform.nodeView.state.ErgoStateContext
+import org.ergoplatform.nodeView.state.{ErgoStateContext, UtxoStateReader}
 import org.ergoplatform.settings.MonetarySettings
 import org.ergoplatform.utils.{BoxUtils, ErgoCorePropertyTest, RandomWrapper}
 import org.ergoplatform.wallet.interpreter.ErgoInterpreter
 import org.scalacheck.Gen
+import scorex.util.ModifierId
 import sigma.data.ProveDlog
 
+import scala.annotation.tailrec
 import scala.concurrent.duration._
+import scala.util.{Failure, Success}
 
 class CandidateGeneratorPropSpec extends ErgoCorePropertyTest {
   import org.ergoplatform.utils.ErgoNodeTestConstants._
@@ -232,6 +236,81 @@ class CandidateGeneratorPropSpec extends ErgoCorePropertyTest {
     collectedReversed should not contain tx2
   }
 
+  property("map overlay collectTxs matches legacy withTransactions overlay") {
+    def check(txCount: Int, withTokens: Boolean): Unit = {
+      val bh       = boxesHolderGen.sample.get
+      val rnd      = new RandomWrapper
+      val us       = createUtxoState(bh, parameters)
+      val minValue = BoxUtils.sufficientAmount(parameters)
+      val inputs   = bh.boxes.values.toIndexedSeq.filter(_.value >= minValue * 2).takeRight(txCount)
+      val txs = inputs.map(i =>
+        validTransactionFromBoxes(IndexedSeq(i), rnd, issueNew = withTokens, feeProp)
+      )
+      val h = validFullBlock(None, us, bh, rnd).header
+      val upcomingContext = us.stateContext.upcoming(
+        h.minerPk, h.timestamp, h.nBits, h.votes, emptyVSUpdate, h.version
+      )
+      val maxCost = parameters.maxBlockCost
+      val maxSize = parameters.maxBlockSize
+
+      val modern = CandidateGenerator.collectTxs(
+        defaultMinerPk, maxCost, maxSize, us, upcomingContext, txs
+      )
+      val legacy = collectTxsLegacy(
+        defaultMinerPk, maxCost, maxSize, us, upcomingContext, txs
+      )
+      modern._1.map(_.id) shouldBe legacy._1.map(_.id)
+      modern._2 shouldBe legacy._2
+    }
+
+    check(20, withTokens = false)
+    check(30, withTokens = true)
+    check(10, withTokens = false)
+  }
+
+  property("map overlay collectTxs microbenchmark (informational)") {
+    val bh       = boxesHolderGen.sample.get
+    val rnd      = new RandomWrapper
+    val us       = createUtxoState(bh, parameters)
+    val minValue = BoxUtils.sufficientAmount(parameters)
+    val inputs   = bh.boxes.values.toIndexedSeq.filter(_.value >= minValue * 2).takeRight(60)
+    val txs = inputs.map(i =>
+      validTransactionFromBoxes(IndexedSeq(i), rnd, issueNew = false, feeProp)
+    )
+    val h = validFullBlock(None, us, bh, rnd).header
+    val upcomingContext = us.stateContext.upcoming(
+      h.minerPk, h.timestamp, h.nBits, h.votes, emptyVSUpdate, h.version
+    )
+    val maxCost = parameters.maxBlockCost
+    val maxSize = parameters.maxBlockSize
+    val rounds  = 15
+
+    (0 until 2).foreach { _ =>
+      CandidateGenerator.collectTxs(defaultMinerPk, maxCost, maxSize, us, upcomingContext, txs)
+      collectTxsLegacy(defaultMinerPk, maxCost, maxSize, us, upcomingContext, txs)
+    }
+
+    val tModern0 = System.nanoTime()
+    (0 until rounds).foreach { _ =>
+      CandidateGenerator.collectTxs(defaultMinerPk, maxCost, maxSize, us, upcomingContext, txs)
+    }
+    val modernMs = (System.nanoTime() - tModern0) / 1e6
+
+    val tLegacy0 = System.nanoTime()
+    (0 until rounds).foreach { _ =>
+      collectTxsLegacy(defaultMinerPk, maxCost, maxSize, us, upcomingContext, txs)
+    }
+    val legacyMs = (System.nanoTime() - tLegacy0) / 1e6
+
+    info(
+      s"collectTxs overlay microbench pool=${txs.size} rounds=$rounds: " +
+        f"map-overlay ${modernMs}%.1f ms, legacy ${legacyMs}%.1f ms " +
+        "(informational; not a full O(n) candidate-generation claim)"
+    )
+    modernMs should be >= 0.0
+    legacyMs should be >= 0.0
+  }
+
   property("should not be able to spend recent fee boxes") {
 
     val delta          = 1
@@ -327,4 +406,82 @@ class CandidateGeneratorPropSpec extends ErgoCorePropertyTest {
     }
     avgMiningTime shouldBe 200.millis
   }
+
+  /**
+    * Pre-overlay reference: rebuilds state via `withTransactions` and uses linear
+    * `find`/`doublespend` scans. Kept only for differential testing against the map overlay.
+    */
+  private def collectTxsLegacy(
+    minerPk: ProveDlog,
+    maxBlockCost: Int,
+    maxBlockSize: Int,
+    us: UtxoStateReader,
+    upcomingContext: ErgoStateContext,
+    transactions: Seq[ErgoTransaction]
+  ): (Seq[ErgoTransaction], Seq[ModifierId]) = {
+    import CandidateGenerator.{CostedTransaction, collectFees, correctLimits, doublespend}
+
+    val currentHeight = us.stateContext.currentHeight
+    val verifier: ErgoInterpreter = ErgoInterpreter(upcomingContext.currentParameters)
+
+    def inputsNotSpent(tx: ErgoTransaction, s: UtxoStateReader): Boolean =
+      tx.inputs.forall(inp => s.boxById(inp.boxId).isDefined)
+
+    @tailrec
+    def loop(
+      mempoolTxs: Iterable[ErgoTransaction],
+      acc: Seq[CostedTransaction],
+      lastFeeTx: Option[CostedTransaction],
+      invalidTxs: Seq[ModifierId]
+    ): (Seq[ErgoTransaction], Seq[ModifierId]) = {
+      val currentCosted = acc ++ lastFeeTx
+      def current: Seq[ErgoTransaction] = currentCosted.map(_._1)
+      val stateWithTxs = us.withTransactions(current)
+
+      mempoolTxs.headOption match {
+        case Some(tx) =>
+          if (!inputsNotSpent(tx, stateWithTxs) || doublespend(current, tx)) {
+            loop(mempoolTxs.tail, acc, lastFeeTx, invalidTxs :+ tx.id)
+          } else {
+            stateWithTxs.validateWithCost(tx, upcomingContext, maxBlockCost, Some(verifier)) match {
+              case Success(costConsumed) =>
+                val newTxs = acc :+ (tx -> costConsumed)
+                val newBoxes = newTxs.flatMap(_._1.outputs)
+                collectFees(currentHeight, newTxs.map(_._1), minerPk, upcomingContext) match {
+                  case Some(feeTx) =>
+                    val boxesToSpend = feeTx.inputs.flatMap(i =>
+                      newBoxes.find(b => java.util.Arrays.equals(b.id, i.boxId))
+                    )
+                    feeTx.statefulValidity(boxesToSpend, IndexedSeq(), upcomingContext)(verifier) match {
+                      case Success(cost) =>
+                        val blockTxs: Seq[CostedTransaction] = (feeTx -> cost) +: newTxs
+                        if (correctLimits(blockTxs, maxBlockCost, maxBlockSize)) {
+                          loop(mempoolTxs.tail, newTxs, Some(feeTx -> cost), invalidTxs)
+                        } else {
+                          current -> invalidTxs
+                        }
+                      case Failure(_) =>
+                        current -> invalidTxs
+                    }
+                  case None =>
+                    val blockTxs: Seq[CostedTransaction] = newTxs ++ lastFeeTx.toSeq
+                    if (correctLimits(blockTxs, maxBlockCost, maxBlockSize)) {
+                      loop(mempoolTxs.tail, blockTxs, lastFeeTx, invalidTxs)
+                    } else {
+                      current -> invalidTxs
+                    }
+                }
+              case Failure(_) =>
+                loop(mempoolTxs.tail, acc, lastFeeTx, invalidTxs :+ tx.id)
+            }
+          }
+        case None =>
+          current -> invalidTxs
+      }
+    }
+
+    loop(transactions, Seq.empty, None, Seq.empty)
+  }
+
+
 }

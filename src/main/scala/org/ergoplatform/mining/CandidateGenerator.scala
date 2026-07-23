@@ -896,7 +896,8 @@ object CandidateGenerator extends ScorexLogging {
       val currentCosted = acc ++ lastFeeTx
       def current: Seq[ErgoTransaction] = currentCosted.map(_._1)
 
-      // overlay of created outputs and spent inputs of `current`, maintained incrementally
+      // Incremental Map/Set overlay of created outputs and spent inputs for `current`
+      // (equivalent to rebuilding via us.withTransactions(current) + linear find/exists).
       val feeTxOpt = lastFeeTx.map(_._1)
       val currentCreated = accCreated ++ feeTxOpt.map(t => boxesToMap(t.outputs)).getOrElse(Map.empty)
       val currentSpent = accSpent ++ feeTxOpt.map(t => inputKeys(Seq(t))).getOrElse(Set.empty)
