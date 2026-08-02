@@ -5,7 +5,7 @@ import org.ergoplatform.ErgoAddressEncoder
 import org.ergoplatform.http.api.SortDirection
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.{RemoteBlockApplied, Rollback}
-import org.ergoplatform.nodeView.history.extra.ExtraIndexer.ReceivableMessages.{BackfillRentChunk, Index}
+import org.ergoplatform.nodeView.history.extra.ExtraIndexer.ReceivableMessages.{BackfillRentChunk, Index, StartExtraIndexer}
 import org.ergoplatform.nodeView.history.extra.ExtraIndexer.{RentBackfillKey, isRentKey}
 import org.ergoplatform.nodeView.history.extra.IndexedContractTemplateSerializer.hashTreeTemplate
 import org.ergoplatform.nodeView.history.extra.IndexedErgoAddressSerializer.hashErgoTree
@@ -450,6 +450,47 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
     checkRentIndex(HEIGHT + 10)
     ExtraIndexer.rentBackfillCursor(_history.getReader) shouldBe None
     noRent ! Reset()
+  }
+
+  /** Brief step 5's sentinel-branch requirement. Drives a REAL StartExtraIndexer
+    * round-trip through the production `ExtraIndexer` actor (not a direct call
+    * into the branch body, and not `ExtraIndexerTestActor`, which never handles
+    * StartExtraIndexer at all) so a future regression in the three-way startup
+    * branch would actually be caught. This is the one place in the whole feature
+    * where a bug is silent -- a fresh node mistaken for pre-feature, or a
+    * mid-backfill restart that never resumes, both surface only as a 503 that
+    * never clears, with an otherwise-green suite.
+    */
+  property("storage rent backfill writes the sentinel on a fresh database") {
+    // Build the underlying chain but deliberately never send this actor Index():
+    // the extra indexer's OWN progress (IndexedHeightKey/GlobalBoxIndexKey) must
+    // still be at its zero default, which is exactly what "fresh database" means
+    // to the startup branch -- as opposed to a pre-feature database, which would
+    // have indexed height/box progress already recorded.
+    val builder = system.actorOf(Props.create(classOf[ExtraIndexerTestActor], this))
+    builder ! CreateDB(HEIGHT)
+    lock.lock()
+    created.await()
+
+    IndexerState.fromHistory(_history).globalBoxIndex shouldBe 0
+    _history.historyStorage.get(RentBackfillKey) shouldBe empty
+
+    // Real production actor, rent writes on by default -- the actual code path
+    // Task 11's route gate depends on, not a test double.
+    val realIndexer = system.actorOf(
+      Props.create(classOf[ExtraIndexer], initSettings.cacheSettings, addressEncoder))
+    realIndexer ! StartExtraIndexer(_history)
+
+    awaitCondition() { _history.historyStorage.get(RentBackfillKey).isDefined }
+
+    // Both assertions together are what distinguish "sentinel written" from
+    // "key never written at all" -- rentBackfillCursor alone reads None in
+    // both cases, so it can't tell them apart on its own.
+    ExtraIndexer.rentBackfillCursor(_history.getReader) shouldBe None
+    _history.historyStorage.get(RentBackfillKey) shouldBe defined
+
+    system.stop(realIndexer)
+    builder ! Reset()
   }
 
   property("addresses") {
