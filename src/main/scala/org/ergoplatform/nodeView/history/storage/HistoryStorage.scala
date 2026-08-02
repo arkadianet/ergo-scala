@@ -122,6 +122,23 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
   }
   def get(id: Array[Byte]): Option[Array[Byte]] = objectsStore.get(id).orElse(extraStore.get(id))
 
+  /** Ordered scan over raw extraStore keys. See KVStoreReader.getRangeWithFilter.
+    * Used by the storage-rent index, whose 13-byte keys cannot be ModifierIds.
+    * Propagates RangeScanBudgetExceeded to the caller.
+    */
+  def getExtraRange(start: Array[Byte], end: Array[Byte], offset: Int, limit: Int,
+                    reverse: Boolean, visitBudget: Long = Long.MaxValue)
+                   (keyFilter: Array[Byte] => Boolean): Array[(Array[Byte], Array[Byte])] =
+    extraStore.getRangeWithFilter(start, end, offset, limit, reverse, visitBudget)(keyFilter)
+
+  /** Generic UNORDERED enumeration of raw extraStore entries matching a predicate.
+    * Deliberately routed through the pre-existing KVStoreReader.getWithFilter
+    * rather than getExtraRange, so tests can verify the ordered scan against an
+    * independent code path. Do not reimplement this in terms of getExtraRange.
+    */
+  def getAllExtraRaw(cond: (Array[Byte], Array[Byte]) => Boolean): Seq[(Array[Byte], Array[Byte])] =
+    extraStore.getWithFilter(cond).toSeq
+
   /**
     * @return if object with `id` is in the objects database
     */
