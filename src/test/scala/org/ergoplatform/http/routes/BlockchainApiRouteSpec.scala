@@ -247,7 +247,9 @@ class BlockchainApiRouteSpec
   it should "reject limit above MaxItems" in {
     Get("/blockchain/box/unspent/rentEligible?limit=16385") ~> route ~> check {
       status shouldBe StatusCodes.BadRequest
-      responseAs[String] should include("16384")
+      // ApiError.BadRequest's JSON envelope (matching every sibling route in
+      // this file), not a bare string body -- decode and check "detail".
+      responseAs[Json].hcursor.downField("detail").as[String].toOption.get should include("16384")
     }
   }
 
@@ -260,7 +262,7 @@ class BlockchainApiRouteSpec
   it should "reject an invalid sortDirection with the exact existing message" in {
     Get("/blockchain/box/unspent/rentEligible?sortDirection=sideways") ~> route ~> check {
       status shouldBe StatusCodes.BadRequest
-      responseAs[String] should include(
+      responseAs[Json].hcursor.downField("detail").as[String].toOption.get should include(
         """Invalid parameter for sort direction, valid values are "ASC" and "DESC"""")
     }
   }

@@ -448,31 +448,25 @@ case class BlockchainApiRoute(readersHolder: ActorRef, ergoSettings: ErgoSetting
             case Success(Right(json)) => ApiResponse(json)
             case Success(Left(errorRoute)) => errorRoute
             case Failure(_: RangeScanBudgetExceeded) =>
-              rentBadRequest("descending scan budget exceeded; use sortDirection=asc or narrow the range")
+              BadRequest("descending scan budget exceeded; use sortDirection=asc or narrow the range")
             case Failure(e) => throw e
           }
       }
     }
   }
 
-  /** Plain-text 400, matching the plain-text 503 above -- as opposed to
-    * ApiError.BadRequest's JSON-wrapped body, whose "detail" field callers would
-    * have to parse out of a JSON object rather than match on directly.
-    */
-  private def rentBadRequest(msg: String): Route = complete(StatusCodes.BadRequest -> msg)
-
   private def validateAndGetRentEligible(atHeightOpt: Option[Int],
                                          offset: Int,
                                          limit: Int,
                                          dir: Direction): Route = {
     if (limit > MaxItems) {
-      rentBadRequest(s"No more than $MaxItems boxes can be requested")
+      BadRequest(s"No more than $MaxItems boxes can be requested")
     } else if (offset < 0) {
-      rentBadRequest("offset must not be negative")
+      BadRequest("offset must not be negative")
     } else if (atHeightOpt.exists(_ <= 0)) {
-      rentBadRequest("atHeight must be positive")
+      BadRequest("atHeight must be positive")
     } else if (dir == SortDirection.INVALID) {
-      rentBadRequest("Invalid parameter for sort direction, valid values are \"ASC\" and \"DESC\"")
+      BadRequest("Invalid parameter for sort direction, valid values are \"ASC\" and \"DESC\"")
     } else {
       getRentEligible(atHeightOpt, offset, limit, dir)
     }
