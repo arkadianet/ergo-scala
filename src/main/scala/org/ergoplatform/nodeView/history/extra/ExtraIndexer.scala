@@ -652,6 +652,48 @@ object ExtraIndexer {
   val RollbackToKey: Array[Byte] = Algos.hash("rollback to")
   val SchemaVersionKey: Array[Byte] = Algos.hash("schema version")
 
+  /** First byte of raw ordered rent-index keys.
+    *
+    * Raw key-space registry for extraStore:
+    *   0x72 ('r') — storage-rent unspent-by-creation-height index, 13-byte keys.
+    * Every other extraStore key is a 32-byte blake2b hash. This is the first
+    * key-space in extraStore that cannot round-trip through ModifierId, which is
+    * why raw-key removal exists in HistoryStorage.
+    */
+  val RentKeyPrefix: Byte = 0x72
+
+  /** 1 prefix byte + 4 bytes creationHeight + 8 bytes globalBoxIndex. */
+  val RentKeyLength: Int = 13
+
+  /** Progress cursor for the storage-rent backfill (spec §9). 32-byte hash, so
+    * isRentKey can never match it.
+    */
+  val RentBackfillKey: Array[Byte] = Algos.hash("rent backfill")
+
+  /** Encode a rent-index key. Big-endian so byte order equals numeric order —
+    * which holds only for NON-NEGATIVE components, hence the require. A negative
+    * creationHeight sorts above every positive one and would silently vanish from
+    * every range scan. The consensus rule enforcing creationHeight >= 0 is
+    * disabled for block version 1 (ErgoTransaction.scala:173), so this guard is
+    * real. Callers must short-circuit before calling with a negative cutoff.
+    */
+  def rentKey(creationHeight: Int, globalIndex: Long): Array[Byte] = {
+    require(creationHeight >= 0, s"negative creationHeight in rent key: $creationHeight")
+    require(globalIndex >= 0, s"negative globalIndex in rent key: $globalIndex")
+    ByteBuffer.allocate(RentKeyLength)
+      .put(RentKeyPrefix)
+      .putInt(creationHeight)
+      .putLong(globalIndex)
+      .array
+  }
+
+  /** Mandatory filter for every scan over the rent key-space. A 32-byte hash
+    * whose first byte is 0x72 and whose bytes 1-4 encode a value below the scan
+    * cutoff sorts INSIDE a rent range; decoding it yields garbage.
+    */
+  def isRentKey(key: Array[Byte]): Boolean =
+    key.length == RentKeyLength && key(0) == RentKeyPrefix
+
   def getIndex(key: Array[Byte], history: HistoryStorage): ByteBuffer =
     ByteBuffer.wrap(history.modifierBytesById(bytesToId(key)).getOrElse(Array.fill[Byte](8) {
       0
