@@ -9,25 +9,21 @@ import org.ergoplatform.nodeView.history.extra.ExtraIndexer.ReceivableMessages.I
 import org.ergoplatform.nodeView.history.extra.IndexedContractTemplateSerializer.hashTreeTemplate
 import org.ergoplatform.nodeView.history.extra.IndexedErgoAddressSerializer.hashErgoTree
 import org.ergoplatform.nodeView.history.extra.SegmentSerializer.{boxSegmentId, txSegmentId}
-import org.ergoplatform.nodeView.history.{ErgoHistory, ErgoHistoryReader}
+import org.ergoplatform.nodeView.history.ErgoHistoryReader
 import org.ergoplatform.nodeView.mempool.ErgoMemPool
 import org.ergoplatform.settings.ErgoSettings
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import scorex.util.{ModifierId, bytesToId}
 import spire.implicits.cfor
 
-import java.util.concurrent.locks.{Condition, ReentrantLock}
 import scala.collection.mutable
 import scala.reflect.ClassTag
 
-class ExtraIndexerSpecification extends ErgoCorePropertyTest {
+class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTestHarness {
   import org.ergoplatform.utils.ErgoNodeTestConstants._
 
   implicit val addressEncoder: ErgoAddressEncoder = settings.addressEncoder
   val initSettings: ErgoSettings = settings
-  case class CreateDB(blockCount: Int)
-  case class Reset()
-  case class GenerateBetterChainTip()
 
   type ID_LL = mutable.HashMap[ModifierId,(Long,Long)]
 
@@ -38,12 +34,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
   val system: ActorSystem = ActorSystem.create("indexer-test")
   val indexer: ActorRef = system.actorOf(Props.create(classOf[ExtraIndexerTestActor], this))
 
-  var _history: ErgoHistory = _
   def history: ErgoHistoryReader = _history.getReader
-
-  val lock: ReentrantLock = new ReentrantLock()
-  val done: Condition = lock.newCondition()
-  val created: Condition = lock.newCondition()
 
   def manualIndex(limit: Int): (ID_LL, // address -> (erg,tokenSum)
                                 ID_LL, // template -> (spentBoxCount,unspentBoxCount)

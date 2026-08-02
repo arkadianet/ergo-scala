@@ -14,7 +14,17 @@ import java.io.File
 import scala.collection.mutable
 import scala.concurrent.duration.DurationInt
 
-class ExtraIndexerTestActor(test: ExtraIndexerSpecification) extends ExtraIndexerBase with FileUtils {
+class ExtraIndexerTestActor(test: ExtraIndexerTestHarness,
+                            saveLimitOverride: Int,
+                            override val rentWritesEnabled: Boolean)
+  extends ExtraIndexerBase with FileUtils {
+
+  /** Explicit auxiliary constructors. ExtraIndexerSpecification constructs this
+    * reflectively via Props.create, which matches by arity — and Scala emits only
+    * ONE constructor for default parameters, so defaults would break it.
+    */
+  def this(test: ExtraIndexerTestHarness) = this(test, 1, true)
+  def this(test: ExtraIndexerTestHarness, saveLimitOverride: Int) = this(test, saveLimitOverride, true)
 
   override def receive: Receive = {
     case test.CreateDB(blockCount: Int) => createDB(blockCount)
@@ -37,7 +47,7 @@ class ExtraIndexerTestActor(test: ExtraIndexerSpecification) extends ExtraIndexe
 
   type ID_LL = mutable.HashMap[ModifierId,(Long,Long)]
 
-  override protected val saveLimit: Int = 1 // save every block
+  override protected val saveLimit: Int = saveLimitOverride
   override protected implicit val segmentThreshold: Int = 8 // split to smaller segments
   override protected implicit val addressEncoder: ErgoAddressEncoder = test.initSettings.chainSettings.addressEncoder
 

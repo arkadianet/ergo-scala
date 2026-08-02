@@ -74,6 +74,12 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
     history.bestBlockTransactionsAt(height).get.txs.last
   }
 
+  /** Test seam: lets a spec build a history WITHOUT rent rows, simulating a
+    * pre-feature database for the backfill tests (Task 9). Always true in
+    * production; Task 6 guards the rent write sites with it.
+    */
+  protected val rentWritesEnabled: Boolean = true
+
   // fast access buffers
   protected val general: ArrayBuffer[ExtraIndex] = ArrayBuffer.empty[ExtraIndex]
   protected val boxes: mutable.HashMap[ModifierId, IndexedErgoBox] = mutable.HashMap.empty[ModifierId, IndexedErgoBox]
