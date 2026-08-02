@@ -827,6 +827,17 @@ object ExtraIndexer {
     getIndex(key, history.historyStorage)
   }
 
+  /** Public scan over the rent key-space for API routes, which cannot reach the
+    * protected[history] historyStorage directly. Always applies the mandatory
+    * §2.3 key filter — callers cannot forget it. Propagates
+    * RangeScanBudgetExceeded; descending callers must pass a finite budget.
+    */
+  def rentRange(history: ErgoHistoryReader,
+                start: Array[Byte], end: Array[Byte],
+                offset: Int, limit: Int, reverse: Boolean,
+                visitBudget: Long = Long.MaxValue): Array[(Array[Byte], Array[Byte])] =
+    history.historyStorage.getExtraRange(start, end, offset, limit, reverse, visitBudget)(isRentKey)
+
   /** Backfill progress. None = complete, or never needed (no key on a database
     * that was built with the rent index from the start). Some(c) = in progress,
     * next globalBoxIndex to process is c. Routes gate on Some.
