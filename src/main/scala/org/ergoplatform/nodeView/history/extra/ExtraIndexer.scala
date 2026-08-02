@@ -516,6 +516,47 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
     newState
   }
 
+  protected val RentBackfillChunkSize: Int = 10000
+
+  /** One chunk of the resumable storage-rent backfill (spec §9). Walks the
+    * dense numeric box index [cursor, min(cursor + chunk, watermark)) and
+    * writes rent rows for boxes still unspent. Self-messages for the next
+    * chunk until the watermark is reached, at which point it writes the -1
+    * completion sentinel.
+    */
+  protected def backfillRentChunk(watermark: Long): Unit = {
+    val cursor = ExtraIndexer.rentBackfillCursor(history).getOrElse(return)
+    val end = math.min(cursor + RentBackfillChunkSize, watermark)
+    val rows = ArrayBuffer.empty[(Array[Byte], Array[Byte])]
+    cfor(cursor)(_ < end, _ + 1) { n =>
+      // getBoxByNumber has an UNGUARDED .get on the inner NumericBoxIndex lookup
+      // (NumericIndex.scala:94-99) and throws NoSuchElementException on any gap.
+      // A throw here restarts the actor, which restarts the backfill, which
+      // throws again -- an infinite restart loop. Absorb and log instead.
+      val boxOpt = try NumericBoxIndex.getBoxByNumber(history, n) catch {
+        case _: NoSuchElementException =>
+          log.warn(s"Rent backfill: no box index at $n, skipping")
+          None
+      }
+      boxOpt.foreach { iEb =>
+        // Buffer first, exactly like findAndSpendBox, so an unflushed spend is seen.
+        val live = boxes.getOrElse(iEb.id, iEb)
+        if (!live.isSpent) {
+          rows += ((rentKey(live.box.creationHeight, live.globalIndex), fastIdToBytes(live.id)))
+        }
+      }
+    }
+    val nextCursor = if (end >= watermark) -1L else end
+    // Rows and cursor in ONE batch: the cursor can never advance ahead of its rows.
+    rows += ((RentBackfillKey, ByteBuffer.allocate(8).putLong(nextCursor).array))
+    historyStorage.insertExtra(rows.toArray, Array.empty)
+    if (nextCursor >= 0L) self ! BackfillRentChunk(watermark)
+    else log.info("Storage-rent backfill complete")
+    // No-op in production; lets tests block on the existing lock/done handshake
+    // until this chunk (or the whole backfill) has been durably written.
+    caughtUpHook()
+  }
+
   protected def loaded(state: IndexerState): Receive = {
 
     case Index() if !state.caughtUp && !state.rollbackInProgress =>
@@ -574,6 +615,8 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
     case GetSegmentThreshold =>
       sender ! segmentThreshold
 
+    case BackfillRentChunk(watermark) => backfillRentChunk(watermark)
+
     case _ =>
 
   }
@@ -624,6 +667,31 @@ class ExtraIndexer(cacheSettings: CacheSettings,
       self ! Index()
       unstashAll()
 
+      // Storage-rent backfill (spec §9 rev. 3): three-way branch on cursor state.
+      ExtraIndexer.rentBackfillCursor(this.history) match {
+        case Some(c) =>
+          // Interrupted backfill: resume. Watermark = CURRENT globalBoxIndex --
+          // boxes indexed live since the original watermark already have rows;
+          // re-deriving them is an idempotent overwrite.
+          log.info(s"Resuming storage-rent backfill from $c up to ${state.globalBoxIndex}")
+          self ! BackfillRentChunk(state.globalBoxIndex)
+        case None if historyStorage.get(RentBackfillKey).isEmpty =>
+          if (state.globalBoxIndex > 0) {
+            // Pre-feature database: backfill [0, W).
+            historyStorage.insertExtra(
+              Array((RentBackfillKey, ByteBuffer.allocate(8).putLong(0L).array)), Array.empty)
+            log.info(s"Starting storage-rent backfill up to global box index ${state.globalBoxIndex}")
+            self ! BackfillRentChunk(state.globalBoxIndex)
+          } else {
+            // Fresh database: live indexing builds everything. Write the -1
+            // sentinel NOW so the key is never absent on a later restart --
+            // otherwise the first restart triggers the spurious backfill above.
+            historyStorage.insertExtra(
+              Array((RentBackfillKey, ByteBuffer.allocate(8).putLong(-1L).array)), Array.empty)
+          }
+        case None => // sentinel present: backfill already complete, nothing to do
+      }
+
   }
 }
 
@@ -655,6 +723,13 @@ object ExtraIndexer {
       * @param branchHeight - height of last block to keep
       */
     case class RemoveAfter(branchHeight: Int)
+
+    /** Process one chunk of the rent backfill, then self-message for the next.
+      * Runs through the actor mailbox, so it interleaves with — never runs
+      * concurrently with — live block indexing. That sequentiality IS the
+      * concurrency control; no locks needed.
+      */
+    case class BackfillRentChunk(watermark: Long)
   }
 
   /**
@@ -751,6 +826,18 @@ object ExtraIndexer {
   def getIndex(key: Array[Byte], history: ErgoHistoryReader): ByteBuffer = {
     getIndex(key, history.historyStorage)
   }
+
+  /** Backfill progress. None = complete, or never needed (no key on a database
+    * that was built with the rent index from the start). Some(c) = in progress,
+    * next globalBoxIndex to process is c. Routes gate on Some.
+    */
+  def rentBackfillCursor(history: ErgoHistoryReader): Option[Long] =
+    history.historyStorage.get(RentBackfillKey) match {
+      case Some(bytes) if bytes.length == 8 =>
+        val c = ByteBuffer.wrap(bytes).getLong
+        if (c < 0L) None else Some(c)
+      case _ => None
+    }
 
   def apply(chainSettings: ChainSettings, cacheSettings: CacheSettings)(implicit system: ActorSystem): ActorRef = {
     val props = Props.create(classOf[ExtraIndexer], cacheSettings, chainSettings.addressEncoder)

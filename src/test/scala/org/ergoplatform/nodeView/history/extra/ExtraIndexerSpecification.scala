@@ -5,8 +5,8 @@ import org.ergoplatform.ErgoAddressEncoder
 import org.ergoplatform.http.api.SortDirection
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.{RemoteBlockApplied, Rollback}
-import org.ergoplatform.nodeView.history.extra.ExtraIndexer.ReceivableMessages.Index
-import org.ergoplatform.nodeView.history.extra.ExtraIndexer.isRentKey
+import org.ergoplatform.nodeView.history.extra.ExtraIndexer.ReceivableMessages.{BackfillRentChunk, Index}
+import org.ergoplatform.nodeView.history.extra.ExtraIndexer.{RentBackfillKey, isRentKey}
 import org.ergoplatform.nodeView.history.extra.IndexedContractTemplateSerializer.hashTreeTemplate
 import org.ergoplatform.nodeView.history.extra.IndexedErgoAddressSerializer.hashErgoTree
 import org.ergoplatform.nodeView.history.extra.SegmentSerializer.{boxSegmentId, txSegmentId}
@@ -18,6 +18,8 @@ import scorex.db.ByteArrayWrapper
 import scorex.util.{ModifierId, bytesToId}
 import spire.implicits.cfor
 
+import java.nio.ByteBuffer
+import java.util.concurrent.TimeUnit
 import scala.collection.mutable
 import scala.reflect.ClassTag
 
@@ -167,6 +169,66 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
     onDisk.size shouldBe expected.size
   }
 
+  /** Blocks until `pred` holds, polling on the existing lock/done handshake with a
+    * short timeout per attempt rather than a single unbounded await. The backfill
+    * self-perpetuates through the actor mailbox (each processed chunk fires
+    * `caughtUpHook`, same as live indexing), so many signals can arrive in quick
+    * succession; a plain single `await()` risks missing one between our check of
+    * `pred` and re-entering the wait, which would hang the test forever. Polling
+    * makes that impossible: worst case we just re-check on the next tick.
+    */
+  def awaitCondition(timeoutMs: Long = 30000)(pred: => Boolean): Unit = {
+    val deadline = System.currentTimeMillis + timeoutMs
+    while (!pred) {
+      if (System.currentTimeMillis > deadline)
+        throw new RuntimeException("Timed out waiting for backfill condition")
+      lock.lock()
+      try {
+        if (!pred) done.await(50, TimeUnit.MILLISECONDS)
+      } finally {
+        lock.unlock()
+      }
+    }
+  }
+
+  /** Directly (over)write the backfill cursor, bypassing the production startup
+    * wiring (which the test actor never exercises -- it only handles
+    * CreateDB/Index/Reset/GenerateBetterChainTip, not StartExtraIndexer). Mirrors
+    * what that startup code writes for a pre-feature database.
+    */
+  def seedBackfillCursor(cursor: Long = 0L): Unit =
+    _history.historyStorage.insertExtra(
+      Array((RentBackfillKey, ByteBuffer.allocate(8).putLong(cursor).array)), Array.empty)
+
+  private def ensureBackfillStarted(): Unit =
+    if (_history.historyStorage.get(RentBackfillKey).isEmpty) seedBackfillCursor(0L)
+
+  /** Trigger `chunks` rounds of backfill progress and wait for each to land.
+    * Seeds the cursor at 0 on first use, exactly like the production startup
+    * wiring would for a pre-feature database. Since a single `BackfillRentChunk`
+    * self-perpetuates until the watermark is reached, this waits for the cursor
+    * to move at least once per requested round rather than assuming exactly one
+    * chunk elapses -- with the small `RentBackfillChunkSize` the test actor uses,
+    * one round leaves the backfill well short of complete.
+    */
+  def runBackfillChunks(actor: ActorRef, chunks: Int): Unit = {
+    ensureBackfillStarted()
+    val watermark = IndexerState.fromHistory(_history).globalBoxIndex
+    cfor(0)(_ < chunks, _ + 1) { _ =>
+      val before = ExtraIndexer.rentBackfillCursor(_history.getReader)
+      actor ! BackfillRentChunk(watermark)
+      awaitCondition() { ExtraIndexer.rentBackfillCursor(_history.getReader) != before }
+    }
+  }
+
+  /** Drive the backfill to completion against the CURRENT global box index. */
+  def runBackfillToCompletion(actor: ActorRef): Unit = {
+    ensureBackfillStarted()
+    val watermark = IndexerState.fromHistory(_history).globalBoxIndex
+    actor ! BackfillRentChunk(watermark)
+    awaitCondition() { ExtraIndexer.rentBackfillCursor(_history.getReader).isEmpty }
+  }
+
   // example G-30;R-20;G-35;R-30
   def rollbackWithPattern(pattern: String): Unit = {
 
@@ -305,6 +367,89 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
     done.await()
     checkRentIndex(HEIGHT)
     bigBatchIndexer ! Reset()
+  }
+
+  property("storage rent backfill populates an existing index") {
+    val noRent = system.actorOf(
+      Props.create(classOf[ExtraIndexerTestActor], this, Int.box(1), Boolean.box(false)))
+    noRent ! CreateDB(HEIGHT)
+    noRent ! Index()
+    lock.lock()
+    done.await()
+
+    // Pre-feature database: indexed, but no rent rows at all.
+    _history.historyStorage.getAllExtraRaw((k, _) => isRentKey(k)) shouldBe empty
+
+    runBackfillToCompletion(noRent)
+
+    checkRentIndex(HEIGHT)
+    ExtraIndexer.rentBackfillCursor(_history.getReader) shouldBe None
+    noRent ! Reset()
+  }
+
+  property("storage rent backfill resumes from its cursor") {
+    val noRent = system.actorOf(
+      Props.create(classOf[ExtraIndexerTestActor], this, Int.box(1), Boolean.box(false)))
+    noRent ! CreateDB(HEIGHT)
+    noRent ! Index()
+    lock.lock()
+    done.await()
+
+    runBackfillChunks(noRent, chunks = 1)
+    ExtraIndexer.rentBackfillCursor(_history.getReader) shouldBe defined
+
+    runBackfillToCompletion(noRent)
+    checkRentIndex(HEIGHT)
+    ExtraIndexer.rentBackfillCursor(_history.getReader) shouldBe None
+    noRent ! Reset()
+  }
+
+  /** Required by spec section 11.2. This is the ONLY test that exercises the
+    * buffer-first lookup in backfillRentChunk (`boxes.getOrElse(iEb.id, iEb)`),
+    * which is what section 9's lock-free argument rests on. Without it, deleting
+    * that lookup passes everything else.
+    */
+  property("storage rent backfill interleaves with live indexing") {
+    // A large saveLimit keeps the live-indexing buffers from flushing until the
+    // extension below is fully caught up, so there is a real window in which a
+    // freshly-indexed spend of an original, not-yet-backfilled box sits only in
+    // the unflushed `boxes` buffer -- exactly what the buffer-first lookup is for.
+    val noRent = system.actorOf(
+      Props.create(classOf[ExtraIndexerTestActor], this, Int.box(1000000), Boolean.box(false)))
+    noRent ! CreateDB(HEIGHT)
+    noRent ! Index()
+    lock.lock()
+    done.await()
+
+    // Start the backfill (self-perpetuates in the background through the shared
+    // mailbox) but only wait for the first round of progress.
+    runBackfillChunks(noRent, chunks = 1)
+
+    // Extend the chain and index it while the first backfill pass (still
+    // targeting the original, smaller watermark) is in flight. Some of the
+    // original boxes it hasn't reached yet get spent by the new blocks before
+    // the backfill's own walk visits them.
+    noRent ! CreateDB(HEIGHT + 10)
+    noRent ! Index()
+
+    // Let both the original backfill pass and the extension's indexing fully
+    // settle before starting a second pass with an updated watermark: running
+    // two chains toward different watermarks concurrently is unsafe (the
+    // shorter one can stomp the cursor to -1 while the longer one is still
+    // mid-flight).
+    awaitCondition() {
+      ExtraIndexer.rentBackfillCursor(_history.getReader).isEmpty &&
+        IndexerState.fromHistory(_history).caughtUp
+    }
+
+    // Cover any boxes the first pass never reached, including the extension's.
+    // Re-deriving rows for the already-covered range is an idempotent overwrite.
+    seedBackfillCursor(0L)
+    runBackfillToCompletion(noRent)
+
+    checkRentIndex(HEIGHT + 10)
+    ExtraIndexer.rentBackfillCursor(_history.getReader) shouldBe None
+    noRent ! Reset()
   }
 
   property("addresses") {

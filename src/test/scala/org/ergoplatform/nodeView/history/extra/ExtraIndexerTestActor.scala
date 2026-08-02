@@ -51,6 +51,12 @@ class ExtraIndexerTestActor(test: ExtraIndexerTestHarness,
   override protected implicit val segmentThreshold: Int = 8 // split to smaller segments
   override protected implicit val addressEncoder: ErgoAddressEncoder = test.initSettings.chainSettings.addressEncoder
 
+  /** Small on purpose: test chains have far fewer than 10000 boxes, so the
+    * production default would always finish the backfill in a single chunk,
+    * making it impossible to exercise resumption from a mid-backfill cursor.
+    */
+  override protected val RentBackfillChunkSize: Int = 3
+
   val nodeSettings: NodeConfigurationSettings = NodeConfigurationSettings(StateType.Utxo, verifyTransactions = true,
     -1, UtxoSettings(utxoBootstrap = false, 0, 2), NipopowSettings(nipopowBootstrap = false, 1), mining = false,
     ChainGenerator.txCostLimit, ChainGenerator.txSizeLimit, blockCandidateGenerationInterval = 20.seconds, useExternalMiner = false,
