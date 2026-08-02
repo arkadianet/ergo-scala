@@ -6,6 +6,7 @@ import org.ergoplatform.http.api.SortDirection
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.{RemoteBlockApplied, Rollback}
 import org.ergoplatform.nodeView.history.extra.ExtraIndexer.ReceivableMessages.Index
+import org.ergoplatform.nodeView.history.extra.ExtraIndexer.isRentKey
 import org.ergoplatform.nodeView.history.extra.IndexedContractTemplateSerializer.hashTreeTemplate
 import org.ergoplatform.nodeView.history.extra.IndexedErgoAddressSerializer.hashErgoTree
 import org.ergoplatform.nodeView.history.extra.SegmentSerializer.{boxSegmentId, txSegmentId}
@@ -13,6 +14,7 @@ import org.ergoplatform.nodeView.history.ErgoHistoryReader
 import org.ergoplatform.nodeView.mempool.ErgoMemPool
 import org.ergoplatform.settings.ErgoSettings
 import org.ergoplatform.utils.ErgoCorePropertyTest
+import scorex.db.ByteArrayWrapper
 import scorex.util.{ModifierId, bytesToId}
 import spire.implicits.cfor
 
@@ -143,6 +145,28 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
       seg._1.boxCount == seg._2._1
     })
 
+  /** Assert the on-disk rent index equals the oracle using TWO code paths that
+    * share nothing with getRangeWithFilter — otherwise a bug in the new scan
+    * would make this pass vacuously.
+    *   - no missing rows: HistoryStorage.get raw point lookups (predates this feature)
+    *   - no ghost rows:   getAllExtraRaw -> KVStoreReader.getWithFilter (ditto)
+    */
+  def checkRentIndex(limit: Int): Unit = {
+    val expected = manualRentSet(limit)
+    expected.foreach { case (k, boxId) =>
+      withClue(s"missing rent row ${k.data.toSeq}: ") {
+        _history.historyStorage.get(k.data).map(bytesToId) shouldBe Some(boxId)
+      }
+    }
+    val onDisk = _history.historyStorage.getAllExtraRaw((k, _) => isRentKey(k))
+    onDisk.foreach { case (k, _) =>
+      withClue(s"ghost rent row ${k.toSeq}: ") {
+        expected.contains(ByteArrayWrapper(k)) shouldBe true
+      }
+    }
+    onDisk.size shouldBe expected.size
+  }
+
   // example G-30;R-20;G-35;R-30
   def rollbackWithPattern(pattern: String): Unit = {
 
@@ -258,6 +282,26 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
       history.typedExtraIndexById[IndexedErgoBox](id.get.m) shouldNot be(empty)
     }
     indexer ! Reset()
+  }
+
+  property("storage rent rows") {
+    indexer ! CreateDB(HEIGHT)
+    indexer ! Index()
+    lock.lock()
+    done.await()
+    checkRentIndex(HEIGHT)
+    indexer ! Reset()
+  }
+
+  property("storage rent rows with multi-block batches") {
+    val bigBatchIndexer = system.actorOf(
+      Props.create(classOf[ExtraIndexerTestActor], this, Int.box(500), Boolean.box(true)))
+    bigBatchIndexer ! CreateDB(HEIGHT)
+    bigBatchIndexer ! Index()
+    lock.lock()
+    done.await()
+    checkRentIndex(HEIGHT)
+    bigBatchIndexer ! Reset()
   }
 
   property("addresses") {
