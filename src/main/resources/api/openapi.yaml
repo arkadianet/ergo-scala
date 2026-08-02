@@ -322,7 +322,7 @@ components:
                 field reports whatever value that arithmetic produces rather
                 than a clamped or corrected one.
               type: integer
-              format: int32
+              format: int64
 
     RentEligibleBoxes:
       type: object
