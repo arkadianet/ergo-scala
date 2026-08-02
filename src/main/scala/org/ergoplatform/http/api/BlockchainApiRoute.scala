@@ -102,6 +102,7 @@ case class BlockchainApiRoute(readersHolder: ActorRef, ergoSettings: ErgoSetting
       getBoxesByAddressUnspentR ~
       getBoxesByAddressUnspentGetRoute ~
       getRentEligibleR ~
+      getRentMaturingInRangeR ~
       getBoxesByTemplateHashR ~
       getBoxesByTemplateHashUnspentR ~
       getBoxRangeR ~
@@ -321,8 +322,9 @@ case class BlockchainApiRoute(readersHolder: ActorRef, ergoSettings: ErgoSetting
         validateAndGetBoxesByAddressUnspent(address, offset, limit, dir, unconfirmed, excludeMempoolSpent)
     }
 
-  /** Scan the rent index [rentKey(0,0), rentKey(cutoff, Long.MaxValue)] and
-    * collect the first `offset + limit` EMITTED items (i.e. `target`), starting
+  /** Scan the rent index over [start, end] (both routes construct these from
+    * `rentKey`) and collect the first `offset + limit` EMITTED items (i.e.
+    * `target`), starting
     * the underlying raw scan at position 0 and re-issuing it with a growing
     * key-counted limit as anomalous rows (missing box / already spent) are
     * skipped along the way. The caller then drops the first `offset` items to
@@ -344,14 +346,13 @@ case class BlockchainApiRoute(readersHolder: ActorRef, ergoSettings: ErgoSetting
     * since that signals a massively desynced index rather than a stray orphan
     * row.
     */
-  private def scanRentEligible(history: ErgoHistoryReader,
-                               cutoff: Int,
-                               offset: Int,
-                               limit: Int,
-                               reverse: Boolean,
-                               factor: Int): Either[Route, Vector[(IndexedErgoBox, Int, Int)]] = {
-    val start = ExtraIndexer.rentKey(0, 0L)
-    val end = ExtraIndexer.rentKey(cutoff, Long.MaxValue)
+  private def scanRentRange(history: ErgoHistoryReader,
+                            start: Array[Byte],
+                            end: Array[Byte],
+                            offset: Int,
+                            limit: Int,
+                            reverse: Boolean,
+                            factor: Int): Either[Route, Vector[(IndexedErgoBox, Int, Int)]] = {
     val visitBudget = if (reverse) DescendingScanBudget else Long.MaxValue
     val target = offset + limit
 
@@ -376,10 +377,10 @@ case class BlockchainApiRoute(readersHolder: ActorRef, ergoSettings: ErgoSetting
             acc += ((iEb, size, fee))
             emittedThisRound += 1
           case Some(_) =>
-            log.debug(s"rentEligible: skipping already-spent box $boxId in rent index")
+            log.debug(s"rent range scan: skipping already-spent box $boxId in rent index")
             totalSkipped += 1
           case None =>
-            log.warn(s"rentEligible: missing box $boxId referenced by rent index")
+            log.warn(s"rent range scan: missing box $boxId referenced by rent index")
             totalSkipped += 1
         }
       }
@@ -429,22 +430,69 @@ case class BlockchainApiRoute(readersHolder: ActorRef, ergoSettings: ErgoSetting
       Right(baseFields(Json.arr()))
     } else {
       val reverse = dir == DESC
-      scanRentEligible(history, cutoff, offset, limit, reverse, factorAtHeight.factor).map { items =>
+      val start = ExtraIndexer.rentKey(0, 0L)
+      val end = ExtraIndexer.rentKey(cutoff, Long.MaxValue)
+      scanRentRange(history, start, end, offset, limit, reverse, factorAtHeight.factor).map { items =>
         baseFields(items.asJson)
       }
     }
   }
 
-  private def getRentEligible(atHeightOpt: Option[Int],
-                              offset: Int,
-                              limit: Int,
-                              dir: Direction): Route = {
+  /** `rentMaturingInRange`'s counterpart of `rentEligibleResponse`: boxes whose
+    * creation height + StoragePeriod falls within [fromHeight, toHeight], i.e.
+    * `creationHeight` in [loCutoff, hiCutoff]. `fromHeight == toHeight` is a
+    * valid single-height slice (subsumes a separate "matures at exactly H"
+    * route); range validation must use `>=`, not `>`, to accept it.
+    */
+  private def rentMaturingInRangeResponse(fromHeight: Int,
+                                          toHeight: Int,
+                                          offset: Int,
+                                          limit: Int,
+                                          dir: Direction,
+                                          history: ErgoHistoryReader,
+                                          state: ErgoStateReader): Either[Route, Json] = {
+    val indexedHeight = getIndex(IndexedHeightKey, history).getInt
+    val loCutoff = math.max(0, fromHeight - Constants.StoragePeriod)
+    val hiCutoff = toHeight - Constants.StoragePeriod
+
+    val factorAtHeight = StorageFeeFactorResolver.factorAt(toHeight, history, state.parameters, ergoSettings)
+
+    def baseFields(items: Json): Json = Json.obj(
+      "items" -> items,
+      "fromHeight" -> fromHeight.asJson,
+      "toHeight" -> toHeight.asJson,
+      "storageFeeFactor" -> factorAtHeight.factor.asJson,
+      "storageFeeFactorSource" -> factorAtHeight.source.asJson,
+      "indexedHeight" -> indexedHeight.asJson,
+      "fullHeight" -> history.fullBlockHeight.asJson
+    )
+
+    // Same rentKey non-negativity trap as rentEligible: hiCutoff < 0 must
+    // short-circuit BEFORE any key is constructed.
+    if (hiCutoff < 0) {
+      Right(baseFields(Json.arr()))
+    } else {
+      val reverse = dir == DESC
+      val start = ExtraIndexer.rentKey(loCutoff, 0L)
+      val end = ExtraIndexer.rentKey(hiCutoff, Long.MaxValue)
+      scanRentRange(history, start, end, offset, limit, reverse, factorAtHeight.factor).map { items =>
+        baseFields(items.asJson)
+      }
+    }
+  }
+
+  /** Shared by both rent routes: 503-gate on an in-progress backfill, run `f`,
+    * translate a descending-scan budget overrun into 400, and complete with the
+    * resulting JSON. A gate wired into one handler and forgotten in the other is
+    * exactly the kind of regression this sharing is meant to prevent.
+    */
+  private def withRentBackfillGate(f: (ErgoHistoryReader, ErgoStateReader) => Either[Route, Json]): Route = {
     onSuccess(getHistoryWithState) { case (history, state) =>
       ExtraIndexer.rentBackfillCursor(history) match {
         case Some(c) =>
           complete(StatusCodes.ServiceUnavailable -> s"rent index backfill in progress: $c")
         case None =>
-          Try(rentEligibleResponse(atHeightOpt, offset, limit, dir, history, state)) match {
+          Try(f(history, state)) match {
             case Success(Right(json)) => ApiResponse(json)
             case Success(Left(errorRoute)) => errorRoute
             case Failure(_: RangeScanBudgetExceeded) =>
@@ -454,6 +502,12 @@ case class BlockchainApiRoute(readersHolder: ActorRef, ergoSettings: ErgoSetting
       }
     }
   }
+
+  private def getRentEligible(atHeightOpt: Option[Int],
+                              offset: Int,
+                              limit: Int,
+                              dir: Direction): Route =
+    withRentBackfillGate((history, state) => rentEligibleResponse(atHeightOpt, offset, limit, dir, history, state))
 
   private def validateAndGetRentEligible(atHeightOpt: Option[Int],
                                          offset: Int,
@@ -476,6 +530,41 @@ case class BlockchainApiRoute(readersHolder: ActorRef, ergoSettings: ErgoSetting
     (pathPrefix("box" / "unspent" / "rentEligible") & get &
       parameters("atHeight".as[Int].?) & paging & rentSortDir) { (atHeightOpt, offset, limit, dir) =>
       validateAndGetRentEligible(atHeightOpt, offset, limit, dir)
+    }
+
+  private def getRentMaturingInRange(fromHeight: Int,
+                                     toHeight: Int,
+                                     offset: Int,
+                                     limit: Int,
+                                     dir: Direction): Route =
+    withRentBackfillGate((history, state) =>
+      rentMaturingInRangeResponse(fromHeight, toHeight, offset, limit, dir, history, state))
+
+  private def validateAndGetRentMaturingInRange(fromHeight: Int,
+                                                toHeight: Int,
+                                                offset: Int,
+                                                limit: Int,
+                                                dir: Direction): Route = {
+    if (limit > MaxItems) {
+      BadRequest(s"No more than $MaxItems boxes can be requested")
+    } else if (offset < 0) {
+      BadRequest("offset must not be negative")
+    } else if (fromHeight < 0) {
+      BadRequest("fromHeight must not be negative")
+    } else if (fromHeight > toHeight) {
+      BadRequest("fromHeight must not be greater than toHeight")
+    } else if (dir == SortDirection.INVALID) {
+      BadRequest("Invalid parameter for sort direction, valid values are \"ASC\" and \"DESC\"")
+    } else {
+      getRentMaturingInRange(fromHeight, toHeight, offset, limit, dir)
+    }
+  }
+
+  private def getRentMaturingInRangeR: Route =
+    (pathPrefix("box" / "unspent" / "rentMaturingInRange") & get &
+      parameters("fromHeight".as[Int], "toHeight".as[Int]) & paging & rentSortDir) {
+      (fromHeight, toHeight, offset, limit, dir) =>
+        validateAndGetRentMaturingInRange(fromHeight, toHeight, offset, limit, dir)
     }
 
   private def getBoxesByTemplateHash(templateHash: ModifierId, offset: Int, limit: Int): Future[(Seq[IndexedErgoBox],Long)] =

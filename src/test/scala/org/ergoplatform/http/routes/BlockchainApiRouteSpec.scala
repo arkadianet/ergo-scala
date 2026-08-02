@@ -312,4 +312,144 @@ class BlockchainApiRouteSpec
   // (50 blocks << the 1M-key budget). The mechanism is covered by
   // KVStoreRangeSpec's budget cases; that rentRange passes the budget through is
   // verified by inspection. Do not fabricate a route test for it.
+
+  /** Find a box that was created then later spent within the test chain,
+    * together with the (creationHeight, globalIndex) it was originally indexed
+    * under. Production correctly removes the rent row when a box is spent
+    * (ExtraIndexer.scala), so this scenario -- a rent row whose target box
+    * exists but is already spent -- can't arise naturally in the test chain
+    * and must be planted directly, by re-inserting the row production would
+    * have deleted.
+    */
+  private def findSpentBoxRentEntry(limit: Int): (Int, Long, scorex.util.ModifierId) = {
+    val seen = scala.collection.mutable.HashMap.empty[scorex.util.ModifierId, (Int, Long)]
+    var globalBoxIndex = 0L
+    var found: Option[(Int, Long, scorex.util.ModifierId)] = None
+    for (i <- 1 to limit if found.isEmpty) {
+      val header = _history.headerIdsAtHeight(i).last
+      val block = _history.getFullBlock(_history.typedModifierById[org.ergoplatform.modifiers.history.header.Header](header).get)
+      block.get.transactions.foreach { tx =>
+        if (i > 1) tx.inputs.foreach { in =>
+          if (found.isEmpty) {
+            seen.get(bytesToId(in.boxId)).foreach { case (h, g) =>
+              found = Some((h, g, bytesToId(in.boxId)))
+            }
+          }
+        }
+        tx.outputs.foreach { out =>
+          val id = bytesToId(out.id)
+          seen.put(id, (out.creationHeight, globalBoxIndex))
+          globalBoxIndex += 1
+        }
+      }
+    }
+    found.getOrElse(throw new IllegalStateException("test chain has no spent box to plant a stale rent row for"))
+  }
+
+  private def plantSpentBoxRentRow(): Int = {
+    val (h, g, boxId) = findSpentBoxRentEntry(HEIGHT)
+    RentIndexTestSupport.insertExtraRaw(_history, Array(
+      rentKey(h, g) -> RentIndexTestSupport.fastIdToBytes(boxId)))
+    h
+  }
+
+  it should "return exactly the oracle's boxes maturing in range" in {
+    val from = P + 2; val to = P + 4
+    Get(s"/blockchain/box/unspent/rentMaturingInRange?fromHeight=$from&toHeight=$to&limit=16384") ~> route ~> check {
+      status shouldBe StatusCodes.OK
+      val expected = manualRentSet(HEIGHT).keys.map(decodeCreationHeight)
+        .filter(h => h >= from - P && h <= to - P).toSeq.sorted
+      expected should not be empty
+      creationHeightsOf(responseAs[Json]).sorted shouldBe expected
+    }
+  }
+
+  it should "return empty items, HTTP 200, when toHeight is below StoragePeriod" in {
+    // toHeight - StoragePeriod is NEGATIVE; must not reach rentKey's require
+    Get("/blockchain/box/unspent/rentMaturingInRange?fromHeight=1&toHeight=2") ~> route ~> check {
+      status shouldBe StatusCodes.OK
+      itemsOf(responseAs[Json]) shouldBe empty
+    }
+  }
+
+  it should "accept fromHeight == toHeight as a single-height slice" in {
+    // This is what subsumes the Rust node's separate maturesAt route; if it
+    // 400s, the range validation used > instead of >=.
+    val h = P + 3
+    Get(s"/blockchain/box/unspent/rentMaturingInRange?fromHeight=$h&toHeight=$h&limit=16384") ~> route ~> check {
+      status shouldBe StatusCodes.OK
+      creationHeightsOf(responseAs[Json]).foreach(_ shouldBe (h - P))
+    }
+  }
+
+  it should "reject fromHeight greater than toHeight" in {
+    Get("/blockchain/box/unspent/rentMaturingInRange?fromHeight=100&toHeight=99") ~> route ~> check {
+      status shouldBe StatusCodes.BadRequest
+    }
+  }
+
+  it should "reject a negative fromHeight" in {
+    Get("/blockchain/box/unspent/rentMaturingInRange?fromHeight=-1&toHeight=100") ~> route ~> check {
+      status shouldBe StatusCodes.BadRequest
+    }
+  }
+
+  it should "return 503 while a backfill cursor is present for rentMaturingInRange" in {
+    // MUST be tested on this route too, not just rentEligible -- a gate wired
+    // into one handler and forgotten in the other is exactly the B5 regression.
+    setBackfillCursor(42L)
+    try {
+      Get(s"/blockchain/box/unspent/rentMaturingInRange?fromHeight=${P + 2}&toHeight=${P + 4}") ~> route ~> check {
+        status shouldBe StatusCodes.ServiceUnavailable
+        responseAs[String] should include("backfill")
+      }
+    } finally setBackfillComplete()
+    Get(s"/blockchain/box/unspent/rentMaturingInRange?fromHeight=${P + 2}&toHeight=${P + 4}") ~> route ~> check {
+      status shouldBe StatusCodes.OK
+    }
+  }
+
+  it should "echo fromHeight, toHeight, indexedHeight and fullHeight" in {
+    val from = P + 2
+    val to = P + 4
+    Get(s"/blockchain/box/unspent/rentMaturingInRange?fromHeight=$from&toHeight=$to") ~> route ~> check {
+      status shouldBe StatusCodes.OK
+      val c = responseAs[Json].hcursor
+      c.downField("fromHeight").as[Int].toOption.get shouldBe from
+      c.downField("toHeight").as[Int].toOption.get shouldBe to
+      c.downField("indexedHeight").as[Int].toOption.get should be > 0
+      c.downField("fullHeight").as[Int].toOption.get should be > 0
+      c.downField("atHeight").succeeded shouldBe false   // range route has no atHeight
+      c.downField("total").succeeded shouldBe false      // no total, ever
+    }
+  }
+
+  it should "reject limit above MaxItems for rentMaturingInRange" in {
+    Get(s"/blockchain/box/unspent/rentMaturingInRange?fromHeight=${P + 2}&toHeight=${P + 4}&limit=16385") ~> route ~> check {
+      status shouldBe StatusCodes.BadRequest
+      responseAs[Json].hcursor.downField("detail").as[String].toOption.get should include("16384")
+    }
+  }
+
+  it should "default to ascending order for rentMaturingInRange" in {
+    val base = s"/blockchain/box/unspent/rentMaturingInRange?fromHeight=${P + 2}&toHeight=${P + 10}&limit=100"
+    val implicitDir = Get(base) ~> route ~> check {
+      status shouldBe StatusCodes.OK
+      creationHeightsOf(responseAs[Json])
+    }
+    implicitDir should not be empty
+    val explicitAsc = Get(s"$base&sortDirection=asc") ~> route ~> check {
+      creationHeightsOf(responseAs[Json])
+    }
+    implicitDir shouldBe explicitAsc
+  }
+
+  it should "exclude a rent row whose box is already spent" in {
+    val spentHeight = plantSpentBoxRentRow()
+    val maturesAt = spentHeight + P
+    Get(s"/blockchain/box/unspent/rentMaturingInRange?fromHeight=$maturesAt&toHeight=$maturesAt&limit=16384") ~> route ~> check {
+      status shouldBe StatusCodes.OK
+      creationHeightsOf(responseAs[Json]) should not contain spentHeight
+    }
+  }
 }
