@@ -436,6 +436,7 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
       val txTarget: Long = history.typedExtraIndexById[IndexedErgoTransaction](lastTxToKeep.id).get.globalIndex
       val boxTarget: Long = history.typedExtraIndexById[IndexedErgoBox](bytesToId(lastTxToKeep.outputs.last.id)).get.globalIndex
       val toRemove: ArrayBuffer[ModifierId] = ArrayBuffer.empty[ModifierId]
+      val rentKeysToRemove: ArrayBuffer[Array[Byte]] = ArrayBuffer.empty[Array[Byte]]
 
       // remove all tx indexes
       newState = newState.decrementTxIndex
@@ -453,7 +454,11 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
           val template = history.typedExtraIndexById[IndexedContractTemplate](hashTreeTemplate(iEb.box.ergoTree)).get
           template.findAndModBox(iEb.globalIndex, history)
 
-          historyStorage.insertExtra(Array.empty, Array[ExtraIndex](iEb, address, template) ++ address.buffer.values ++ template.buffer.values)
+          // Box is unspent again, so its rent row must come back.
+          historyStorage.insertExtra(
+            Array((rentKey(iEb.box.creationHeight, iEb.globalIndex), fastIdToBytes(iEb.id))),
+            Array[ExtraIndex](iEb, address, template) ++ address.buffer.values ++ template.buffer.values
+          )
 
           cfor(0)(_ < iEb.box.additionalTokens.length, _ + 1) { i =>
             history.typedExtraIndexById[IndexedToken](IndexedToken.fromBox(iEb, i).id).map { token =>
@@ -489,6 +494,9 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
           template.spendBox(iEb)
           toRemove ++= template.rollback(txTarget, boxTarget, _history)
         }
+        // Every removed box must end with no rent row — whether it was spent
+        // (row already gone; absent-key delete is a documented no-op) or unspent.
+        rentKeysToRemove += rentKey(iEb.box.creationHeight, iEb.globalIndex)
         toRemove += iEb.id // box by id
         toRemove += bytesToId(NumericBoxIndex.indexToBytes(newState.globalBoxIndex)) // box id by number
         newState = newState.decrementBoxIndex
@@ -497,6 +505,8 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
 
       // Save changes
       newState = newState.copy(indexedHeight = height, rollbackTo = 0, caughtUp = true)
+      // Rent rows first: see comment above on failure direction.
+      historyStorage.insertExtra(Array.empty, Array.empty, rentKeysToRemove.toArray)
       historyStorage.removeExtra(toRemove.toArray)
       saveProgress(newState)
     } catch {

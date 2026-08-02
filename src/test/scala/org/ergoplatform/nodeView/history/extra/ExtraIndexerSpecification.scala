@@ -221,6 +221,8 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
         else
           boxOpt shouldBe None
       }
+
+      checkRentIndex(n)
     }
 
     def generate(n: Int): Unit = {
@@ -245,6 +247,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
         utxos.exists(_.isSpent) shouldBe false
       }
 
+      checkRentIndex(n)
     }
 
     pattern.split(";").map(_.split("-")).map(x => x(0) -> x(1).toInt).foreach {
