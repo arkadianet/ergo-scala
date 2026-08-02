@@ -59,10 +59,17 @@ class BlockchainApiRouteSpec
   done.await()
 
   // Backfill-gate assertion (brief gotcha #6): the rent routes added in the next task
-  // return 503 while a backfill cursor is present. Assert here, in setup, that this
-  // harness leaves the database in the "no backfill pending" state -- absent key, or a
-  // stored -1 -- so a later 200-expectation in the next task's spec cannot silently
-  // become a 503 that burns someone's afternoon.
+  // return 503 while a backfill cursor is present. `RentBackfillKey` is written ONLY by
+  // the production `StartExtraIndexer` handler / `backfillRentChunk` on the real
+  // `ExtraIndexer` actor -- `ExtraIndexerTestActor` never sends or handles that message,
+  // so the key would be absent here regardless. Absence happens to also read as `None`,
+  // but relying on that would be incidental: absence is exactly what trips the
+  // backfill-START branch, so if chain construction is ever routed through the real
+  // `StartExtraIndexer` path, an absent key would flip the cursor to `Some(0)` and every
+  // rent route added in the next two tasks would silently start 503'ing. Seed the
+  // "backfill already complete" sentinel explicitly instead, so this harness is correct
+  // under both the current and any future construction path.
+  seedBackfillCursor(-1L)
   ExtraIndexer.rentBackfillCursor(_history.getReader) shouldBe None
 
   // extraIndex lives on NodeConfigurationSettings, not ErgoSettings directly.

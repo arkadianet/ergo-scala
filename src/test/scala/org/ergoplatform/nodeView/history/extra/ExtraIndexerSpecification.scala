@@ -18,7 +18,6 @@ import scorex.db.ByteArrayWrapper
 import scorex.util.{ModifierId, bytesToId}
 import spire.implicits.cfor
 
-import java.nio.ByteBuffer
 import java.util.concurrent.TimeUnit
 import scala.collection.mutable
 import scala.reflect.ClassTag
@@ -191,14 +190,10 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
     }
   }
 
-  /** Directly (over)write the backfill cursor, bypassing the production startup
-    * wiring (which the test actor never exercises -- it only handles
-    * CreateDB/Index/Reset/GenerateBetterChainTip, not StartExtraIndexer). Mirrors
-    * what that startup code writes for a pre-feature database.
-    */
-  def seedBackfillCursor(cursor: Long = 0L): Unit =
-    _history.historyStorage.insertExtra(
-      Array((RentBackfillKey, ByteBuffer.allocate(8).putLong(cursor).array)), Array.empty)
+  // seedBackfillCursor now lives on ExtraIndexerTestHarness (org.ergoplatform.nodeView.
+  // history.extra.ExtraIndexerTestHarness) so that suites outside this package tree,
+  // like the route-level BlockchainApiRouteSpec, can seed the sentinel too --
+  // historyStorage is protected[history].
 
   private def ensureBackfillStarted(): Unit =
     if (_history.historyStorage.get(RentBackfillKey).isEmpty) seedBackfillCursor(0L)

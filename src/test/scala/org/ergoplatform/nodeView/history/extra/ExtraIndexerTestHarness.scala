@@ -2,12 +2,13 @@ package org.ergoplatform.nodeView.history.extra
 
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.nodeView.history.ErgoHistory
-import org.ergoplatform.nodeView.history.extra.ExtraIndexer.rentKey
+import org.ergoplatform.nodeView.history.extra.ExtraIndexer.{RentBackfillKey, rentKey}
 import org.ergoplatform.settings.ErgoSettings
 import scorex.db.ByteArrayWrapper
 import scorex.util.{ModifierId, bytesToId}
 import spire.implicits.cfor
 
+import java.nio.ByteBuffer
 import java.util.concurrent.locks.{Condition, ReentrantLock}
 import scala.collection.mutable
 
@@ -30,6 +31,19 @@ trait ExtraIndexerTestHarness {
   case class CreateDB(blockCount: Int)
   case class Reset()
   case class GenerateBetterChainTip()
+
+  /** Directly (over)write the backfill cursor, bypassing the production startup wiring
+    * (`StartExtraIndexer` on the real `ExtraIndexer` actor, which `ExtraIndexerTestActor`
+    * never handles). `historyStorage` is `protected[history]`, so this lives here rather
+    * than at call sites outside the `org.ergoplatform.nodeView.history` package tree
+    * (e.g. a route-level spec) that need to seed the sentinel directly.
+    *
+    * `cursor = -1L` is the "backfill already complete" sentinel the production code
+    * writes; any other value resumes from that byte offset.
+    */
+  def seedBackfillCursor(cursor: Long = -1L): Unit =
+    _history.historyStorage.insertExtra(
+      Array((RentBackfillKey, ByteBuffer.allocate(8).putLong(cursor).array)), Array.empty)
 
   /** Expected rent rows after indexing blocks 1..limit: currently-unspent boxes
     * keyed by (creationHeight, globalIndex) -> boxId.
