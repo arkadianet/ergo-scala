@@ -14,6 +14,7 @@ import org.ergoplatform.nodeView.history.extra.IndexedErgoAddressSerializer.hash
 import org.ergoplatform.nodeView.history.extra.IndexedTokenSerializer.uniqueId
 import org.ergoplatform.nodeView.history.storage.HistoryStorage
 import org.ergoplatform.settings.{Algos, CacheSettings, ChainSettings}
+import scorex.db.ByteArrayWrapper
 import scorex.util.{ModifierId, ScorexLogging, bytesToId}
 import sigma.ast.ErgoTree
 import sigma.Extensions._
@@ -87,6 +88,23 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
   protected val templates: mutable.HashMap[ModifierId, IndexedContractTemplate] = mutable.HashMap.empty[ModifierId, IndexedContractTemplate]
   protected val tokens: mutable.HashMap[ModifierId, IndexedToken] = mutable.HashMap.empty[ModifierId, IndexedToken]
   protected val segments: mutable.HashMap[ModifierId, Segment[_]] = mutable.HashMap.empty[ModifierId, Segment[_]]
+
+  /** Pending storage-rent rows: 13-byte key -> 32-byte boxId.
+    * Deliberately NOT counted in `modCount` (line 238): rentPuts.size ~= boxes.size,
+    * so counting them would halve the effective saveLimit and double flush
+    * frequency for ~45 bytes per entry. Safe because every rentPuts entry
+    * accompanies a boxes.put and every rentRemovals entry accompanies a
+    * findAndSpendBox that also populates boxes — so modCount > 0 whenever these
+    * are non-empty, and no flush can be skipped while rent rows are pending.
+    */
+  protected val rentPuts: mutable.HashMap[ByteArrayWrapper, Array[Byte]] =
+    mutable.HashMap.empty[ByteArrayWrapper, Array[Byte]]
+
+  protected val rentRemovals: mutable.HashSet[ByteArrayWrapper] =
+    mutable.HashSet.empty[ByteArrayWrapper]
+
+  // NOTE: `rentWritesEnabled` was already declared in Task 5, together with the
+  // test actor's override. Do NOT re-declare it here — just use it in steps 2-3.
 
   /**
     * Input tokens in a transaction, cleared after every transaction
@@ -274,8 +292,9 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
         (GlobalTxIndexKey, ByteBuffer.allocate(8).putLong(state.globalTxIndex).array),
         (GlobalBoxIndexKey, ByteBuffer.allocate(8).putLong(state.globalBoxIndex).array),
         (RollbackToKey, ByteBuffer.allocate(4).putInt(state.rollbackTo).array)
-      ),
-      (((((general ++= boxes.values) ++= trees.values) ++= templates.values) ++= tokens.values) ++= segments.values).toArray
+      ) ++ rentPuts.iterator.map { case (k, v) => (k.data, v) },
+      (((((general ++= boxes.values) ++= trees.values) ++= templates.values) ++= tokens.values) ++= segments.values).toArray,
+      rentRemovals.iterator.map(_.data).toArray
     )
 
     log.debug(s"Processed ${trees.size} ErgoTrees with ${boxes.size} boxes and inserted them to database in ${System.currentTimeMillis - start}ms")
@@ -287,6 +306,8 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
     templates.clear()
     tokens.clear()
     segments.clear()
+    rentPuts.clear()
+    rentRemovals.clear()
   }
 
   /**
@@ -327,6 +348,12 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
           val spendingProof = tx.inputs(i).spendingProof
           if (findAndSpendBox(boxId, tx.id, height, spendingProof)) { // spend box and add tx
             val iEb = boxes(boxId)
+            if (rentWritesEnabled) {
+              // Cancel a pending put when the box was created in this same
+              // unflushed batch; otherwise the row is on disk and must be deleted.
+              val rk = ByteArrayWrapper(rentKey(iEb.box.creationHeight, iEb.globalIndex))
+              if (rentPuts.remove(rk).isEmpty) rentRemovals.add(rk)
+            }
             findAndUpdateTree(hashErgoTree(iEb.box.ergoTree), Left(iEb))(newState)
             findAndUpdateTemplate(hashTreeTemplate(iEb.box.ergoTree), Left(iEb))
               cfor(0)(_ < iEb.box.additionalTokens.length, _ + 1) { j =>
@@ -343,6 +370,12 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
       cfor(0)(_ < tx.outputs.size, _ + 1) { i =>
         val iEb: IndexedErgoBox = new IndexedErgoBox(height, None, None, None, tx.outputs(i), newState.globalBoxIndex)
         boxes.put(iEb.id, iEb) // box by id
+        if (rentWritesEnabled) {
+          rentPuts.put(
+            ByteArrayWrapper(rentKey(iEb.box.creationHeight, iEb.globalIndex)),
+            fastIdToBytes(iEb.id)
+          )
+        }
         general += NumericBoxIndex(newState.globalBoxIndex, iEb.id) // box id by global box number
         outputs(i) = iEb.globalIndex
 

@@ -83,11 +83,8 @@ class ExtraIndexerTestActor(test: ExtraIndexerTestHarness,
   def reset(): Unit = {
     stateOpt = None
     test._history = null
-    general.clear()
-    boxes.clear()
-    trees.clear()
-    tokens.clear()
-    segments.clear()
+    general.clear(); boxes.clear(); trees.clear(); templates.clear()
+    tokens.clear(); segments.clear(); rentPuts.clear(); rentRemovals.clear()
     context.become(receive.orElse(loaded(IndexerState(0, 0, 0, 0, caughtUp = false))))
   }
 
