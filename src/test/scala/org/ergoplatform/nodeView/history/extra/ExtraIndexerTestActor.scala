@@ -51,6 +51,17 @@ class ExtraIndexerTestActor(test: ExtraIndexerTestHarness,
   override protected implicit val segmentThreshold: Int = 8 // split to smaller segments
   override protected implicit val addressEncoder: ErgoAddressEncoder = test.initSettings.chainSettings.addressEncoder
 
+  /** Records every `saveProgress` call's exact insertExtra arguments, for specs
+    * that need to prove the progress marker and pending rent mutations travel
+    * in the SAME `insertExtra` invocation (I5b). See `ExtraIndexer.onSaveProgress`.
+    */
+  val saveProgressCalls: mutable.ArrayBuffer[(Array[(Array[Byte], Array[Byte])], Array[Array[Byte]])] =
+    mutable.ArrayBuffer.empty[(Array[(Array[Byte], Array[Byte])], Array[Array[Byte]])]
+
+  override protected def onSaveProgress(indexesToInsert: Array[(Array[Byte], Array[Byte])],
+                                        keysToRemove: Array[Array[Byte]]): Unit =
+    saveProgressCalls += ((indexesToInsert, keysToRemove))
+
   /** Small on purpose: test chains have far fewer than 10000 boxes, so the
     * production default would always finish the backfill in a single chunk,
     * making it impossible to exercise resumption from a mid-backfill cursor.

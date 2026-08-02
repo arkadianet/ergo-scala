@@ -41,7 +41,7 @@ trait ExtraIndexerTestHarness {
     * `cursor = -1L` is the "backfill already complete" sentinel the production code
     * writes; any other value resumes from that byte offset.
     */
-  def seedBackfillCursor(cursor: Long = -1L): Unit =
+  def seedBackfillCursor(cursor: Long): Unit =
     _history.historyStorage.insertExtra(
       Array((RentBackfillKey, ByteBuffer.allocate(8).putLong(cursor).array)), Array.empty)
 

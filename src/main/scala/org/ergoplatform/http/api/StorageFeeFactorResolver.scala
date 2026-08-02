@@ -55,7 +55,9 @@ object StorageFeeFactorResolver extends ScorexLogging {
       // storageFeeFactor is a bare Map.apply (Parameters.scala:33) and throws
       // NoSuchElementException when the key is absent — parseExtension only
       // guarantees the table is non-empty. Keep that inside the Try or it
-      // escapes as a 500, which §8.4 forbids.
+      // escapes as an uncaught 500: an API route must never fail a request
+      // with an unhandled exception for input it can anticipate and recover
+      // from (fall back to the projected factor, as the caller does above).
       factor <- Parameters.parseExtension(epochStart, ext).flatMap(p => Try(p.storageFeeFactor)).toOption
     } yield factor
 }

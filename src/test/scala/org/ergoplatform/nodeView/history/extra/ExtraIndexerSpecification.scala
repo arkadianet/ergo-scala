@@ -1,6 +1,7 @@
 package org.ergoplatform.nodeView.history.extra
 
 import akka.actor.{ActorRef, ActorSystem, Props}
+import akka.testkit.TestActorRef
 import org.ergoplatform.ErgoAddressEncoder
 import org.ergoplatform.http.api.SortDirection
 import org.ergoplatform.modifiers.history.header.Header
@@ -362,6 +363,37 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
     done.await()
     checkRentIndex(HEIGHT)
     bigBatchIndexer ! Reset()
+  }
+
+  /** I5b: HistoryStorageBatchingSpec proves insertExtra itself is one atomic
+    * batch, but not that saveProgress ever PASSES the marker and the pending
+    * rent mutations to the SAME insertExtra call -- splitting saveProgress
+    * into two insertExtra calls would break the atomicity invariant with that
+    * spec still fully green. Uses TestActorRef (with a real dispatcher, so
+    * this stays async like every other test here) purely to reach
+    * `saveProgressCalls`, the recording seam ExtraIndexerTestActor adds over
+    * `ExtraIndexer.onSaveProgress`.
+    */
+  property("saveProgress passes the progress marker and rent mutations to ONE insertExtra call") {
+    val recording: TestActorRef[ExtraIndexerTestActor] =
+      TestActorRef(Props(new ExtraIndexerTestActor(this)).withDispatcher("akka.actor.default-dispatcher"))(system)
+    recording ! CreateDB(HEIGHT)
+    recording ! Index()
+    lock.lock()
+    done.await()
+
+    val calls = recording.underlyingActor.saveProgressCalls
+    calls should not be empty
+    val markerWithRentMutation = calls.exists { case (indexesToInsert, keysToRemove) =>
+      val keys = indexesToInsert.map(_._1)
+      val hasMarker = keys.exists(_.sameElements(ExtraIndexer.IndexedHeightKey))
+      val hasRentMutation = keys.exists(isRentKey) || keysToRemove.exists(isRentKey)
+      hasMarker && hasRentMutation
+    }
+    withClue("no saveProgress call carried both the IndexedHeightKey marker and a rent mutation: ") {
+      markerWithRentMutation shouldBe true
+    }
+    recording ! Reset()
   }
 
   property("storage rent backfill populates an existing index") {

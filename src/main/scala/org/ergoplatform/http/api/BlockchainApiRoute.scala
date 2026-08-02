@@ -54,8 +54,8 @@ case class BlockchainApiRoute(readersHolder: ActorRef, ergoSettings: ErgoSetting
   }
   private val sortDir: Directive[Tuple1[Direction]] = parameters("sortDirection".as(sortMarshaller) ? DESC)
 
-  /** Rent routes default to ascending order (spec §5 rev. 3), against the shared
-    * `sortDir` directive's DESC default above -- do not reuse `sortDir` for these
+  /** Rent routes default to ascending order, against the shared `sortDir`
+    * directive's DESC default above -- do not reuse `sortDir` for these
     * routes, its default is wrong here.
     */
   private val rentSortDir: Directive[Tuple1[Direction]] = parameters("sortDirection".as(sortMarshaller) ? ASC)
@@ -67,7 +67,7 @@ case class BlockchainApiRoute(readersHolder: ActorRef, ergoSettings: ErgoSetting
     */
   private val MaxItems = 16384
 
-  /** Visit budget for descending rent-index scans (spec §5 rev. 3). Forward scans
+  /** Visit budget for descending rent-index scans. Forward scans
     * are O(offset+limit) by construction and need no budget; a descending scan
     * over an unauthenticated route must never be allowed to walk the whole
     * key-space, so it gets a finite budget and a 400 instead of a truncated page.
@@ -519,6 +519,8 @@ case class BlockchainApiRoute(readersHolder: ActorRef, ergoSettings: ErgoSetting
       BadRequest(s"No more than $MaxItems boxes can be requested")
     } else if (offset < 0) {
       BadRequest("offset must not be negative")
+    } else if (offset > MaxItems) {
+      BadRequest(s"offset must not exceed $MaxItems")
     } else if (atHeightOpt.exists(_ <= 0)) {
       BadRequest("atHeight must be positive")
     } else if (dir == SortDirection.INVALID) {
@@ -551,6 +553,8 @@ case class BlockchainApiRoute(readersHolder: ActorRef, ergoSettings: ErgoSetting
       BadRequest(s"No more than $MaxItems boxes can be requested")
     } else if (offset < 0) {
       BadRequest("offset must not be negative")
+    } else if (offset > MaxItems) {
+      BadRequest(s"offset must not exceed $MaxItems")
     } else if (fromHeight < 0) {
       BadRequest("fromHeight must not be negative")
     } else if (fromHeight > toHeight) {

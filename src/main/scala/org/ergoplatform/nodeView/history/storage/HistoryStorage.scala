@@ -167,12 +167,18 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
 
   /** Write extra-index objects and raw key-value pairs, and remove raw keys.
     *
-    * CRASH CONSISTENCY: the raw pairs carry the indexer progress keys (including
-    * IndexedHeightKey) alongside storage-rent rows. They are written in ONE
-    * atomic WriteBatch together with `keysToRemove`, so the height marker can
-    * never become durable ahead of the data it vouches for. Recovery is replay
-    * from IndexedHeightKey, which only heals writes landing before the marker.
-    * DO NOT split this into separate writes — HistoryStorageBatchingSpec enforces it.
+    * CRASH CONSISTENCY (live-indexing flush, i.e. `ExtraIndexer.saveProgress`):
+    * the raw pairs carry the indexer progress keys (including IndexedHeightKey)
+    * alongside storage-rent rows. They are written in ONE atomic WriteBatch
+    * together with `keysToRemove`, so the height marker can never become
+    * durable ahead of the data it vouches for. Recovery is replay from
+    * IndexedHeightKey, which only heals writes landing before the marker.
+    * DO NOT split the live-indexing flush call into separate writes —
+    * HistoryStorageBatchingSpec enforces it. This guarantee is scoped to that
+    * one call site: other callers (e.g. rollback, see ExtraIndexer.scala around
+    * `removeAfter`) may legitimately issue multiple separate `insertExtra`
+    * batches when their own recovery story doesn't depend on single-batch
+    * atomicity.
     *
     * Objects go in a separate (also atomic) batch first; a crash between the two
     * leaves the marker un-advanced, so the block is re-indexed and object writes

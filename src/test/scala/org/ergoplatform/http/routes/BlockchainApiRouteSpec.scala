@@ -259,6 +259,17 @@ class BlockchainApiRouteSpec
     }
   }
 
+  it should "reject an offset above MaxItems" in {
+    // C1: an unbounded offset turns scanRentRange's `target = offset + limit`
+    // into an unauthenticated materialization count -- offset=5000000&limit=1
+    // would buffer ~5M rows before discarding all but one. Must 400 before
+    // any scan happens.
+    Get("/blockchain/box/unspent/rentEligible?offset=5000000&limit=1") ~> route ~> check {
+      status shouldBe StatusCodes.BadRequest
+      responseAs[Json].hcursor.downField("detail").as[String].toOption.get should include("16384")
+    }
+  }
+
   it should "reject an invalid sortDirection with the exact existing message" in {
     Get("/blockchain/box/unspent/rentEligible?sortDirection=sideways") ~> route ~> check {
       status shouldBe StatusCodes.BadRequest
@@ -391,6 +402,14 @@ class BlockchainApiRouteSpec
   it should "reject a negative fromHeight" in {
     Get("/blockchain/box/unspent/rentMaturingInRange?fromHeight=-1&toHeight=100") ~> route ~> check {
       status shouldBe StatusCodes.BadRequest
+    }
+  }
+
+  it should "reject an offset above MaxItems for rentMaturingInRange" in {
+    // C1, same unauthenticated-OOM guard as rentEligible.
+    Get(s"/blockchain/box/unspent/rentMaturingInRange?fromHeight=${P + 2}&toHeight=${P + 4}&offset=5000000&limit=1") ~> route ~> check {
+      status shouldBe StatusCodes.BadRequest
+      responseAs[Json].hcursor.downField("detail").as[String].toOption.get should include("16384")
     }
   }
 

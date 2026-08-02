@@ -9,7 +9,8 @@ import scala.collection.mutable
 /** Thrown when a range scan would visit more keys than its `visitBudget`.
   * Callers exposing scans to untrusted input map this to an explicit client
   * error. NEVER catch-and-truncate: a truncated page is indistinguishable from
-  * an exhausted range and silently corrupts pagination (spec §5 rev. 3).
+  * an exhausted range, which silently breaks the pagination contract that a
+  * page shorter than the requested limit means "range exhausted".
   */
 final class RangeScanBudgetExceeded(msg: String) extends RuntimeException(msg)
 
@@ -156,74 +157,77 @@ trait KVStoreReader extends AutoCloseable {
         s"reverse window $window exceeds visit budget $visitBudget")
     }
     lock.readLock().lock()
-    val ro = new ReadOptions()
-    ro.snapshot(db.getSnapshot)
-    val iter = db.iterator(ro)
     try {
-      iter.seek(start)
-      var visits = 0L
-      if (!reverse) {
-        val bf = mutable.ArrayBuffer.empty[(K, V)]
-        var skipped = 0
-        var continue = true
-        while (continue && iter.hasNext) {
-          val n = iter.next()
-          visits += 1
-          if (visits > visitBudget) {
-            throw new RangeScanBudgetExceeded(s"scan exceeded visit budget $visitBudget")
+      val ro = new ReadOptions()
+      ro.snapshot(db.getSnapshot)
+      val iter = db.iterator(ro)
+      try {
+        iter.seek(start)
+        var visits = 0L
+        if (!reverse) {
+          val bf = mutable.ArrayBuffer.empty[(K, V)]
+          var skipped = 0
+          var continue = true
+          while (continue && iter.hasNext) {
+            val n = iter.next()
+            visits += 1
+            if (visits > visitBudget) {
+              throw new RangeScanBudgetExceeded(s"scan exceeded visit budget $visitBudget")
+            }
+            if (ByteArrayUtils.compare(n.getKey, end) > 0) {
+              continue = false
+            } else if (keyFilter(n.getKey)) {
+              if (skipped < offset) skipped += 1 else bf += (n.getKey -> n.getValue)
+              if (bf.length >= limit) continue = false
+            }
           }
-          if (ByteArrayUtils.compare(n.getKey, end) > 0) {
-            continue = false
-          } else if (keyFilter(n.getKey)) {
-            if (skipped < offset) skipped += 1 else bf += (n.getKey -> n.getValue)
-            if (bf.length >= limit) continue = false
+          bf.toArray[(K, V)]
+        } else {
+          val cap = window.toInt
+          val buf = new Array[(K, V)](cap)
+          var matches = 0L
+          var continue = true
+          while (continue && iter.hasNext) {
+            val n = iter.next()
+            visits += 1
+            if (visits > visitBudget) {
+              throw new RangeScanBudgetExceeded(s"scan exceeded visit budget $visitBudget")
+            }
+            if (ByteArrayUtils.compare(n.getKey, end) > 0) {
+              continue = false
+            } else if (keyFilter(n.getKey)) {
+              buf((matches % cap).toInt) = (n.getKey, n.getValue)
+              matches += 1
+            }
+          }
+          // buf holds the last `held` matches. Match number g was written to slot
+          // g % cap and is only overwritten by match g + cap, so every retained
+          // match (g >= matches - held) still lives at slot g % cap. The
+          // descending page at `offset` is, in match numbers, the interval
+          // [base + max(0, hi - limit), base + hi) reversed, where
+          // base = matches - held and hi = held - offset.
+          val held = math.min(matches, cap.toLong).toInt
+          val hi = held - offset
+          if (hi <= 0) Array.empty[(K, V)]
+          else {
+            val lo = math.max(0, hi - limit)
+            val base = matches - held
+            val out = new Array[(K, V)](hi - lo)
+            var j = hi - 1
+            var i = 0
+            while (j >= lo) {
+              out(i) = buf(((base + j) % cap).toInt)
+              i += 1
+              j -= 1
+            }
+            out
           }
         }
-        bf.toArray[(K, V)]
-      } else {
-        val cap = window.toInt
-        val buf = new Array[(K, V)](cap)
-        var matches = 0L
-        var continue = true
-        while (continue && iter.hasNext) {
-          val n = iter.next()
-          visits += 1
-          if (visits > visitBudget) {
-            throw new RangeScanBudgetExceeded(s"scan exceeded visit budget $visitBudget")
-          }
-          if (ByteArrayUtils.compare(n.getKey, end) > 0) {
-            continue = false
-          } else if (keyFilter(n.getKey)) {
-            buf((matches % cap).toInt) = (n.getKey, n.getValue)
-            matches += 1
-          }
-        }
-        // buf holds the last `held` matches. Match number g was written to slot
-        // g % cap and is only overwritten by match g + cap, so every retained
-        // match (g >= matches - held) still lives at slot g % cap. The
-        // descending page at `offset` is, in match numbers, the interval
-        // [base + max(0, hi - limit), base + hi) reversed, where
-        // base = matches - held and hi = held - offset.
-        val held = math.min(matches, cap.toLong).toInt
-        val hi = held - offset
-        if (hi <= 0) Array.empty[(K, V)]
-        else {
-          val lo = math.max(0, hi - limit)
-          val base = matches - held
-          val out = new Array[(K, V)](hi - lo)
-          var j = hi - 1
-          var i = 0
-          while (j >= lo) {
-            out(i) = buf(((base + j) % cap).toInt)
-            i += 1
-            j -= 1
-          }
-          out
-        }
+      } finally {
+        iter.close()
+        ro.snapshot().close()
       }
     } finally {
-      iter.close()
-      ro.snapshot().close()
       lock.readLock().unlock()
     }
   }

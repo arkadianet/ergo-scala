@@ -68,6 +68,17 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
    */
   protected def caughtUpHook(height: Int = 0): Unit = {}
 
+  /** Test seam: called once per `saveProgress` invocation, immediately before
+    * the write, with the exact `indexesToInsert`/`keysToRemove` arrays about to
+    * be passed to a single `historyStorage.insertExtra` call. Lets a spec
+    * assert that the progress marker and the pending rent mutations travel in
+    * that one call -- the invariant HistoryStorage.insertExtra's docstring
+    * documents and HistoryStorageBatchingSpec enforces at the storage layer --
+    * without touching production behavior.
+    */
+  protected def onSaveProgress(indexesToInsert: Array[(Array[Byte], Array[Byte])],
+                               keysToRemove: Array[Array[Byte]]): Unit = {}
+
   /**
    * Used in tests to get block for rollback, maybe orphan
    */
@@ -76,8 +87,8 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
   }
 
   /** Test seam: lets a spec build a history WITHOUT rent rows, simulating a
-    * pre-feature database for the backfill tests (Task 9). Always true in
-    * production; Task 6 guards the rent write sites with it.
+    * pre-feature database for the backfill tests. Always true in production;
+    * every rent write site is guarded by it.
     */
   protected val rentWritesEnabled: Boolean = true
 
@@ -90,7 +101,7 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
   protected val segments: mutable.HashMap[ModifierId, Segment[_]] = mutable.HashMap.empty[ModifierId, Segment[_]]
 
   /** Pending storage-rent rows: 13-byte key -> 32-byte boxId.
-    * Deliberately NOT counted in `modCount` (line 238): rentPuts.size ~= boxes.size,
+    * Deliberately NOT counted in `modCount`: rentPuts.size ~= boxes.size,
     * so counting them would halve the effective saveLimit and double flush
     * frequency for ~45 bytes per entry. Safe because every rentPuts entry
     * accompanies a boxes.put and every rentRemovals entry accompanies a
@@ -102,9 +113,6 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
 
   protected val rentRemovals: mutable.HashSet[ByteArrayWrapper] =
     mutable.HashSet.empty[ByteArrayWrapper]
-
-  // NOTE: `rentWritesEnabled` was already declared in Task 5, together with the
-  // test actor's override. Do NOT re-declare it here — just use it in steps 2-3.
 
   /**
     * Input tokens in a transaction, cleared after every transaction
@@ -286,15 +294,18 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
     }
 
     // insert modifiers and progress info to db
+    val indexesToInsert = Array(
+      (IndexedHeightKey, ByteBuffer.allocate(4).putInt(state.indexedHeight).array),
+      (GlobalTxIndexKey, ByteBuffer.allocate(8).putLong(state.globalTxIndex).array),
+      (GlobalBoxIndexKey, ByteBuffer.allocate(8).putLong(state.globalBoxIndex).array),
+      (RollbackToKey, ByteBuffer.allocate(4).putInt(state.rollbackTo).array)
+    ) ++ rentPuts.iterator.map { case (k, v) => (k.data, v) }
+    val keysToRemove = rentRemovals.iterator.map(_.data).toArray
+    onSaveProgress(indexesToInsert, keysToRemove)
     historyStorage.insertExtra(
-      Array(
-        (IndexedHeightKey, ByteBuffer.allocate(4).putInt(state.indexedHeight).array),
-        (GlobalTxIndexKey, ByteBuffer.allocate(8).putLong(state.globalTxIndex).array),
-        (GlobalBoxIndexKey, ByteBuffer.allocate(8).putLong(state.globalBoxIndex).array),
-        (RollbackToKey, ByteBuffer.allocate(4).putInt(state.rollbackTo).array)
-      ) ++ rentPuts.iterator.map { case (k, v) => (k.data, v) },
+      indexesToInsert,
       (((((general ++= boxes.values) ++= trees.values) ++= templates.values) ++= tokens.values) ++= segments.values).toArray,
-      rentRemovals.iterator.map(_.data).toArray
+      keysToRemove
     )
 
     log.debug(s"Processed ${trees.size} ErgoTrees with ${boxes.size} boxes and inserted them to database in ${System.currentTimeMillis - start}ms")
@@ -474,6 +485,18 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
       newState = newState.incrementTxIndex
 
       // remove all box indexes, tokens and address balances
+      //
+      // Ordering dependency: this loop (rent deletes, via rentKeysToRemove
+      // below) must run entirely AFTER the tx-undo loop above (rent
+      // re-inserts, `historyStorage.insertExtra` a few lines up) has finished
+      // for all boxes. A box can be un-spent by the loop above and then
+      // itself rolled back past its creation height by this loop -- if this
+      // loop's delete for that box's rent key ran before the earlier loop's
+      // re-insert, the delete would be clobbered by a later insert and the
+      // row would wrongly survive. This is NOT about final-flush ordering: a
+      // per-iteration flush inside this loop would still be correct, since
+      // every re-insert from the loop above is already durable by the time
+      // this loop starts.
       newState = newState.decrementBoxIndex
       while (newState.globalBoxIndex > boxTarget) {
         val iEb: IndexedErgoBox = NumericBoxIndex.getBoxByNumber(history, newState.globalBoxIndex).get
@@ -505,7 +528,17 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
 
       // Save changes
       newState = newState.copy(indexedHeight = height, rollbackTo = 0, caughtUp = true)
-      // Rent rows first: see comment above on failure direction.
+      // Three separate batches here (rent deletes, then object removal, then
+      // saveProgress) are safe without the single-batch atomicity that
+      // insertExtra's live-indexing flush guarantees: `rollbackTo` was already
+      // made durable by the saveProgress call above, before this method did
+      // any mutation, so a crash partway through leaves it set; on restart the
+      // rollback is simply replayed from the top, and every step here (rent
+      // key removal, object removal, and the final saveProgress) is an
+      // idempotent overwrite/no-op when repeated. Rent rows are removed first
+      // only to make an interrupted-and-resumed rollback re-derive the same
+      // set of pending removals from `toRemove`/`rentKeysToRemove`, not for
+      // any atomicity reason.
       historyStorage.insertExtra(Array.empty, Array.empty, rentKeysToRemove.toArray)
       historyStorage.removeExtra(toRemove.toArray)
       saveProgress(newState)
@@ -518,7 +551,7 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
 
   protected val RentBackfillChunkSize: Int = 10000
 
-  /** One chunk of the resumable storage-rent backfill (spec §9). Walks the
+  /** One chunk of the resumable storage-rent backfill. Walks the
     * dense numeric box index [cursor, min(cursor + chunk, watermark)) and
     * writes rent rows for boxes still unspent. Self-messages for the next
     * chunk until the watermark is reached, at which point it writes the -1
@@ -667,7 +700,8 @@ class ExtraIndexer(cacheSettings: CacheSettings,
       self ! Index()
       unstashAll()
 
-      // Storage-rent backfill (spec §9 rev. 3): three-way branch on cursor state.
+      // Storage-rent backfill: three-way branch on cursor state (in progress /
+      // needs starting / already complete -- see the cases below).
       ExtraIndexer.rentBackfillCursor(this.history) match {
         case Some(c) =>
           // Interrupted backfill: resume. Watermark = CURRENT globalBoxIndex --
@@ -789,7 +823,7 @@ object ExtraIndexer {
   /** 1 prefix byte + 4 bytes creationHeight + 8 bytes globalBoxIndex. */
   val RentKeyLength: Int = 13
 
-  /** Progress cursor for the storage-rent backfill (spec §9). 32-byte hash, so
+  /** Progress cursor for the storage-rent backfill. 32-byte hash, so
     * isRentKey can never match it.
     */
   val RentBackfillKey: Array[Byte] = Algos.hash("rent backfill")
@@ -828,9 +862,11 @@ object ExtraIndexer {
   }
 
   /** Public scan over the rent key-space for API routes, which cannot reach the
-    * protected[history] historyStorage directly. Always applies the mandatory
-    * §2.3 key filter — callers cannot forget it. Propagates
-    * RangeScanBudgetExceeded; descending callers must pass a finite budget.
+    * protected[history] historyStorage directly. Always applies the `isRentKey`
+    * filter itself, rather than taking a filter from the caller, so a route can
+    * never accidentally scan raw extraStore keys outside the rent key-space.
+    * Propagates RangeScanBudgetExceeded; descending callers must pass a finite
+    * budget.
     */
   def rentRange(history: ErgoHistoryReader,
                 start: Array[Byte], end: Array[Byte],

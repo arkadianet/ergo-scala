@@ -6956,6 +6956,14 @@ paths:
         large scans.
 
 
+        `sortDirection=desc` is NOT viable on this route at mainnet scale: the
+        scanned range is effectively the entire rent index (every unspent box
+        whose rent is or was ever due), so a descending scan on a synced
+        mainnet node will structurally exceed the 1,000,000-visited-key budget
+        and return `400`, not just under unusually heavy load. `asc` is the
+        only sort direction this route supports in practice.
+
+
         Returns `503` while a one-time storage-rent index backfill is still
         running on this node.
       operationId: getRentEligibleBoxes
@@ -7017,9 +7025,9 @@ paths:
         '503':
           description: the storage-rent index backfill is still in progress
           content:
-            application/json:
+            text/plain:
               schema:
-                $ref: '#/components/schemas/ApiError'
+                type: string
         default:
           description: Error
           content:
@@ -7133,9 +7141,9 @@ paths:
         '503':
           description: the storage-rent index backfill is still in progress
           content:
-            application/json:
+            text/plain:
               schema:
-                $ref: '#/components/schemas/ApiError'
+                type: string
         default:
           description: Error
           content:
