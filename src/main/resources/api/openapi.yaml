@@ -298,6 +298,147 @@ components:
               minimum: 0
               example: 83927
 
+    IndexedErgoBoxWithRentInfo:
+      allOf:
+        - $ref: '#/components/schemas/IndexedErgoBox'
+        - type: object
+          description: >-
+            An indexed box augmented with the two fields needed to reason about
+            its storage-rent status.
+          required:
+            - serializedBoxSize
+            - storageFee
+          properties:
+            serializedBoxSize:
+              description: Size of the box's serialized bytes, as counted for storage-fee purposes
+              type: integer
+              format: int32
+            storageFee:
+              description: >-
+                Storage fee owed for this box, computed with the node's consensus
+                arithmetic (`storageFeeFactor * serializedBoxSize`). MAY BE
+                NEGATIVE: the computation reproduces the exact 32-bit
+                multiplication used by consensus, which can overflow, and this
+                field reports whatever value that arithmetic produces rather
+                than a clamped or corrected one.
+              type: integer
+              format: int32
+
+    RentEligibleBoxes:
+      type: object
+      description: >-
+        A page of unspent boxes whose storage rent is due at `atHeight`, i.e.
+        `creationHeight + StoragePeriod <= atHeight`.
+      required:
+        - items
+        - atHeight
+        - storageFeeFactor
+        - storageFeeFactorSource
+        - indexedHeight
+        - fullHeight
+      properties:
+        items:
+          description: >-
+            The requested page of eligible boxes. There is no `total` field: a
+            page shorter than the requested `limit` is the signal that the
+            range is exhausted.
+          type: array
+          items:
+            $ref: '#/components/schemas/IndexedErgoBoxWithRentInfo'
+        atHeight:
+          description: >-
+            The height rent eligibility was evaluated at. Echoed back so a
+            client can tell which height a cached/paginated response applies
+            to; defaults to `indexedHeight + 1` (i.e. "as of right now") when
+            the `atHeight` query parameter is omitted.
+          type: integer
+          format: int32
+        storageFeeFactor:
+          description: The storage fee factor used to compute every `storageFee` in `items`
+          type: integer
+          format: int32
+        storageFeeFactorSource:
+          type: string
+          enum: [historical, projected]
+          description: >-
+            'historical' - the factor was read from the consensus record for the
+            relevant epoch (the epoch-start Extension, or launch parameters in
+            the chain's first epoch). 'projected' - `atHeight` is beyond the
+            indexed tip, so the current node's live parameters were used
+            instead, since future parameter votes cannot be known in advance.
+        indexedHeight:
+          description: >-
+            Height the extra (rent) index has been flushed up to. Compare
+            against `fullHeight`: if they differ, the response reflects the
+            last flushed indexer batch, not the current chain tip.
+          type: integer
+          format: int32
+        fullHeight:
+          description: Current full-block height of the node's chain
+          type: integer
+          format: int32
+
+    RentMaturingBoxes:
+      type: object
+      description: >-
+        A page of unspent boxes whose storage rent matures (becomes due) at
+        some height in `[fromHeight, toHeight]`, i.e. whose `creationHeight`
+        falls in the corresponding cutoff range.
+      required:
+        - items
+        - fromHeight
+        - toHeight
+        - storageFeeFactor
+        - storageFeeFactorSource
+        - indexedHeight
+        - fullHeight
+      properties:
+        items:
+          description: >-
+            The requested page of maturing boxes. There is no `total` field: a
+            page shorter than the requested `limit` is the signal that the
+            range is exhausted.
+          type: array
+          items:
+            $ref: '#/components/schemas/IndexedErgoBoxWithRentInfo'
+        fromHeight:
+          description: Lower bound of the requested maturity-height range, echoed back
+          type: integer
+          format: int32
+        toHeight:
+          description: >-
+            Upper bound of the requested maturity-height range, echoed back.
+            Because a range has no single evaluation height, `storageFeeFactor`
+            is resolved at `toHeight` (the upper edge of the requested range).
+          type: integer
+          format: int32
+        storageFeeFactor:
+          description: >-
+            The storage fee factor used to compute every `storageFee` in
+            `items`, resolved at `toHeight`
+          type: integer
+          format: int32
+        storageFeeFactorSource:
+          type: string
+          enum: [historical, projected]
+          description: >-
+            'historical' - the factor was read from the consensus record for the
+            relevant epoch (the epoch-start Extension, or launch parameters in
+            the chain's first epoch). 'projected' - `toHeight` is beyond the
+            indexed tip, so the current node's live parameters were used
+            instead, since future parameter votes cannot be known in advance.
+        indexedHeight:
+          description: >-
+            Height the extra (rent) index has been flushed up to. Compare
+            against `fullHeight`: if they differ, the response reflects the
+            last flushed indexer batch, not the current chain tip.
+          type: integer
+          format: int32
+        fullHeight:
+          description: Current full-block height of the node's chain
+          type: integer
+          format: int32
+
     IndexedToken:
       type: object
       description: Token indexed with extra information
@@ -6768,6 +6909,229 @@ paths:
                   $ref: '#/components/schemas/IndexedErgoBox'
         '404':
           description: No unspent boxes found for wanted address
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        default:
+          description: Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /blockchain/box/unspent/rentEligible:
+    get:
+      summary: Retrieve unspent boxes whose storage rent is due
+      description: >-
+        Returns a page of unspent boxes eligible for storage-rent collection at
+        `atHeight` (default: the current tip plus one, i.e. "as of right now"),
+        i.e. boxes with `creationHeight + StoragePeriod <= atHeight`.
+
+
+        Results reflect the last flushed indexer batch, not necessarily the
+        live chain tip: compare the response's `indexedHeight` against
+        `fullHeight` to see how far behind the index is.
+
+
+        There is no `total` field. A page shorter than the requested `limit`
+        means the range is exhausted, not that more items exist beyond it.
+        Because of rare reorgs landing exactly on a page boundary, a box may
+        very occasionally be duplicated across two successive pages -- it is
+        never silently omitted.
+
+
+        Pre-block genesis boxes (the emission box, the foundation box, and the
+        no-premine box) are never returned by this route, since the extra
+        indexer that backs it only observes boxes created by block
+        transactions.
+
+
+        `sortDirection` defaults to `asc` here, unlike the other `/blockchain`
+        box routes, which default to `desc`. Descending scans are not a true
+        reverse iteration -- the pure-Java LevelDB backend this node uses has
+        no `prev`/`seekToLast` support -- so `desc` is implemented as a forward
+        scan under a 1,000,000-visited-key budget. Exceeding that budget
+        returns `400`; prefer `asc`, or narrow the requested height range, for
+        large scans.
+
+
+        Returns `503` while a one-time storage-rent index backfill is still
+        running on this node.
+      operationId: getRentEligibleBoxes
+      tags:
+        - blockchain
+      parameters:
+        - in: query
+          name: atHeight
+          required: false
+          description: >-
+            Height to evaluate rent eligibility at. Must be positive if given.
+            Defaults to the indexed height plus one (i.e. "as of right now")
+            when omitted.
+          schema:
+            type: integer
+            format: int32
+        - in: query
+          name: offset
+          required: false
+          description: amount of elements to skip from the start
+          schema:
+            type: integer
+            format: int32
+            default: 0
+        - in: query
+          name: limit
+          required: false
+          description: amount of elements to retrieve
+          schema:
+            type: integer
+            format: int32
+            default: 5
+        - in: query
+          name: sortDirection
+          required: false
+          description: >-
+            asc = boxes with the lowest creationHeight first ; desc = boxes
+            with the highest creationHeight first (forward-scanned under a
+            visited-key budget; see the route description). Defaults to asc.
+          schema:
+            type: string
+            default: asc
+      responses:
+        '200':
+          description: a page of rent-eligible boxes
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RentEligibleBoxes'
+        '400':
+          description: >-
+            Invalid parameters (e.g. negative offset, non-positive atHeight,
+            limit above the maximum, invalid sortDirection), or a descending
+            scan exceeded its visited-key budget
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '503':
+          description: the storage-rent index backfill is still in progress
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        default:
+          description: Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+
+  /blockchain/box/unspent/rentMaturingInRange:
+    get:
+      summary: Retrieve unspent boxes whose storage rent matures within a height range
+      description: >-
+        Returns a page of unspent boxes whose storage rent matures (becomes
+        due) at some height in `[fromHeight, toHeight]`, i.e. boxes with
+        `creationHeight + StoragePeriod` in that range. `fromHeight ==
+        toHeight` is a valid single-height slice. Because a range has no
+        single evaluation height, the returned `storageFeeFactor` is resolved
+        at `toHeight`, the upper edge of the requested range.
+
+
+        Results reflect the last flushed indexer batch, not necessarily the
+        live chain tip: compare the response's `indexedHeight` against
+        `fullHeight` to see how far behind the index is.
+
+
+        There is no `total` field. A page shorter than the requested `limit`
+        means the range is exhausted, not that more items exist beyond it.
+        Because of rare reorgs landing exactly on a page boundary, a box may
+        very occasionally be duplicated across two successive pages -- it is
+        never silently omitted.
+
+
+        Pre-block genesis boxes (the emission box, the foundation box, and the
+        no-premine box) are never returned by this route, since the extra
+        indexer that backs it only observes boxes created by block
+        transactions.
+
+
+        `sortDirection` defaults to `asc` here, unlike the other `/blockchain`
+        box routes, which default to `desc`. Descending scans are not a true
+        reverse iteration -- the pure-Java LevelDB backend this node uses has
+        no `prev`/`seekToLast` support -- so `desc` is implemented as a forward
+        scan under a 1,000,000-visited-key budget. Exceeding that budget
+        returns `400`; prefer `asc`, or narrow the requested height range, for
+        large scans.
+
+
+        Returns `503` while a one-time storage-rent index backfill is still
+        running on this node.
+      operationId: getRentMaturingInRangeBoxes
+      tags:
+        - blockchain
+      parameters:
+        - in: query
+          name: fromHeight
+          required: true
+          description: lower bound of the maturity-height range (inclusive), must not be negative
+          schema:
+            type: integer
+            format: int32
+        - in: query
+          name: toHeight
+          required: true
+          description: >-
+            upper bound of the maturity-height range (inclusive), must not be
+            less than fromHeight; also the height storageFeeFactor is resolved at
+          schema:
+            type: integer
+            format: int32
+        - in: query
+          name: offset
+          required: false
+          description: amount of elements to skip from the start
+          schema:
+            type: integer
+            format: int32
+            default: 0
+        - in: query
+          name: limit
+          required: false
+          description: amount of elements to retrieve
+          schema:
+            type: integer
+            format: int32
+            default: 5
+        - in: query
+          name: sortDirection
+          required: false
+          description: >-
+            asc = boxes with the lowest creationHeight first ; desc = boxes
+            with the highest creationHeight first (forward-scanned under a
+            visited-key budget; see the route description). Defaults to asc.
+          schema:
+            type: string
+            default: asc
+      responses:
+        '200':
+          description: a page of boxes maturing in the requested height range
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RentMaturingBoxes'
+        '400':
+          description: >-
+            Invalid parameters (e.g. negative offset, negative fromHeight,
+            fromHeight greater than toHeight, limit above the maximum, invalid
+            sortDirection), or a descending scan exceeded its visited-key budget
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ApiError'
+        '503':
+          description: the storage-rent index backfill is still in progress
           content:
             application/json:
               schema:

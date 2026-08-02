@@ -455,6 +455,8 @@ case class BlockchainApiRoute(readersHolder: ActorRef, ergoSettings: ErgoSetting
     val loCutoff = math.max(0, fromHeight - Constants.StoragePeriod)
     val hiCutoff = toHeight - Constants.StoragePeriod
 
+    // Resolved at toHeight, the upper edge of the requested range, since a
+    // range (unlike a single atHeight) has no single evaluation height.
     val factorAtHeight = StorageFeeFactorResolver.factorAt(toHeight, history, state.parameters, ergoSettings)
 
     def baseFields(items: Json): Json = Json.obj(
