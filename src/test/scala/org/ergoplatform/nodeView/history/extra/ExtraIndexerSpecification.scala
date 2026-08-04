@@ -177,11 +177,11 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
     * `pred` and re-entering the wait, which would hang the test forever. Polling
     * makes that impossible: worst case we just re-check on the next tick.
     */
-  def awaitCondition(timeoutMs: Long = 30000)(pred: => Boolean): Unit = {
+  def awaitCondition(label: String, timeoutMs: Long = 30000)(pred: => Boolean): Unit = {
     val deadline = System.currentTimeMillis + timeoutMs
     while (!pred) {
       if (System.currentTimeMillis > deadline)
-        throw new RuntimeException("Timed out waiting for backfill condition")
+        fail(s"Timed out after ${timeoutMs}ms waiting for: $label")
       lock.lock()
       try {
         if (!pred) done.await(50, TimeUnit.MILLISECONDS)
@@ -213,7 +213,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
     cfor(0)(_ < chunks, _ + 1) { _ =>
       val before = ExtraIndexer.rentBackfillCursor(_history.getReader)
       actor ! BackfillRentChunk(watermark)
-      awaitCondition() { ExtraIndexer.rentBackfillCursor(_history.getReader) != before }
+      awaitCondition("backfill cursor to advance past one chunk") { ExtraIndexer.rentBackfillCursor(_history.getReader) != before }
     }
   }
 
@@ -222,7 +222,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
     ensureBackfillStarted()
     val watermark = IndexerState.fromHistory(_history).globalBoxIndex
     actor ! BackfillRentChunk(watermark)
-    awaitCondition() { ExtraIndexer.rentBackfillCursor(_history.getReader).isEmpty }
+    awaitCondition("backfill to reach the completion sentinel") { ExtraIndexer.rentBackfillCursor(_history.getReader).isEmpty }
   }
 
   // example G-30;R-20;G-35;R-30
@@ -464,7 +464,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
     // two chains toward different watermarks concurrently is unsafe (the
     // shorter one can stomp the cursor to -1 while the longer one is still
     // mid-flight).
-    awaitCondition() {
+    awaitCondition("backfill complete and indexer caught up") {
       ExtraIndexer.rentBackfillCursor(_history.getReader).isEmpty &&
         IndexerState.fromHistory(_history).caughtUp
     }
@@ -508,7 +508,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
       Props.create(classOf[ExtraIndexer], initSettings.cacheSettings, addressEncoder))
     realIndexer ! StartExtraIndexer(_history)
 
-    awaitCondition() { _history.historyStorage.get(RentBackfillKey).isDefined }
+    awaitCondition("StartExtraIndexer to write the backfill sentinel key") { _history.historyStorage.get(RentBackfillKey).isDefined }
 
     // Both assertions together are what distinguish "sentinel written" from
     // "key never written at all" -- rentBackfillCursor alone reads None in

@@ -59,7 +59,7 @@ class HistoryStorageBatchingSpec extends AnyFlatSpec with Matchers {
         NetworkCacheSettings(100, 4.hours),
         MempoolCacheSettings(100, 4.hours)))
 
-  it should "put progress keys, rent puts and rent deletes in ONE atomic batch" in {
+  "insertExtra" should "put progress keys, rent puts and rent deletes in ONE atomic batch" in {
     val extra = countingStore()
     val s = storageWith(extra)
     val existing = rentKey(1, 1L)

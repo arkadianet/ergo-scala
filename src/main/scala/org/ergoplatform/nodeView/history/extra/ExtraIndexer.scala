@@ -114,6 +114,26 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
   protected val rentRemovals: mutable.HashSet[ByteArrayWrapper] =
     mutable.HashSet.empty[ByteArrayWrapper]
 
+  /** Whether a box can be represented in the storage-rent key-space.
+    *
+    * `rentKey` requires non-negative components: big-endian byte order equals numeric
+    * order only for non-negatives, so a negative creationHeight would sort above every
+    * positive one and vanish from every range scan. The consensus rule enforcing
+    * `creationHeight >= 0` is disabled for block version 1, so such a box is not
+    * structurally impossible on historic chain data.
+    *
+    * Skipping costs one absent rent row plus a log line. Letting `rentKey` throw here
+    * would instead kill the indexer actor mid-block, and a crash during rollback leaves
+    * the extra indexer permanently frozen — so skip, but loudly.
+    */
+  protected def rentIndexable(creationHeight: Int, globalIndex: Long, boxId: ModifierId): Boolean =
+    if (creationHeight >= 0 && globalIndex >= 0) true
+    else {
+      log.warn(s"Box $boxId is not representable in the storage-rent index " +
+        s"(creationHeight=$creationHeight, globalIndex=$globalIndex); skipping its rent row")
+      false
+    }
+
   /**
     * Input tokens in a transaction, cleared after every transaction
     */
@@ -359,7 +379,7 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
           val spendingProof = tx.inputs(i).spendingProof
           if (findAndSpendBox(boxId, tx.id, height, spendingProof)) { // spend box and add tx
             val iEb = boxes(boxId)
-            if (rentWritesEnabled) {
+            if (rentWritesEnabled && rentIndexable(iEb.box.creationHeight, iEb.globalIndex, iEb.id)) {
               // Cancel a pending put when the box was created in this same
               // unflushed batch; otherwise the row is on disk and must be deleted.
               val rk = ByteArrayWrapper(rentKey(iEb.box.creationHeight, iEb.globalIndex))
@@ -381,7 +401,7 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
       cfor(0)(_ < tx.outputs.size, _ + 1) { i =>
         val iEb: IndexedErgoBox = new IndexedErgoBox(height, None, None, None, tx.outputs(i), newState.globalBoxIndex)
         boxes.put(iEb.id, iEb) // box by id
-        if (rentWritesEnabled) {
+        if (rentWritesEnabled && rentIndexable(iEb.box.creationHeight, iEb.globalIndex, iEb.id)) {
           rentPuts.put(
             ByteArrayWrapper(rentKey(iEb.box.creationHeight, iEb.globalIndex)),
             fastIdToBytes(iEb.id)
@@ -466,8 +486,12 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
           template.findAndModBox(iEb.globalIndex, history)
 
           // Box is unspent again, so its rent row must come back.
+          val rentReinsert: Array[(Array[Byte], Array[Byte])] =
+            if (rentIndexable(iEb.box.creationHeight, iEb.globalIndex, iEb.id))
+              Array((rentKey(iEb.box.creationHeight, iEb.globalIndex), fastIdToBytes(iEb.id)))
+            else Array.empty
           historyStorage.insertExtra(
-            Array((rentKey(iEb.box.creationHeight, iEb.globalIndex), fastIdToBytes(iEb.id))),
+            rentReinsert,
             Array[ExtraIndex](iEb, address, template) ++ address.buffer.values ++ template.buffer.values
           )
 
@@ -519,7 +543,9 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
         }
         // Every removed box must end with no rent row — whether it was spent
         // (row already gone; absent-key delete is a documented no-op) or unspent.
-        rentKeysToRemove += rentKey(iEb.box.creationHeight, iEb.globalIndex)
+        // A box that was never representable has no row to remove.
+        if (rentIndexable(iEb.box.creationHeight, iEb.globalIndex, iEb.id))
+          rentKeysToRemove += rentKey(iEb.box.creationHeight, iEb.globalIndex)
         toRemove += iEb.id // box by id
         toRemove += bytesToId(NumericBoxIndex.indexToBytes(newState.globalBoxIndex)) // box id by number
         newState = newState.decrementBoxIndex
@@ -574,7 +600,9 @@ trait ExtraIndexerBase extends Actor with Stash with ScorexLogging {
       boxOpt.foreach { iEb =>
         // Buffer first, exactly like findAndSpendBox, so an unflushed spend is seen.
         val live = boxes.getOrElse(iEb.id, iEb)
-        if (!live.isSpent) {
+        // Skipping an unrepresentable box must not stall the walk: the cursor still
+        // advances past it below, so the backfill completes rather than retrying forever.
+        if (!live.isSpent && rentIndexable(live.box.creationHeight, live.globalIndex, live.id)) {
           rows += ((rentKey(live.box.creationHeight, live.globalIndex), fastIdToBytes(live.id)))
         }
       }

@@ -136,7 +136,7 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
     * rather than getExtraRange, so tests can verify the ordered scan against an
     * independent code path. Do not reimplement this in terms of getExtraRange.
     */
-  def getAllExtraRaw(cond: (Array[Byte], Array[Byte]) => Boolean): Seq[(Array[Byte], Array[Byte])] =
+  private[history] def getAllExtraRaw(cond: (Array[Byte], Array[Byte]) => Boolean): Seq[(Array[Byte], Array[Byte])] =
     extraStore.getWithFilter(cond).toSeq
 
   /**

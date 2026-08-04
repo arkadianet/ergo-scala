@@ -20,7 +20,7 @@ import org.ergoplatform.wallet.protocol.Constants
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
 import scorex.db.ByteArrayWrapper
-import scorex.util.bytesToId
+import scorex.util.{ModifierId, bytesToId}
 
 import java.nio.ByteBuffer
 import java.util.concurrent.TimeUnit
@@ -64,7 +64,12 @@ class BlockchainApiRouteSpec
   builderIndexer ! CreateDB(HEIGHT)
   builderIndexer ! Index()
   lock.lock()
-  if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
+  // Condition.await reacquires the lock before returning, so it must be released here or
+  // ExtraIndexerTestActor.caughtUpHook blocks forever the next time it tries to signal.
+  try {
+    if (!done.await(120, TimeUnit.SECONDS))
+      fail("indexer never signalled done -- actor likely crashed; check supervision log")
+  } finally lock.unlock()
 
   // Backfill-gate assertion (brief gotcha #6): the rent routes added in the next task
   // return 503 while a backfill cursor is present. `RentBackfillKey` is written ONLY by
@@ -125,6 +130,9 @@ class BlockchainApiRouteSpec
 
   private def creationHeightsOf(j: Json): Seq[Int] =
     itemsOf(j).map(_.hcursor.downField("creationHeight").as[Int].toOption.get)
+
+  private def boxIdsOf(j: Json): Seq[ModifierId] =
+    itemsOf(j).map(i => ModifierId @@ i.hcursor.downField("boxId").as[String].toOption.get)
 
   /** creationHeight from a 13-byte rent key: bytes 1-4, big-endian. */
   private def decodeCreationHeight(k: ByteArrayWrapper): Int =
@@ -358,11 +366,14 @@ class BlockchainApiRouteSpec
     found.getOrElse(throw new IllegalStateException("test chain has no spent box to plant a stale rent row for"))
   }
 
-  private def plantSpentBoxRentRow(): Int = {
+  /** Plants a rent row for a box that is already spent, and returns both the row's
+    * creationHeight (to target the query) and the boxId (to assert on precisely).
+    */
+  private def plantSpentBoxRentRow(): (Int, ModifierId) = {
     val (h, g, boxId) = findSpentBoxRentEntry(HEIGHT)
     RentIndexTestSupport.insertExtraRaw(_history, Array(
       rentKey(h, g) -> RentIndexTestSupport.fastIdToBytes(boxId)))
-    h
+    (h, boxId)
   }
 
   it should "return exactly the oracle's boxes maturing in range" in {
@@ -465,11 +476,14 @@ class BlockchainApiRouteSpec
   }
 
   it should "exclude a rent row whose box is already spent" in {
-    val spentHeight = plantSpentBoxRentRow()
+    val (spentHeight, spentBoxId) = plantSpentBoxRentRow()
     val maturesAt = spentHeight + P
     Get(s"/blockchain/box/unspent/rentMaturingInRange?fromHeight=$maturesAt&toHeight=$maturesAt&limit=16384") ~> route ~> check {
       status shouldBe StatusCodes.OK
-      creationHeightsOf(responseAs[Json]) should not contain spentHeight
+      // Assert on the box itself, not its creationHeight: another genuinely unspent box
+      // may legitimately share that height, which would fail a height-based assertion
+      // even though the spent row was correctly excluded.
+      boxIdsOf(responseAs[Json]) should not contain spentBoxId
     }
   }
 }
