@@ -122,6 +122,23 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
   }
   def get(id: Array[Byte]): Option[Array[Byte]] = objectsStore.get(id).orElse(extraStore.get(id))
 
+  /** Ordered scan over raw extraStore keys. See KVStoreReader.getRangeWithFilter.
+    * Used by the storage-rent index, whose 13-byte keys cannot be ModifierIds.
+    * Propagates RangeScanBudgetExceeded to the caller.
+    */
+  def getExtraRange(start: Array[Byte], end: Array[Byte], offset: Int, limit: Int,
+                    reverse: Boolean, visitBudget: Long = Long.MaxValue)
+                   (keyFilter: Array[Byte] => Boolean): Array[(Array[Byte], Array[Byte])] =
+    extraStore.getRangeWithFilter(start, end, offset, limit, reverse, visitBudget)(keyFilter)
+
+  /** Generic UNORDERED enumeration of raw extraStore entries matching a predicate.
+    * Deliberately routed through the pre-existing KVStoreReader.getWithFilter
+    * rather than getExtraRange, so tests can verify the ordered scan against an
+    * independent code path. Do not reimplement this in terms of getExtraRange.
+    */
+  private[history] def getAllExtraRaw(cond: (Array[Byte], Array[Byte]) => Boolean): Seq[(Array[Byte], Array[Byte])] =
+    extraStore.getWithFilter(cond).toSeq
+
   /**
     * @return if object with `id` is in the objects database
     */
@@ -148,13 +165,45 @@ class HistoryStorage(indexStore: LDBKVStore, objectsStore: LDBKVStore, extraStor
     }
   }
 
+  /** Write extra-index objects and raw key-value pairs, and remove raw keys.
+    *
+    * CRASH CONSISTENCY (live-indexing flush, i.e. `ExtraIndexer.saveProgress`):
+    * the raw pairs carry the indexer progress keys (including IndexedHeightKey)
+    * alongside storage-rent rows. They are written in ONE atomic WriteBatch
+    * together with `keysToRemove`, so the height marker can never become
+    * durable ahead of the data it vouches for. Recovery is replay from
+    * IndexedHeightKey, which only heals writes landing before the marker.
+    * DO NOT split the live-indexing flush call into separate writes —
+    * HistoryStorageBatchingSpec enforces it. This guarantee is scoped to that
+    * one call site: other callers (e.g. rollback, see ExtraIndexer.scala around
+    * `removeAfter`) may legitimately issue multiple separate `insertExtra`
+    * batches when their own recovery story doesn't depend on single-batch
+    * atomicity.
+    *
+    * Objects go in a separate (also atomic) batch first; a crash between the two
+    * leaves the marker un-advanced, so the block is re-indexed and object writes
+    * are idempotent overwrites.
+    *
+    * Empty batches are skipped: removeAfter calls this once per un-spent box, and
+    * an empty createWriteBatch/write pair per call is pure overhead. The guards
+    * must never separate batch 2's contents from each other.
+    */
   def insertExtra(indexesToInsert: Array[(Array[Byte], Array[Byte])],
-                  objectsToInsert: Array[ExtraIndex]): Unit = {
-    extraStore.insert(
-      objectsToInsert.map(mod => mod.serializedId),
-      objectsToInsert.map(mod => ExtraIndexSerializer.toBytes(mod))
-    )
-    cfor(0)(_ < indexesToInsert.length, _ + 1) { i => extraStore.insert(indexesToInsert(i)._1, indexesToInsert(i)._2)}
+                  objectsToInsert: Array[ExtraIndex],
+                  keysToRemove: Array[Array[Byte]] = Array.empty): Unit = {
+    if (objectsToInsert.nonEmpty) {
+      extraStore.insert(
+        objectsToInsert.map(mod => mod.serializedId),
+        objectsToInsert.map(mod => ExtraIndexSerializer.toBytes(mod))
+      ).get
+    }
+    if (indexesToInsert.nonEmpty || keysToRemove.nonEmpty) {
+      extraStore.update(
+        indexesToInsert.map(_._1),
+        indexesToInsert.map(_._2),
+        keysToRemove
+      ).get
+    }
   }
 
   def removeExtra(indexesToRemove: Array[ModifierId]) : Unit = {

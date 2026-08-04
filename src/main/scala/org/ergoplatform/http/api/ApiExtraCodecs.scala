@@ -28,6 +28,16 @@ trait ApiExtraCodecs extends JsonCodecs {
     ))
   }
 
+  /** One eligible box: standard indexed-box JSON plus the two rent fields.
+    * storageFee is the raw consensus Int and may be negative -- never clamp it.
+    */
+  implicit val rentBoxEncoder: Encoder[(IndexedErgoBox, Int, Int)] = { case (iEb, size, fee) =>
+    indexedBoxEncoder(iEb).deepMerge(Json.obj(
+      "serializedBoxSize" -> size.asJson,
+      "storageFee" -> fee.asJson
+    ))
+  }
+
   implicit val indexedBoxSeqEncoder: Encoder[(Seq[IndexedErgoBox], Long)] = { iEbSeq =>
     Json.obj(
       "items" -> iEbSeq._1.asJson,

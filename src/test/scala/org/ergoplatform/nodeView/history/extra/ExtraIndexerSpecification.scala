@@ -1,33 +1,33 @@
 package org.ergoplatform.nodeView.history.extra
 
 import akka.actor.{ActorRef, ActorSystem, Props}
+import akka.testkit.TestActorRef
 import org.ergoplatform.ErgoAddressEncoder
 import org.ergoplatform.http.api.SortDirection
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.{RemoteBlockApplied, Rollback}
-import org.ergoplatform.nodeView.history.extra.ExtraIndexer.ReceivableMessages.Index
+import org.ergoplatform.nodeView.history.extra.ExtraIndexer.ReceivableMessages.{BackfillRentChunk, Index, StartExtraIndexer}
+import org.ergoplatform.nodeView.history.extra.ExtraIndexer.{RentBackfillKey, isRentKey}
 import org.ergoplatform.nodeView.history.extra.IndexedContractTemplateSerializer.hashTreeTemplate
 import org.ergoplatform.nodeView.history.extra.IndexedErgoAddressSerializer.hashErgoTree
 import org.ergoplatform.nodeView.history.extra.SegmentSerializer.{boxSegmentId, txSegmentId}
-import org.ergoplatform.nodeView.history.{ErgoHistory, ErgoHistoryReader}
+import org.ergoplatform.nodeView.history.ErgoHistoryReader
 import org.ergoplatform.nodeView.mempool.ErgoMemPool
 import org.ergoplatform.settings.ErgoSettings
 import org.ergoplatform.utils.ErgoCorePropertyTest
+import scorex.db.ByteArrayWrapper
 import scorex.util.{ModifierId, bytesToId}
 import spire.implicits.cfor
 
-import java.util.concurrent.locks.{Condition, ReentrantLock}
+import java.util.concurrent.TimeUnit
 import scala.collection.mutable
 import scala.reflect.ClassTag
 
-class ExtraIndexerSpecification extends ErgoCorePropertyTest {
+class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTestHarness {
   import org.ergoplatform.utils.ErgoNodeTestConstants._
 
   implicit val addressEncoder: ErgoAddressEncoder = settings.addressEncoder
   val initSettings: ErgoSettings = settings
-  case class CreateDB(blockCount: Int)
-  case class Reset()
-  case class GenerateBetterChainTip()
 
   type ID_LL = mutable.HashMap[ModifierId,(Long,Long)]
 
@@ -38,12 +38,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
   val system: ActorSystem = ActorSystem.create("indexer-test")
   val indexer: ActorRef = system.actorOf(Props.create(classOf[ExtraIndexerTestActor], this))
 
-  var _history: ErgoHistory = _
   def history: ErgoHistoryReader = _history.getReader
-
-  val lock: ReentrantLock = new ReentrantLock()
-  val done: Condition = lock.newCondition()
-  val created: Condition = lock.newCondition()
 
   def manualIndex(limit: Int): (ID_LL, // address -> (erg,tokenSum)
                                 ID_LL, // template -> (spentBoxCount,unspentBoxCount)
@@ -152,6 +147,84 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
       seg._1.boxCount == seg._2._1
     })
 
+  /** Assert the on-disk rent index equals the oracle using TWO code paths that
+    * share nothing with getRangeWithFilter — otherwise a bug in the new scan
+    * would make this pass vacuously.
+    *   - no missing rows: HistoryStorage.get raw point lookups (predates this feature)
+    *   - no ghost rows:   getAllExtraRaw -> KVStoreReader.getWithFilter (ditto)
+    */
+  def checkRentIndex(limit: Int): Unit = {
+    val expected = manualRentSet(limit)
+    expected.foreach { case (k, boxId) =>
+      withClue(s"missing rent row ${k.data.toSeq}: ") {
+        _history.historyStorage.get(k.data).map(bytesToId) shouldBe Some(boxId)
+      }
+    }
+    val onDisk = _history.historyStorage.getAllExtraRaw((k, _) => isRentKey(k))
+    onDisk.foreach { case (k, _) =>
+      withClue(s"ghost rent row ${k.toSeq}: ") {
+        expected.contains(ByteArrayWrapper(k)) shouldBe true
+      }
+    }
+    onDisk.size shouldBe expected.size
+  }
+
+  /** Blocks until `pred` holds, polling on the existing lock/done handshake with a
+    * short timeout per attempt rather than a single unbounded await. The backfill
+    * self-perpetuates through the actor mailbox (each processed chunk fires
+    * `caughtUpHook`, same as live indexing), so many signals can arrive in quick
+    * succession; a plain single `await()` risks missing one between our check of
+    * `pred` and re-entering the wait, which would hang the test forever. Polling
+    * makes that impossible: worst case we just re-check on the next tick.
+    */
+  def awaitCondition(label: String, timeoutMs: Long = 30000)(pred: => Boolean): Unit = {
+    val deadline = System.currentTimeMillis + timeoutMs
+    while (!pred) {
+      if (System.currentTimeMillis > deadline)
+        fail(s"Timed out after ${timeoutMs}ms waiting for: $label")
+      lock.lock()
+      try {
+        if (!pred) done.await(50, TimeUnit.MILLISECONDS)
+      } finally {
+        lock.unlock()
+      }
+    }
+  }
+
+  // seedBackfillCursor now lives on ExtraIndexerTestHarness (org.ergoplatform.nodeView.
+  // history.extra.ExtraIndexerTestHarness) so that suites outside this package tree,
+  // like the route-level BlockchainApiRouteSpec, can seed the sentinel too --
+  // historyStorage is protected[history].
+
+  private def ensureBackfillStarted(): Unit =
+    if (_history.historyStorage.get(RentBackfillKey).isEmpty) seedBackfillCursor(0L)
+
+  /** Trigger `chunks` rounds of backfill progress and wait for each to land.
+    * Seeds the cursor at 0 on first use, exactly like the production startup
+    * wiring would for a pre-feature database. Since a single `BackfillRentChunk`
+    * self-perpetuates until the watermark is reached, this waits for the cursor
+    * to move at least once per requested round rather than assuming exactly one
+    * chunk elapses -- with the small `RentBackfillChunkSize` the test actor uses,
+    * one round leaves the backfill well short of complete.
+    */
+  def runBackfillChunks(actor: ActorRef, chunks: Int): Unit = {
+    ensureBackfillStarted()
+    val watermark = IndexerState.fromHistory(_history).globalBoxIndex
+    cfor(0)(_ < chunks, _ + 1) { _ =>
+      val before = ExtraIndexer.rentBackfillCursor(_history.getReader)
+      actor ! BackfillRentChunk(watermark)
+      awaitCondition("backfill cursor to advance past one chunk") { ExtraIndexer.rentBackfillCursor(_history.getReader) != before }
+    }
+  }
+
+  /** Drive the backfill to completion against the CURRENT global box index. */
+  def runBackfillToCompletion(actor: ActorRef): Unit = {
+    ensureBackfillStarted()
+    val watermark = IndexerState.fromHistory(_history).globalBoxIndex
+    actor ! BackfillRentChunk(watermark)
+    awaitCondition("backfill to reach the completion sentinel") { ExtraIndexer.rentBackfillCursor(_history.getReader).isEmpty }
+  }
+
   // example G-30;R-20;G-35;R-30
   def rollbackWithPattern(pattern: String): Unit = {
 
@@ -168,7 +241,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
       // perform rollback
       indexer ! Rollback(history.bestHeaderIdAtHeight(n).get)
       lock.lock()
-      done.await()
+      if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
       state = IndexerState.fromHistory(_history)
 
       // address balances
@@ -206,6 +279,8 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
         else
           boxOpt shouldBe None
       }
+
+      checkRentIndex(n)
     }
 
     def generate(n: Int): Unit = {
@@ -213,7 +288,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
       indexer ! CreateDB(n)
       indexer ! Index()
       lock.lock()
-      done.await()
+      if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
 
       val (addresses, _, _, _, _) = manualIndex(n)
 
@@ -230,6 +305,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
         utxos.exists(_.isSpent) shouldBe false
       }
 
+      checkRentIndex(n)
     }
 
     pattern.split(";").map(_.split("-")).map(x => x(0) -> x(1).toInt).foreach {
@@ -245,7 +321,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     indexer ! CreateDB(HEIGHT)
     indexer ! Index()
     lock.lock()
-    done.await()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
     val state = IndexerState.fromHistory(_history)
     cfor(0)(_ < state.globalTxIndex, _ + 1) { n =>
       val id = history.typedExtraIndexById[NumericTxIndex](bytesToId(NumericTxIndex.indexToBytes(n)))
@@ -259,7 +335,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     indexer ! CreateDB(HEIGHT)
     indexer ! Index()
     lock.lock()
-    done.await()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
     val state = IndexerState.fromHistory(_history)
     cfor(0)(_ < state.globalBoxIndex, _ + 1) { n =>
       val id = history.typedExtraIndexById[NumericBoxIndex](bytesToId(NumericBoxIndex.indexToBytes(n)))
@@ -269,11 +345,186 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     indexer ! Reset()
   }
 
+  property("storage rent rows") {
+    indexer ! CreateDB(HEIGHT)
+    indexer ! Index()
+    lock.lock()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
+    checkRentIndex(HEIGHT)
+    indexer ! Reset()
+  }
+
+  property("storage rent rows with multi-block batches") {
+    val bigBatchIndexer = system.actorOf(
+      Props.create(classOf[ExtraIndexerTestActor], this, Int.box(500), Boolean.box(true)))
+    bigBatchIndexer ! CreateDB(HEIGHT)
+    bigBatchIndexer ! Index()
+    lock.lock()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
+    checkRentIndex(HEIGHT)
+    bigBatchIndexer ! Reset()
+  }
+
+  /** I5b: HistoryStorageBatchingSpec proves insertExtra itself is one atomic
+    * batch, but not that saveProgress ever PASSES the marker and the pending
+    * rent mutations to the SAME insertExtra call -- splitting saveProgress
+    * into two insertExtra calls would break the atomicity invariant with that
+    * spec still fully green. Uses TestActorRef (with a real dispatcher, so
+    * this stays async like every other test here) purely to reach
+    * `saveProgressCalls`, the recording seam ExtraIndexerTestActor adds over
+    * `ExtraIndexer.onSaveProgress`.
+    */
+  property("saveProgress passes the progress marker and rent mutations to ONE insertExtra call") {
+    val recording: TestActorRef[ExtraIndexerTestActor] =
+      TestActorRef(Props(new ExtraIndexerTestActor(this)).withDispatcher("akka.actor.default-dispatcher"))(system)
+    recording ! CreateDB(HEIGHT)
+    recording ! Index()
+    lock.lock()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
+
+    val calls = recording.underlyingActor.saveProgressCalls
+    calls should not be empty
+    val markerWithRentMutation = calls.exists { case (indexesToInsert, keysToRemove) =>
+      val keys = indexesToInsert.map(_._1)
+      val hasMarker = keys.exists(_.sameElements(ExtraIndexer.IndexedHeightKey))
+      val hasRentMutation = keys.exists(isRentKey) || keysToRemove.exists(isRentKey)
+      hasMarker && hasRentMutation
+    }
+    withClue("no saveProgress call carried both the IndexedHeightKey marker and a rent mutation: ") {
+      markerWithRentMutation shouldBe true
+    }
+    recording ! Reset()
+  }
+
+  property("storage rent backfill populates an existing index") {
+    val noRent = system.actorOf(
+      Props.create(classOf[ExtraIndexerTestActor], this, Int.box(1), Boolean.box(false)))
+    noRent ! CreateDB(HEIGHT)
+    noRent ! Index()
+    lock.lock()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
+
+    // Pre-feature database: indexed, but no rent rows at all.
+    _history.historyStorage.getAllExtraRaw((k, _) => isRentKey(k)) shouldBe empty
+
+    runBackfillToCompletion(noRent)
+
+    checkRentIndex(HEIGHT)
+    ExtraIndexer.rentBackfillCursor(_history.getReader) shouldBe None
+    noRent ! Reset()
+  }
+
+  property("storage rent backfill resumes from its cursor") {
+    val noRent = system.actorOf(
+      Props.create(classOf[ExtraIndexerTestActor], this, Int.box(1), Boolean.box(false)))
+    noRent ! CreateDB(HEIGHT)
+    noRent ! Index()
+    lock.lock()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
+
+    runBackfillChunks(noRent, chunks = 1)
+    ExtraIndexer.rentBackfillCursor(_history.getReader) shouldBe defined
+
+    runBackfillToCompletion(noRent)
+    checkRentIndex(HEIGHT)
+    ExtraIndexer.rentBackfillCursor(_history.getReader) shouldBe None
+    noRent ! Reset()
+  }
+
+  /** Required by spec section 11.2. This is the ONLY test that exercises the
+    * buffer-first lookup in backfillRentChunk (`boxes.getOrElse(iEb.id, iEb)`),
+    * which is what section 9's lock-free argument rests on. Without it, deleting
+    * that lookup passes everything else.
+    */
+  property("storage rent backfill interleaves with live indexing") {
+    // A large saveLimit keeps the live-indexing buffers from flushing until the
+    // extension below is fully caught up, so there is a real window in which a
+    // freshly-indexed spend of an original, not-yet-backfilled box sits only in
+    // the unflushed `boxes` buffer -- exactly what the buffer-first lookup is for.
+    val noRent = system.actorOf(
+      Props.create(classOf[ExtraIndexerTestActor], this, Int.box(1000000), Boolean.box(false)))
+    noRent ! CreateDB(HEIGHT)
+    noRent ! Index()
+    lock.lock()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
+
+    // Start the backfill (self-perpetuates in the background through the shared
+    // mailbox) but only wait for the first round of progress.
+    runBackfillChunks(noRent, chunks = 1)
+
+    // Extend the chain and index it while the first backfill pass (still
+    // targeting the original, smaller watermark) is in flight. Some of the
+    // original boxes it hasn't reached yet get spent by the new blocks before
+    // the backfill's own walk visits them.
+    noRent ! CreateDB(HEIGHT + 10)
+    noRent ! Index()
+
+    // Let both the original backfill pass and the extension's indexing fully
+    // settle before starting a second pass with an updated watermark: running
+    // two chains toward different watermarks concurrently is unsafe (the
+    // shorter one can stomp the cursor to -1 while the longer one is still
+    // mid-flight).
+    awaitCondition("backfill complete and indexer caught up") {
+      ExtraIndexer.rentBackfillCursor(_history.getReader).isEmpty &&
+        IndexerState.fromHistory(_history).caughtUp
+    }
+
+    // Cover any boxes the first pass never reached, including the extension's.
+    // Re-deriving rows for the already-covered range is an idempotent overwrite.
+    seedBackfillCursor(0L)
+    runBackfillToCompletion(noRent)
+
+    checkRentIndex(HEIGHT + 10)
+    ExtraIndexer.rentBackfillCursor(_history.getReader) shouldBe None
+    noRent ! Reset()
+  }
+
+  /** Brief step 5's sentinel-branch requirement. Drives a REAL StartExtraIndexer
+    * round-trip through the production `ExtraIndexer` actor (not a direct call
+    * into the branch body, and not `ExtraIndexerTestActor`, which never handles
+    * StartExtraIndexer at all) so a future regression in the three-way startup
+    * branch would actually be caught. This is the one place in the whole feature
+    * where a bug is silent -- a fresh node mistaken for pre-feature, or a
+    * mid-backfill restart that never resumes, both surface only as a 503 that
+    * never clears, with an otherwise-green suite.
+    */
+  property("storage rent backfill writes the sentinel on a fresh database") {
+    // Build the underlying chain but deliberately never send this actor Index():
+    // the extra indexer's OWN progress (IndexedHeightKey/GlobalBoxIndexKey) must
+    // still be at its zero default, which is exactly what "fresh database" means
+    // to the startup branch -- as opposed to a pre-feature database, which would
+    // have indexed height/box progress already recorded.
+    val builder = system.actorOf(Props.create(classOf[ExtraIndexerTestActor], this))
+    builder ! CreateDB(HEIGHT)
+    lock.lock()
+    if (!created.await(120, TimeUnit.SECONDS)) fail("indexer never signalled created -- actor likely crashed; check supervision log")
+
+    IndexerState.fromHistory(_history).globalBoxIndex shouldBe 0
+    _history.historyStorage.get(RentBackfillKey) shouldBe empty
+
+    // Real production actor, rent writes on by default -- the actual code path
+    // Task 11's route gate depends on, not a test double.
+    val realIndexer = system.actorOf(
+      Props.create(classOf[ExtraIndexer], initSettings.cacheSettings, addressEncoder))
+    realIndexer ! StartExtraIndexer(_history)
+
+    awaitCondition("StartExtraIndexer to write the backfill sentinel key") { _history.historyStorage.get(RentBackfillKey).isDefined }
+
+    // Both assertions together are what distinguish "sentinel written" from
+    // "key never written at all" -- rentBackfillCursor alone reads None in
+    // both cases, so it can't tell them apart on its own.
+    ExtraIndexer.rentBackfillCursor(_history.getReader) shouldBe None
+    _history.historyStorage.get(RentBackfillKey) shouldBe defined
+
+    system.stop(realIndexer)
+    builder ! Reset()
+  }
+
   property("addresses") {
     indexer ! CreateDB(HEIGHT)
     indexer ! Index()
     lock.lock()
-    done.await()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
     val (addresses, _, _, _, _) = manualIndex(HEIGHT)
     checkAddresses(addresses) shouldBe 0
     indexer ! Reset()
@@ -283,7 +534,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     indexer ! CreateDB(HEIGHT)
     indexer ! Index()
     lock.lock()
-    done.await()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
     val (_, templates, _, _, _) = manualIndex(HEIGHT)
     checkTemplates(templates) shouldBe 0
     indexer ! Reset()
@@ -293,7 +544,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     indexer ! CreateDB(HEIGHT)
     indexer ! Index()
     lock.lock()
-    done.await()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
     val (_, _, indexedTokens, _, _) = manualIndex(HEIGHT)
     checkTokens(indexedTokens) shouldBe 0
     indexer ! Reset()
@@ -323,21 +574,21 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest {
     indexer ! CreateDB(HEIGHT)
     indexer ! Index()
     lock.lock()
-    done.await()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
     indexer ! GenerateBetterChainTip()
     lock.lock()
-    created.await()
+    if (!created.await(120, TimeUnit.SECONDS)) fail("indexer never signalled created -- actor likely crashed; check supervision log")
     val newBestHeaderOpt = history.typedModifierById[Header](history.headerIdsAtHeight(history.fullBlockHeight).last)
     indexer ! RemoteBlockApplied(newBestHeaderOpt.get) // will be ignored
     indexer ! CreateDB(HEIGHT + 1)
     lock.lock()
-    created.await()
+    if (!created.await(120, TimeUnit.SECONDS)) fail("indexer never signalled created -- actor likely crashed; check supervision log")
     indexer ! Index()
     lock.lock()
-    done.await()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
     indexer ! Rollback(history.bestHeaderIdAtHeight(HEIGHT).get)
     lock.lock()
-    done.await()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
     val (_, _, indexedTokens, _, _) = manualIndex(HEIGHT)
     checkTokens(indexedTokens) shouldBe 0
     indexer ! Reset()

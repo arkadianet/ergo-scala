@@ -40,7 +40,7 @@ class ErgoInterpreter(params: BlockchainParameters)
     * @return whether the box is spent properly according to the storage fee rule
     */
   protected def checkExpiredBox(box: ErgoBox, output: ErgoBoxCandidate, currentHeight: Height): Boolean = {
-    val storageFee = params.storageFeeFactor * box.bytes.length
+    val storageFee = ErgoInterpreter.storageFee(params.storageFeeFactor, box.bytes.length)
 
     val storageFeeNotCovered = box.value - storageFee <= 0
     lazy val correctCreationHeight = output.creationHeight == currentHeight
@@ -94,6 +94,17 @@ object ErgoInterpreter {
     * Added once per transaction.
     */
   val interpreterInitCost = 10000
+
+  /** Storage fee charged for a box of `boxByteSize` serialized bytes under the
+    * given `storageFeeFactor`.
+    *
+    * NOTE: reproduces consensus arithmetic exactly, including 32-bit overflow —
+    * may return a negative value when the product exceeds Int.MaxValue. Callers
+    * surfacing this value must not clamp it; a negative fee is what consensus
+    * computes today.
+    */
+  def storageFee(storageFeeFactor: Int, boxByteSize: Int): Int =
+    storageFeeFactor * boxByteSize
 
   /** Creates an interpreter with the given parameters. */
   def apply(params: BlockchainParameters): ErgoInterpreter =

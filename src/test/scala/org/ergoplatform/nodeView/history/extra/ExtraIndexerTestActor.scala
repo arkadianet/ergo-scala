@@ -14,7 +14,17 @@ import java.io.File
 import scala.collection.mutable
 import scala.concurrent.duration.DurationInt
 
-class ExtraIndexerTestActor(test: ExtraIndexerSpecification) extends ExtraIndexerBase with FileUtils {
+class ExtraIndexerTestActor(test: ExtraIndexerTestHarness,
+                            saveLimitOverride: Int,
+                            override val rentWritesEnabled: Boolean)
+  extends ExtraIndexerBase with FileUtils {
+
+  /** Explicit auxiliary constructors. ExtraIndexerSpecification constructs this
+    * reflectively via Props.create, which matches by arity — and Scala emits only
+    * ONE constructor for default parameters, so defaults would break it.
+    */
+  def this(test: ExtraIndexerTestHarness) = this(test, 1, true)
+  def this(test: ExtraIndexerTestHarness, saveLimitOverride: Int) = this(test, saveLimitOverride, true)
 
   override def receive: Receive = {
     case test.CreateDB(blockCount: Int) => createDB(blockCount)
@@ -37,9 +47,26 @@ class ExtraIndexerTestActor(test: ExtraIndexerSpecification) extends ExtraIndexe
 
   type ID_LL = mutable.HashMap[ModifierId,(Long,Long)]
 
-  override protected val saveLimit: Int = 1 // save every block
+  override protected val saveLimit: Int = saveLimitOverride
   override protected implicit val segmentThreshold: Int = 8 // split to smaller segments
   override protected implicit val addressEncoder: ErgoAddressEncoder = test.initSettings.chainSettings.addressEncoder
+
+  /** Records every `saveProgress` call's exact insertExtra arguments, for specs
+    * that need to prove the progress marker and pending rent mutations travel
+    * in the SAME `insertExtra` invocation (I5b). See `ExtraIndexer.onSaveProgress`.
+    */
+  val saveProgressCalls: mutable.ArrayBuffer[(Array[(Array[Byte], Array[Byte])], Array[Array[Byte]])] =
+    mutable.ArrayBuffer.empty[(Array[(Array[Byte], Array[Byte])], Array[Array[Byte]])]
+
+  override protected def onSaveProgress(indexesToInsert: Array[(Array[Byte], Array[Byte])],
+                                        keysToRemove: Array[Array[Byte]]): Unit =
+    saveProgressCalls += ((indexesToInsert, keysToRemove))
+
+  /** Small on purpose: test chains have far fewer than 10000 boxes, so the
+    * production default would always finish the backfill in a single chunk,
+    * making it impossible to exercise resumption from a mid-backfill cursor.
+    */
+  override protected val RentBackfillChunkSize: Int = 3
 
   val nodeSettings: NodeConfigurationSettings = NodeConfigurationSettings(StateType.Utxo, verifyTransactions = true,
     -1, UtxoSettings(utxoBootstrap = false, 0, 2), NipopowSettings(nipopowBootstrap = false, 1), mining = false,
@@ -73,11 +100,8 @@ class ExtraIndexerTestActor(test: ExtraIndexerSpecification) extends ExtraIndexe
   def reset(): Unit = {
     stateOpt = None
     test._history = null
-    general.clear()
-    boxes.clear()
-    trees.clear()
-    tokens.clear()
-    segments.clear()
+    general.clear(); boxes.clear(); trees.clear(); templates.clear()
+    tokens.clear(); segments.clear(); rentPuts.clear(); rentRemovals.clear()
     context.become(receive.orElse(loaded(IndexerState(0, 0, 0, 0, caughtUp = false))))
   }
 
