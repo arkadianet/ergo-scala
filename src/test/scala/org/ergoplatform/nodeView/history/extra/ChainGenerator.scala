@@ -47,8 +47,16 @@ object ChainGenerator extends ErgoTestHelpers with Matchers {
   val minimalSuffix = 2
   val txCostLimit: Height = initSettings.nodeSettings.maxTransactionCost
   val txSizeLimit: Height = initSettings.nodeSettings.maxTransactionSize
-  val startTime: Long = System.currentTimeMillis() - ((5000 - 1) * blockInterval.toMillis)
-
+  // NOTE: startTime must be computed fresh at the moment a from-scratch generation begins
+  // (see generate() below), never frozen once at class-init. History only treats block
+  // sections as "headers chain synced" (FullBlockPruningProcessor / ToDownloadProcessor)
+  // once an appended header's timestamp is within blockInterval * headerChainDiff (5000
+  // minutes here) of "now". If startTime were fixed at singleton init and generation
+  // happened more than ~1 minute later (e.g. because another spec initializes this object
+  // first), the very first generated block would already be too old, block-section appends
+  // would be rejected as un-synced, and the generating actor would crash/hang. Recompute
+  // per from-scratch generation to keep this margin regardless of init-vs-use timing.
+  var startTime: Long = 0
   var endTime: Long = 0
 
   def generate(length: Int, dir: File, history: ErgoHistory, stateOpt: Option[UtxoState]): UtxoState = {
@@ -56,6 +64,9 @@ object ChainGenerator extends ErgoTestHelpers with Matchers {
         val stateDir = new File(s"${dir.getAbsolutePath}/state")
         stateDir.mkdirs()
         ErgoState.generateGenesisUtxoState(stateDir, initSettings)._1
+    }
+    if (stateOpt.isEmpty) {
+      startTime = System.currentTimeMillis() - ((5000 - 1) * blockInterval.toMillis)
     }
     System.out.println(s"Going to ${if(stateOpt.isEmpty) "generate" else "extend"} chain at " +
       s"${dir.getAbsolutePath} starting from ${history.fullBlockHeight}")

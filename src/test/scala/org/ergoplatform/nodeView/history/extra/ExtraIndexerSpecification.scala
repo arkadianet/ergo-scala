@@ -241,7 +241,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
       // perform rollback
       indexer ! Rollback(history.bestHeaderIdAtHeight(n).get)
       lock.lock()
-      done.await()
+      if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
       state = IndexerState.fromHistory(_history)
 
       // address balances
@@ -288,7 +288,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
       indexer ! CreateDB(n)
       indexer ! Index()
       lock.lock()
-      done.await()
+      if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
 
       val (addresses, _, _, _, _) = manualIndex(n)
 
@@ -321,7 +321,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
     indexer ! CreateDB(HEIGHT)
     indexer ! Index()
     lock.lock()
-    done.await()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
     val state = IndexerState.fromHistory(_history)
     cfor(0)(_ < state.globalTxIndex, _ + 1) { n =>
       val id = history.typedExtraIndexById[NumericTxIndex](bytesToId(NumericTxIndex.indexToBytes(n)))
@@ -335,7 +335,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
     indexer ! CreateDB(HEIGHT)
     indexer ! Index()
     lock.lock()
-    done.await()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
     val state = IndexerState.fromHistory(_history)
     cfor(0)(_ < state.globalBoxIndex, _ + 1) { n =>
       val id = history.typedExtraIndexById[NumericBoxIndex](bytesToId(NumericBoxIndex.indexToBytes(n)))
@@ -349,7 +349,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
     indexer ! CreateDB(HEIGHT)
     indexer ! Index()
     lock.lock()
-    done.await()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
     checkRentIndex(HEIGHT)
     indexer ! Reset()
   }
@@ -360,7 +360,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
     bigBatchIndexer ! CreateDB(HEIGHT)
     bigBatchIndexer ! Index()
     lock.lock()
-    done.await()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
     checkRentIndex(HEIGHT)
     bigBatchIndexer ! Reset()
   }
@@ -380,7 +380,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
     recording ! CreateDB(HEIGHT)
     recording ! Index()
     lock.lock()
-    done.await()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
 
     val calls = recording.underlyingActor.saveProgressCalls
     calls should not be empty
@@ -402,7 +402,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
     noRent ! CreateDB(HEIGHT)
     noRent ! Index()
     lock.lock()
-    done.await()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
 
     // Pre-feature database: indexed, but no rent rows at all.
     _history.historyStorage.getAllExtraRaw((k, _) => isRentKey(k)) shouldBe empty
@@ -420,7 +420,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
     noRent ! CreateDB(HEIGHT)
     noRent ! Index()
     lock.lock()
-    done.await()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
 
     runBackfillChunks(noRent, chunks = 1)
     ExtraIndexer.rentBackfillCursor(_history.getReader) shouldBe defined
@@ -446,7 +446,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
     noRent ! CreateDB(HEIGHT)
     noRent ! Index()
     lock.lock()
-    done.await()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
 
     // Start the backfill (self-perpetuates in the background through the shared
     // mailbox) but only wait for the first round of progress.
@@ -497,7 +497,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
     val builder = system.actorOf(Props.create(classOf[ExtraIndexerTestActor], this))
     builder ! CreateDB(HEIGHT)
     lock.lock()
-    created.await()
+    if (!created.await(120, TimeUnit.SECONDS)) fail("indexer never signalled created -- actor likely crashed; check supervision log")
 
     IndexerState.fromHistory(_history).globalBoxIndex shouldBe 0
     _history.historyStorage.get(RentBackfillKey) shouldBe empty
@@ -524,7 +524,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
     indexer ! CreateDB(HEIGHT)
     indexer ! Index()
     lock.lock()
-    done.await()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
     val (addresses, _, _, _, _) = manualIndex(HEIGHT)
     checkAddresses(addresses) shouldBe 0
     indexer ! Reset()
@@ -534,7 +534,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
     indexer ! CreateDB(HEIGHT)
     indexer ! Index()
     lock.lock()
-    done.await()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
     val (_, templates, _, _, _) = manualIndex(HEIGHT)
     checkTemplates(templates) shouldBe 0
     indexer ! Reset()
@@ -544,7 +544,7 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
     indexer ! CreateDB(HEIGHT)
     indexer ! Index()
     lock.lock()
-    done.await()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
     val (_, _, indexedTokens, _, _) = manualIndex(HEIGHT)
     checkTokens(indexedTokens) shouldBe 0
     indexer ! Reset()
@@ -574,21 +574,21 @@ class ExtraIndexerSpecification extends ErgoCorePropertyTest with ExtraIndexerTe
     indexer ! CreateDB(HEIGHT)
     indexer ! Index()
     lock.lock()
-    done.await()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
     indexer ! GenerateBetterChainTip()
     lock.lock()
-    created.await()
+    if (!created.await(120, TimeUnit.SECONDS)) fail("indexer never signalled created -- actor likely crashed; check supervision log")
     val newBestHeaderOpt = history.typedModifierById[Header](history.headerIdsAtHeight(history.fullBlockHeight).last)
     indexer ! RemoteBlockApplied(newBestHeaderOpt.get) // will be ignored
     indexer ! CreateDB(HEIGHT + 1)
     lock.lock()
-    created.await()
+    if (!created.await(120, TimeUnit.SECONDS)) fail("indexer never signalled created -- actor likely crashed; check supervision log")
     indexer ! Index()
     lock.lock()
-    done.await()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
     indexer ! Rollback(history.bestHeaderIdAtHeight(HEIGHT).get)
     lock.lock()
-    done.await()
+    if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
     val (_, _, indexedTokens, _, _) = manualIndex(HEIGHT)
     checkTokens(indexedTokens) shouldBe 0
     indexer ! Reset()

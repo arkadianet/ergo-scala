@@ -23,6 +23,7 @@ import scorex.db.ByteArrayWrapper
 import scorex.util.bytesToId
 
 import java.nio.ByteBuffer
+import java.util.concurrent.TimeUnit
 
 /**
   * First route-level spec for the `/blockchain` API surface. Every existing test
@@ -63,7 +64,7 @@ class BlockchainApiRouteSpec
   builderIndexer ! CreateDB(HEIGHT)
   builderIndexer ! Index()
   lock.lock()
-  done.await()
+  if (!done.await(120, TimeUnit.SECONDS)) fail("indexer never signalled done -- actor likely crashed; check supervision log")
 
   // Backfill-gate assertion (brief gotcha #6): the rent routes added in the next task
   // return 503 while a backfill cursor is present. `RentBackfillKey` is written ONLY by
