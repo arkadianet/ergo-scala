@@ -2,12 +2,42 @@ package org.ergoplatform.nodeView.mempool
 
 import org.ergoplatform.modifiers.mempool.UnconfirmedTransaction
 import scorex.util.{ModifierId, ScorexLogging}
+import scala.collection.mutable
 import scala.util.Random
+import org.ergoplatform.settings.Algos
 
 /**
   * Additional types and functions used in ErgoMemPool
   */
 object ErgoMemPoolUtils extends ScorexLogging {
+
+  /** Parents precede children for wallet scans and transaction events.
+    * Include data-input dependencies and report each transaction only once.
+    */
+  private[mempool] def inDependencyOrder(txs: Seq[UnconfirmedTransaction]): Seq[UnconfirmedTransaction] = {
+    val unique = txs.groupBy(_.id).values.map(_.head).toSeq.sortBy(_.id)
+    val creators = unique.flatMap(u => u.transaction.outputs.map(b => Algos.encode(b.id) -> u.id)).toMap
+    val remaining = mutable.Map.empty[ModifierId, Int]
+    val children = mutable.Map.empty[ModifierId, Vector[UnconfirmedTransaction]]
+    unique.foreach { u =>
+      val tx = u.transaction
+      val parents = (tx.inputIds ++ tx.dataInputs.map(_.boxId)).flatMap(b => creators.get(Algos.encode(b))).toSet
+      remaining(u.id) = parents.size
+      parents.foreach { p => children(p) = children.getOrElse(p, Vector.empty) :+ u }
+    }
+    val ready = mutable.Queue.empty[UnconfirmedTransaction]
+    ready ++= unique.filter(u => remaining(u.id) == 0)
+    val result = Vector.newBuilder[UnconfirmedTransaction]
+    while (ready.nonEmpty) {
+      val u = ready.dequeue()
+      result += u
+      children.getOrElse(u.id, Vector.empty).foreach { child =>
+        remaining(child.id) -= 1
+        if (remaining(child.id) == 0) ready.enqueue(child)
+      }
+    }
+    result.result()
+  }
 
   /**
    * Hierarchy of sorting strategies for mempool transactions
@@ -41,6 +71,14 @@ object ErgoMemPoolUtils extends ScorexLogging {
    * Root of possible mempool transaction validation result family
    */
   sealed trait ProcessingOutcome {
+    /** Transactions newly present in the committed pool, in dependency order.
+      * A declined trigger may still have admitted other transactions.
+      */
+    def admitted: Seq[UnconfirmedTransaction] = Seq.empty
+
+    /** Defined only for opt-in staging. Admission events must not charge this work again. */
+    def validationWork: Option[Seq[ValidationWork]] = None
+
     /**
      * Time when transaction validation was started
      */
@@ -75,12 +113,46 @@ object ErgoMemPoolUtils extends ScorexLogging {
 
   object ProcessingOutcome {
 
+    private[mempool] def withWork(outcome: ProcessingOutcome,
+                                  admittedTxs: Seq[UnconfirmedTransaction],
+                                  work: Seq[ValidationWork]): ProcessingOutcome = {
+      val started = System.currentTimeMillis()
+      val total = math.min(Int.MaxValue.toLong, work.map(_.cost.toLong).sum).toInt
+      outcome match {
+        case a: Accepted => new Accepted(a.tx, started, admittedTxs.filterNot(_.id == a.tx.id)) {
+          override val validationWork = Some(work)
+          override val cost = total
+        }
+        case i: Invalidated => new Invalidated(i.e, started) {
+          override val validationWork = Some(work)
+          override val cost = total
+          override val admitted = inDependencyOrder(admittedTxs)
+        }
+        case d: DoubleSpendingLoser => new DoubleSpendingLoser(d.winnerTxIds, started) {
+          override val validationWork = Some(work)
+          override val cost = total
+          override val admitted = inDependencyOrder(admittedTxs)
+        }
+        case d: Declined => new Declined(d.e, started, inDependencyOrder(admittedTxs)) {
+          override val validationWork = Some(work)
+          override val cost = total
+        }
+      }
+    }
+
     /**
      * Object signalling that a transaction is accepted to the memory pool
+     *
+     * @param coAdmitted - staged txs admitted alongside `tx` (resolved orphans and related
+     *                   transactions); empty on the common single-tx path
      */
     class Accepted(val tx: UnconfirmedTransaction,
-                   override protected val validationStartTime: Long) extends ProcessingOutcome {
+                   override protected val validationStartTime: Long,
+                   val coAdmitted: Seq[UnconfirmedTransaction] = Seq.empty) extends ProcessingOutcome {
       override val cost: Int = tx.lastCost.getOrElse(super.cost)
+
+      override lazy val admitted: Seq[UnconfirmedTransaction] = inDependencyOrder(tx +: coAdmitted)
+
     }
 
     /**
@@ -96,7 +168,8 @@ object ErgoMemPoolUtils extends ScorexLogging {
      * Class signalling that a transaction declined from being accepted into the memory pool
      */
     class Declined(val e: Throwable,
-                   override protected val validationStartTime: Long) extends ProcessingOutcome
+                   override protected val validationStartTime: Long,
+                   override val admitted: Seq[UnconfirmedTransaction] = Seq.empty) extends ProcessingOutcome
 
 
     /**

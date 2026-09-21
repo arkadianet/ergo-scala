@@ -61,18 +61,24 @@ object ErgoNodeViewSynchronizerMessages {
     // hierarchy of events regarding modifiers application outcome
     trait ModificationOutcome extends NodeViewHolderEvent
 
+    /** Account the whole bounded staging batch before handling its announcements. */
+    case class StagingValidationResult(work: Seq[org.ergoplatform.nodeView.mempool.ValidationWork],
+                                       admittedIds: Set[ModifierId]) extends ModificationOutcome
+
     trait InitialTransactionCheckOutcome extends ModificationOutcome {
       val transaction: UnconfirmedTransaction
+      def validationCost: Option[Int]
     }
 
-    case class FailedTransaction(transaction: UnconfirmedTransaction, error: Throwable) extends InitialTransactionCheckOutcome
+    case class FailedTransaction(transaction: UnconfirmedTransaction, error: Throwable,
+                                 validationCost: Option[Int] = None) extends InitialTransactionCheckOutcome
 
-    case class SuccessfulTransaction(transaction: UnconfirmedTransaction) extends InitialTransactionCheckOutcome
+    case class SuccessfulTransaction(transaction: UnconfirmedTransaction, validationCost: Option[Int] = None) extends InitialTransactionCheckOutcome
 
     /**
      * Transaction declined by the mempool (not permanently invalidated, so pool can accept it in future)
      */
-    case class DeclinedTransaction(transaction: UnconfirmedTransaction) extends InitialTransactionCheckOutcome
+    case class DeclinedTransaction(transaction: UnconfirmedTransaction, validationCost: Option[Int] = None) extends InitialTransactionCheckOutcome
 
     /**
      * Transaction which was failed not immediately but after sitting for some time in the mempool or during block

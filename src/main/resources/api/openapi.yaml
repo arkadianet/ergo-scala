@@ -3255,6 +3255,10 @@ paths:
     post:
       summary: Submit an Ergo transaction to unconfirmed pool to send it over the network
       operationId: sendTransaction
+      description: >-
+        With optional mempool staging enabled (disabled by default), a declined transaction may remain in memory
+        until the staging TTL expires or it is evicted, and may later be admitted and broadcast without resubmission.
+        Retention is best effort. Submitting a replacement does not cancel a retained transaction.
       tags:
         - transactions
       requestBody:
@@ -3281,6 +3285,10 @@ paths:
       post:
         summary: Submit an Ergo transaction given as hex-encoded transaction bytes to unconfirmed pool to send it over the network
         operationId: sendTransactionAsBytes
+        description: >-
+          With optional mempool staging enabled (disabled by default), a declined transaction may remain in memory
+          until the staging TTL expires or it is evicted, and may later be admitted and broadcast without resubmission.
+          Retention is best effort. Submitting a replacement does not cancel a retained transaction.
         tags:
           - transactions
         requestBody:

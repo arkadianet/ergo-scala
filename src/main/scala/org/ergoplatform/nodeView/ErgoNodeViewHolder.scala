@@ -30,6 +30,7 @@ import org.ergoplatform.modifiers.history.extension.Extension
 
 import scala.annotation.tailrec
 import scala.collection.mutable
+import scala.concurrent.duration._
 import scala.util.{Failure, Success, Try}
 
 /**
@@ -266,28 +267,54 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
     }
   }
 
+  private def publishStagingResult(newPool: ErgoMemPool, outcome: ProcessingOutcome,
+                                    trigger: Option[ModifierId] = None): Unit = {
+    val admitted = outcome.admitted
+    if (admitted.nonEmpty) {
+      updateNodeView(updatedVault = Some(vault().scanOffchain(admitted.map(_.transaction))), updatedMempool = Some(newPool))
+    } else if (newPool.stagingChangedFrom(memoryPool()) || outcome.validationWork.exists(_.exists(_.error.nonEmpty))) {
+      updateNodeView(updatedMempool = Some(newPool))
+    }
+    outcome.validationWork.foreach { work =>
+      context.system.eventStream.publish(StagingValidationResult(work, admitted.map(_.id).toSet))
+      work.filterNot(w => trigger.contains(w.transaction.id)).foreach { entry =>
+        entry.error.foreach(error => context.system.eventStream.publish(FailedTransaction(entry.transaction, error, Some(0))))
+      }
+    }
+    admitted.foreach(tx => context.system.eventStream.publish(SuccessfulTransaction(tx, outcome.validationWork.map(_ => 0))))
+  }
+
+  override def preStart(): Unit = {
+    super.preStart()
+    if (settings.nodeSettings.stagingEnabled) self ! ExpireStaging
+  }
+
   protected def txModify(unconfirmedTx: UnconfirmedTransaction): ProcessingOutcome = {
     val tx = unconfirmedTx.transaction
     val (newPool, processingOutcome) = memoryPool().process(unconfirmedTx, minimalState())
+    publishStagingResult(newPool, processingOutcome, Some(unconfirmedTx.id))
+    val admitted = processingOutcome.admitted
+    val costOverride = processingOutcome.validationWork.map(_ => 0)
     processingOutcome match {
-      case acc: ProcessingOutcome.Accepted =>
+      case _: ProcessingOutcome.Accepted =>
         log.debug(s"Unconfirmed transaction $tx added to the memory pool")
-        val newVault = vault().scanOffchain(tx)
-        updateNodeView(updatedVault = Some(newVault), updatedMempool = Some(newPool))
-        context.system.eventStream.publish(SuccessfulTransaction(acc.tx))
       case i: ProcessingOutcome.Invalidated =>
         val e = i.e
         log.debug(s"Transaction $tx invalidated. Cause: ${e.getMessage}")
         updateNodeView(updatedMempool = Some(newPool))
-        context.system.eventStream.publish(FailedTransaction(unconfirmedTx.withCost(i.cost), e))
-      case dbl: ProcessingOutcome.DoubleSpendingLoser => // do nothing
+        context.system.eventStream.publish(FailedTransaction(unconfirmedTx.withCost(i.cost), e, costOverride))
+      case dbl: ProcessingOutcome.DoubleSpendingLoser =>
         val winnerTxs = dbl.winnerTxIds
         log.debug(s"Transaction $tx declined, as other transactions $winnerTxs are paying more")
-        context.system.eventStream.publish(DeclinedTransaction(unconfirmedTx.withCost(dbl.cost)))
-      case dcl: ProcessingOutcome.Declined => // do nothing
+        // Persist staging changes even when the submitted transaction is declined.
+        if (admitted.isEmpty && newPool.stagingChangedFrom(memoryPool())) updateNodeView(updatedMempool = Some(newPool))
+        context.system.eventStream.publish(DeclinedTransaction(unconfirmedTx.withCost(dbl.cost), costOverride))
+      case dcl: ProcessingOutcome.Declined =>
         val e = dcl.e
         log.debug(s"Transaction $tx declined, reason: ${e.getMessage}")
-        context.system.eventStream.publish(DeclinedTransaction(unconfirmedTx.withCost(dcl.cost)))
+        // Persist staging changes even when the submitted transaction is declined.
+        if (admitted.isEmpty && newPool.stagingChangedFrom(memoryPool())) updateNodeView(updatedMempool = Some(newPool))
+        context.system.eventStream.publish(DeclinedTransaction(unconfirmedTx.withCost(dcl.cost), costOverride))
     }
     processingOutcome
   }
@@ -419,7 +446,10 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
       .flatMap(extractTransactions)
       .filter(tx => !appliedTxs.exists(_.id == tx.id))
       .map(tx => UnconfirmedTransaction(tx, None))
-    memPool.removeWithDoubleSpends(appliedTxs).put(rolledBackTxs)
+    val spentBoxIds = appliedTxs.flatMap(_.inputs.map(_.boxId)).toSet
+    // A self-message runs after the whole new state and wallet view have been committed.
+    if (settings.nodeSettings.stagingEnabled) self ! RetryStaging
+    memPool.removeWithDoubleSpends(appliedTxs).put(rolledBackTxs).pruneStagingSpentInputs(spentBoxIds)
   }
 
   /**
@@ -662,6 +692,13 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
   }
 
   protected def transactionsProcessing: Receive = {
+    case RetryStaging =>
+      val (updated, outcome) = memoryPool().retryStaging(minimalState())
+      publishStagingResult(updated, outcome)
+    case ExpireStaging =>
+      val updated = memoryPool().expireStaging()
+      if (updated.stagingChangedFrom(memoryPool())) updateNodeView(updatedMempool = Some(updated))
+      context.system.scheduler.scheduleOnce(1.minute, self, ExpireStaging)(context.dispatcher)
     case TransactionFromRemote(unconfirmedTx) =>
       txModify(unconfirmedTx)
     case LocallyGeneratedTransaction(unconfirmedTx) =>
@@ -672,6 +709,7 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
     case EliminateTransactions(ids) =>
       val updatedPool = ids.foldLeft(memoryPool()) { case (pool, txId) => pool.invalidate(txId) }
       updateNodeView(updatedMempool = Some(updatedPool))
+      if (settings.nodeSettings.stagingEnabled) self ! RetryStaging
       val e = new Exception("Became invalid")
       ids.foreach { id =>
         context.system.eventStream.publish(FailedOnRecheckTransaction(id, e))
@@ -723,6 +761,8 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
 object ErgoNodeViewHolder {
 
   object ReceivableMessages {
+    private[nodeView] case object RetryStaging
+    private[nodeView] case object ExpireStaging
     // Tracking last modifier and header & block heights in time, being periodically checked for possible stuck
     case class ChainProgress(lastMod: BlockSection, headersHeight: Int, blockHeight: Int, lastUpdate: Long)
 
