@@ -50,7 +50,18 @@ case class NodeConfigurationSettings(override val stateType: StateType,
                                      adProofsSuffixLength: Int,
                                      extraIndex: Boolean,
                                      blacklistedTransactions: Seq[String] = Seq.empty,
-                                     checkpoint: Option[CheckpointSettings] = None) extends ClientCapabilities {
+                                     checkpoint: Option[CheckpointSettings] = None,
+                                     // Bounded local staging for child-before-parent transactions.
+                                     // Off by default - a no-op feature until explicitly enabled.
+                                     stagingEnabled: Boolean = false,
+                                     stagingMaxCount: Int = 2048,
+                                     stagingMaxBytes: Long = 8 * 1024 * 1024,
+                                     stagingMaxCountPerPeer: Int = 128,
+                                     stagingMaxBytesPerPeer: Long = 1024 * 1024,
+                                     stagingMaxWaitersPerInput: Int = 64,
+                                     stagingTtlMillis: Long = 1200000L,
+                                     stagingMaxValidationAttempts: Int = 32,
+                                     stagingMaxValidationCost: Long = 2000000L) extends ClientCapabilities {
   /**
     * Whether the node keeping all the full blocks of the blockchain or not.
     * @return true if the blockchain is pruned, false if not
@@ -95,7 +106,16 @@ trait NodeConfigurationReaders extends StateTypeReaders with CheckpointingSettin
       cfg.as[Int](s"$path.adProofsSuffixLength"),
       cfg.as[Boolean](s"$path.extraIndex"),
       cfg.as[Seq[String]](s"$path.blacklistedTransactions"),
-      cfg.as[Option[CheckpointSettings]](s"$path.checkpoint")
+      cfg.as[Option[CheckpointSettings]](s"$path.checkpoint"),
+      cfg.as[Option[Boolean]](s"$path.staging.enabled").getOrElse(false),
+      cfg.as[Option[Int]](s"$path.staging.maxCount").getOrElse(2048),
+      cfg.as[Option[Long]](s"$path.staging.maxBytes").getOrElse(8 * 1024 * 1024),
+      cfg.as[Option[Int]](s"$path.staging.maxCountPerPeer").getOrElse(128),
+      cfg.as[Option[Long]](s"$path.staging.maxBytesPerPeer").getOrElse(1024 * 1024),
+      cfg.as[Option[Int]](s"$path.staging.maxWaitersPerInput").getOrElse(64),
+      cfg.as[Option[Long]](s"$path.staging.ttlMillis").getOrElse(1200000L),
+      cfg.as[Option[Int]](s"$path.staging.maxValidationAttempts").getOrElse(32),
+      cfg.as[Option[Long]](s"$path.staging.maxValidationCost").getOrElse(2000000L)
     )
   }
 

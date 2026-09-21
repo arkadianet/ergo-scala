@@ -203,10 +203,10 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
     * To be called when mempool reporting on finished transaction validation.
     * This method adds validation cost to counter and send another
     */
-  private def processMempoolResult(processingResult: InitialTransactionCheckOutcome): Unit = {
+  private def processMempoolResult(processingResult: InitialTransactionCheckOutcome, resume: Boolean): Unit = {
     val FallbackCostValue = 5000
 
-    val costOpt = processingResult.transaction.lastCost
+    val costOpt = processingResult.validationCost.orElse(processingResult.transaction.lastCost)
     if (costOpt.isEmpty) {
       // should not be here, and so ReserveCostValue should not be used
       log.warn("Cost is empty in processMempoolResult")
@@ -214,11 +214,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
     val cost = costOpt.getOrElse(FallbackCostValue)
 
-    val newInterblockCost = processingResult match {
-      case _: FailedTransaction => interblockCost.copy(invalidatedCost = interblockCost.invalidatedCost + cost)
-      case _: SuccessfulTransaction => interblockCost.copy(acceptedCost = interblockCost.acceptedCost + cost)
-      case _: DeclinedTransaction => interblockCost.copy(declinedCost = interblockCost.declinedCost + cost)
-    }
+    val newInterblockCost = interblockCost.record(processingResult, cost)
 
     log.debug(s"Old global cost info: $interblockCost, " +
       s"new: $newInterblockCost, tx processing cache size: ${txProcessingCache.size}")
@@ -228,11 +224,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
     peerOpt match {
       case Some(peer) =>
         val peerTxInfo = perPeerCost.getOrElse(peer, IncomingTxInfo.empty())
-        val newPeerCost = processingResult match {
-          case _: FailedTransaction => peerTxInfo.copy(invalidatedCost = peerTxInfo.invalidatedCost + cost)
-          case _: SuccessfulTransaction => peerTxInfo.copy(acceptedCost = peerTxInfo.acceptedCost + cost)
-          case _: DeclinedTransaction => peerTxInfo.copy(declinedCost = peerTxInfo.declinedCost + cost)
-        }
+        val newPeerCost = peerTxInfo.record(processingResult, cost)
         log.debug(s"Old peer ${peer.connectionId} cost info: ${peerTxInfo.totalCost}, " +
           s"new: $newPeerCost, tx processing cache size: ${txProcessingCache.size}")
         perPeerCost.put(peer, newPeerCost)
@@ -243,7 +235,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
     val withinPeerLimit = peerOpt.isEmpty || (peerOpt.isDefined &&
       perPeerCost.getOrElse(peerOpt.get, IncomingTxInfo.empty()).totalCost < MempoolPeerCostPerBlock)
 
-    if (withinGlobalLimit && withinPeerLimit) {
+    if (resume && withinGlobalLimit && withinPeerLimit) {
       processFirstTxProcessingCacheRecord()
     }
   }
@@ -1452,19 +1444,40 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
       perPeerCost.clear()
       processFirstTxProcessingCacheRecord() // resume cache processing
 
-    case st@SuccessfulTransaction(utx) =>
+    case StagingValidationResult(work, admittedIds) =>
+      work.foreach { entry =>
+        val result = entry.error match {
+          case Some(error) => FailedTransaction(entry.transaction, error, Some(entry.cost))
+          case None if admittedIds.contains(entry.transaction.id) => SuccessfulTransaction(entry.transaction, Some(entry.cost))
+          case None => DeclinedTransaction(entry.transaction, Some(entry.cost))
+        }
+        processMempoolResult(result, resume = false)
+      }
+
+      // Resume once for the whole batch. Per-transaction announcements below
+      // must not turn one cascade into many simultaneous cache validations.
+      if (interblockCost.totalCost < MempoolCostPerBlock) {
+        txProcessingCache.find { case (_, record) =>
+          perPeerCost.getOrElse(record.source, IncomingTxInfo.empty()).totalCost < MempoolPeerCostPerBlock
+        }.foreach { case (id, record) =>
+          parseAndProcessTransaction(id, record.txBytes, record.source)
+          txProcessingCache -= id
+        }
+      }
+
+    case st@SuccessfulTransaction(utx, _) =>
       val tx = utx.transaction
       deliveryTracker.setHeld(tx.id, ErgoTransaction.modifierTypeId)
-      processMempoolResult(st)
+      processMempoolResult(st, resume = st.validationCost.isEmpty)
       broadcastModifierInv(tx)
 
-    case dt@DeclinedTransaction(utx: UnconfirmedTransaction) =>
+    case dt@DeclinedTransaction(utx: UnconfirmedTransaction, _) =>
       declined.put(utx.id, System.currentTimeMillis())
-      processMempoolResult(dt)
+      processMempoolResult(dt, resume = dt.validationCost.isEmpty)
 
-    case ft@FailedTransaction(utx, error) =>
+    case ft@FailedTransaction(utx, error, _) =>
       val id = utx.id
-      processMempoolResult(ft)
+      processMempoolResult(ft, resume = ft.validationCost.isEmpty)
 
       utx.source.foreach { peer =>
         // no need to call deliveryTracker.setInvalid, as mempool will consider invalidated tx in contains()
@@ -1683,6 +1696,12 @@ object ErgoNodeViewSynchronizer {
     */
   case class IncomingTxInfo(acceptedCost: Int, declinedCost: Int, invalidatedCost: Int) {
     val totalCost: Int = acceptedCost + declinedCost + invalidatedCost
+
+    def record(result: InitialTransactionCheckOutcome, cost: Int): IncomingTxInfo = result match {
+      case _: SuccessfulTransaction => copy(acceptedCost = acceptedCost + cost)
+      case _: DeclinedTransaction => copy(declinedCost = declinedCost + cost)
+      case _: FailedTransaction => copy(invalidatedCost = invalidatedCost + cost)
+    }
   }
 
   object IncomingTxInfo {
