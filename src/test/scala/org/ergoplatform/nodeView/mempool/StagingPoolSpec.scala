@@ -206,4 +206,105 @@ class StagingPoolSpec extends AnyFlatSpec with Matchers {
     intercept[IllegalArgumentException](caps.copy(maxBytesPerPeer = -1))
     intercept[IllegalArgumentException](caps.copy(maxWaitersPerInput = -1))
   }
+  it should "stage a held tx, indexed by the outputs it creates" in {
+    val pool = StagingPool.empty(caps)
+    val utx = mkUtx(Seq(randomBoxId()))
+
+    val Right(pool2) = pool.stageHeld(utx, priority = 500L, source = None, stagedTipId = None)
+
+    pool2.get(utx.id).map(_.kind) shouldBe Some(StagedKind.Held)
+    pool2.creatorOf(utx.transaction.outputs.head.id) shouldBe Some(utx.id)
+  }
+
+  it should "reject a newcomer that would evict a higher-priority incumbent, leaving the pool unchanged" in {
+    val tinyCaps = caps.copy(maxCount = 1)
+    val pool = StagingPool.empty(tinyCaps)
+    val incumbent = mkUtx(Seq(randomBoxId()))
+    val newcomer = mkUtx(Seq(randomBoxId()))
+
+    val Right(pool2) = pool.stageHeld(incumbent, priority = 20L, None, None)
+    pool2.stageHeld(newcomer, priority = 10L, None, None) shouldBe Left(StageReject.Full)
+
+    pool2.size shouldBe 1
+    pool2.contains(incumbent.id) shouldBe true
+  }
+
+  it should "vet the full multi-victim set before mutating - a 2nd required victim outranking the newcomer aborts eviction untouched" in {
+    // Two single-input incumbents exactly fill the byte budget; the (larger,
+    // 2-input) newcomer needs BOTH evicted to fit. `b` (priority 50) beats
+    // the newcomer (priority 10), so the whole eviction is aborted and the
+    // pool is byte-for-byte unchanged - evicting only `a` is never applied.
+    val a = mkUtx(Seq(randomBoxId()))
+    val b = mkUtx(Seq(randomBoxId()))
+    val newcomer = mkUtx(Seq(randomBoxId(), randomBoxId()))
+    val tightCaps = caps.copy(maxBytes = (a.transaction.size + b.transaction.size).toLong)
+
+    val pool = StagingPool.empty(tightCaps)
+    val Right(pool2) = pool.stageHeld(a, priority = 5L, None, None)
+    val Right(pool3) = pool2.stageHeld(b, priority = 50L, None, None)
+
+    pool3.stageHeld(newcomer, priority = 10L, None, None) shouldBe Left(StageReject.Full)
+    pool3.size shouldBe 2
+    pool3.contains(a.id) shouldBe true
+    pool3.contains(b.id) shouldBe true
+  }
+
+  it should "never let a fake-high-fee orphan evict a validated held entry" in {
+    val tinyCaps = caps.copy(maxCount = 1)
+    val pool = StagingPool.empty(tinyCaps)
+    val held = mkUtx(Seq(randomBoxId()))
+    val orphanIn = randomBoxId()
+    val orphan = mkUtx(Seq(orphanIn))
+
+    val Right(pool2) = pool.stageHeld(held, priority = 5L, None, None)
+    // Orphan claims a massive fee, but is unvalidated -> must not outrank Held.
+    pool2.stageOrphan(orphan, priority = Long.MaxValue, Set(orphanIn), None, None) shouldBe Left(StageReject.Full)
+    pool2.size shouldBe 1
+    pool2.contains(held.id) shouldBe true
+  }
+
+  // Regression (#4): when the budget fills, orphans are evicted before held
+  // entries regardless of claimed fee.
+  it should "evict orphans before held entries when the budget fills" in {
+    val tinyCaps = caps.copy(maxCount = 2)
+    val pool = StagingPool.empty(tinyCaps)
+    val held = mkUtx(Seq(randomBoxId()))       // low real priority
+    val o1In = randomBoxId()
+    val orphan1 = mkUtx(Seq(o1In))             // fat claimed fee
+    val orphan2 = mkUtx(Seq(randomBoxId()))    // fatter claimed fee (the newcomer)
+
+    val Right(p1) = pool.stageHeld(held, priority = 5L, None, None)
+    val Right(p2) = p1.stageOrphan(orphan1, priority = 50L, Set(o1In), None, None)
+    // Pool full; a higher-ranked orphan newcomer evicts the lower orphan, never the held.
+    val Right(p3) = p2.stageOrphan(orphan2, priority = 100L, Set(randomBoxId()), None, None)
+    p3.size shouldBe 2
+    p3.contains(held.id) shouldBe true
+    p3.contains(orphan1.id) shouldBe false
+    p3.contains(orphan2.id) shouldBe true
+  }
+
+  it should "preserve TTL and host quotas when refreshing a held entry" in {
+    val tx = mkUtx(Seq(randomBoxId())).withCost(100)
+    val Right(first) = StagingPool.empty(caps.copy(maxCountPerPeer = 1)).stageHeld(tx, 1L, Some(peer(100)), None)
+    val Right(refreshed) = first.stageHeld(tx.withCost(200), 2L, Some(peer(200)), None)
+    refreshed.peerCount(peer(300)) shouldBe 1
+    refreshed.peerBytes(peer(300)) shouldBe tx.transaction.size.toLong
+    val received = first.get(tx.id).get.receivedAt
+    refreshed.get(tx.id).get.receivedAt shouldBe received
+    val expired = refreshed.expire(received + 100L, 100L)
+    expired.creatorOf(tx.transaction.outputs.head.id) shouldBe None
+    expired.peerCount(peer(300)) shouldBe 0
+  }
+
+  it should "rotate retries without extending the eviction age or expiry" in {
+    val a = mkUtx(Seq(randomBoxId()))
+    val b = mkUtx(Seq(randomBoxId()))
+    val Right(first) = StagingPool.empty(caps).stageHeld(a, 1L, None, None)
+    val Right(second) = first.stageHeld(b, 1L, None, None)
+    val retried = second.markRetried(a.id)
+    retried.byTxId.values.toSeq.sortBy(e => (e.retryOrder, e.seq)).head.txId shouldBe b.id
+    retried.get(a.id).get.receivedAt shouldBe first.get(a.id).get.receivedAt
+    retried.get(a.id).get.seq shouldBe first.get(a.id).get.seq
+  }
+
 }
