@@ -2,14 +2,12 @@ package org.ergoplatform.nodeView.mempool
 
 import org.ergoplatform.ErgoBox.BoxId
 import org.ergoplatform.mining.emission.EmissionRules
-import org.ergoplatform.modifiers.mempool.{ErgoTransaction, ErgoTransactionSerializer, UnconfirmedTransaction}
+import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction}
 import org.ergoplatform.nodeView.mempool.OrderedTxPool.WeightedTxId
 import org.ergoplatform.nodeView.state.{ErgoState, UtxoState}
 import org.ergoplatform.settings.{ErgoSettings, MonetarySettings, NodeConfigurationSettings}
 import scorex.util.{ModifierId, ScorexLogging, bytesToId}
 import OrderedTxPool.weighted
-import org.ergoplatform.modifiers.history.header.Header
-import sigma.VersionContext
 import org.ergoplatform.nodeView.mempool.ErgoMemPoolUtils._
 import spire.syntax.all.cfor
 
@@ -153,7 +151,7 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
     */
   def invalidate(unconfirmedTx: UnconfirmedTransaction): ErgoMemPool = {
     log.debug(s"Invalidating mempool transaction ${unconfirmedTx.id}")
-    new ErgoMemPool(pool.invalidate(unconfirmedTx), updateStatsOnRemoval(unconfirmedTx.transaction), sortingOption, staging)
+    new ErgoMemPool(pool.invalidate(unconfirmedTx), updateStatsOnRemoval(unconfirmedTx.transaction), sortingOption, staging.remove(unconfirmedTx.id)._1)
   }
 
   def invalidate(unconfirmedTransactionId: ModifierId): ErgoMemPool = {
@@ -203,7 +201,7 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
   def stagingChangedFrom(previous: ErgoMemPool): Boolean =
     stagingEnabled && (staging ne previous.staging)
 
-  private def feeFactor(unconfirmedTransaction: UnconfirmedTransaction): Int = {
+  private[mempool] def feeFactor(unconfirmedTransaction: UnconfirmedTransaction): Int = {
     sortingOption match {
       case SortingOption.FeePerByte =>
         unconfirmedTransaction.transactionBytes.map(_.length).getOrElse(unconfirmedTransaction.transaction.size)
@@ -216,7 +214,8 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
   // If so, the new transacting is replacing older ones if it has bigger weight (fee/byte) than them on average.
   // Otherwise, the new transaction being rejected.
   private def acceptIfNoDoubleSpend(unconfirmedTransaction: UnconfirmedTransaction,
-                                    validationStartTime: Long): (ErgoMemPool, ProcessingOutcome) = {
+                                    validationStartTime: Long,
+                                    tipId: Option[ModifierId] = None): (ErgoMemPool, ProcessingOutcome) = {
     val tx = unconfirmedTransaction.transaction
 
     val doubleSpendingWtxs = tx.inputs.flatMap { inp =>
@@ -234,19 +233,32 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
         val updPool = new ErgoMemPool(p, stats, sortingOption, staging)
         updPool -> new ProcessingOutcome.Accepted(unconfirmedTransaction, validationStartTime)
       } else {
-        this -> new ProcessingOutcome.DoubleSpendingLoser(doubleSpendingWtxs.map(_.id), validationStartTime)
+        stageHeldIfEnabled(unconfirmedTransaction, ownWtx.weight, tipId) ->
+          new ProcessingOutcome.DoubleSpendingLoser(doubleSpendingWtxs.map(_.id), validationStartTime)
       }
     } else {
       val poolSizeLimit = nodeSettings.mempoolCapacity
       if (pool.size == poolSizeLimit &&
         weighted(tx, feeF).weight <= pool.orderedTransactions.lastKey.weight) {
         val exc = new Exception("Transaction pays less than any other in the pool being full")
-        this -> new ProcessingOutcome.Declined(exc, validationStartTime)
+        stageHeldIfEnabled(unconfirmedTransaction, weighted(tx, feeF).weight, tipId) ->
+          new ProcessingOutcome.Declined(exc, validationStartTime)
       } else {
         val updPool = new ErgoMemPool(pool.put(unconfirmedTransaction, feeF), stats, sortingOption, staging)
         updPool -> new ProcessingOutcome.Accepted(unconfirmedTransaction, validationStartTime)
       }
     }
+  }
+
+  private[mempool] def stageHeldIfEnabled(tx: UnconfirmedTransaction, priority: Long,
+                                          tipId: Option[ModifierId]): ErgoMemPool = {
+    if (!stagingEnabled) this
+    else staging.stageHeld(tx, priority, tx.source, tipId).fold(
+      reason => { log.debug(s"Staging refused ${tx.id}: $reason"); this },
+      updated => {
+        log.debug(s"Staging count=${updated.size}, held=${updated.byTxId.values.count(_.isHeld)}, bytes=${updated.totalBytes}")
+        new ErgoMemPool(pool, stats, sortingOption, updated)
+      })
   }
 
   /**
@@ -258,8 +270,9 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
     val work = new StagingValidation(nodeSettings.stagingMaxValidationAttempts,
       nodeSettings.stagingMaxValidationCost, nodeSettings.maxTransactionCost)
     val (updated, initial) = expireStaging().processImpl(unconfirmedTx, state, Some(work))
+    val newlyHeld = updated.staging.get(unconfirmedTx.id).exists(_.isHeld) && !staging.get(unconfirmedTx.id).exists(_.isHeld)
     val resolved = state match {
-      case utxo: UtxoState => updated.resolveStaging(utxo, work, Set(unconfirmedTx.id))
+      case utxo: UtxoState if initial.admitted.nonEmpty || newlyHeld => updated.resolveStaging(utxo, work, Set(unconfirmedTx.id))
       case _ => updated
     }
     val admitted = resolved.getAll.filterNot(tx => pool.contains(tx.id))
@@ -330,26 +343,25 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
               if (tx.inputIds.forall(inputBoxId => utxoWithPool.boxById(inputBoxId).isDefined)) {
 
                 val validationContext = utxo.stateContext.simplifiedUpcoming()
-                def serializationCheck(): Try[Unit] = {
-                  // Added in 6.0: protocol-valid unparseable outputs can still fail
-                  // versioned deserialization, e.g. tree version > activated version.
-                  val scriptVersion = Header.scriptFromBlockVersion(state.stateContext.blockVersion)
-                  VersionContext.withVersions(scriptVersion, scriptVersion) {
-                    ErgoTransactionSerializer.parseBytesTry(unconfirmedTx.transaction.bytes).map(_ => ())
-                  }
-                }
+                val tipId = utxo.stateContext.lastHeaderOpt.map(_.id)
+                def serializationCheck(): Try[Unit] = MempoolValidation.checkSerialization(tx, utxo)
                 if (work.isEmpty) serializationCheck() match {
                   case Failure(error) => return this -> new ProcessingOutcome.Invalidated(error, validationStartTime)
                   case _ =>
                 }
                 def validate(): Try[Int] = (if (work.isEmpty) Success(()) else serializationCheck())
                   .flatMap(_ => utxoWithPool.validateWithCost(tx, validationContext, costLimit, None))
-                work.map(_.validate(unconfirmedTx)(validate())).getOrElse(validate()) match {
+                val cached = staging.get(tx.id).filter { e =>
+                  e.isHeld && e.stagedTipId == tipId && e.dataInputBoxIds.forall(b => utxoWithPool.boxById(b).isDefined)
+                }.flatMap(_.utx.lastCost)
+                val checked = cached.map(Success(_)).getOrElse(
+                  work.map(_.validate(unconfirmedTx, recheck = staging.get(tx.id).exists(_.isHeld))(validate())).getOrElse(validate()))
+                checked match {
                   case Failure(StagingValidation.Deferred) =>
                     stageOrphanIfEnabled(unconfirmedTx, IndexedSeq.empty) ->
                       new ProcessingOutcome.Declined(StagingValidation.Deferred, validationStartTime)
                   case Success(cost) =>
-                    acceptIfNoDoubleSpend(unconfirmedTx.withCost(cost), validationStartTime)
+                    acceptIfNoDoubleSpend(unconfirmedTx.withCost(cost), validationStartTime, tipId)
                   case Failure(ex) =>
                     this.invalidate(unconfirmedTx) -> new ProcessingOutcome.Invalidated(ex, validationStartTime)
                 }
@@ -357,7 +369,9 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
                 val missingInputs = tx.inputIds.filterNot(id => utxoWithPool.boxById(id).isDefined)
                 val exc = new Exception("not all utxos in place yet")
                 if (stagingEnabled) {
-                  stageOrphanIfEnabled(unconfirmedTx, missingInputs) -> new ProcessingOutcome.Declined(exc, validationStartTime)
+                  new PackageAdmission(this, work.get).process(unconfirmedTx, missingInputs, validationStartTime, utxo).getOrElse(
+                    stageOrphanIfEnabled(unconfirmedTx, missingInputs) -> new ProcessingOutcome.Declined(exc, validationStartTime)
+                  )
                 } else {
                   this -> new ProcessingOutcome.Declined(exc, validationStartTime)
                 }
@@ -390,7 +404,7 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
   // Hold a child-before-parent tx as an Orphan, keyed by its still-missing
   // inputs. A stage refusal (cap hit, duplicate) is non-fatal - the tx is
   // simply not held.
-  private def stageOrphanIfEnabled(unconfirmedTx: UnconfirmedTransaction,
+  private[mempool] def stageOrphanIfEnabled(unconfirmedTx: UnconfirmedTransaction,
                                    missingInputs: IndexedSeq[BoxId]): ErgoMemPool = {
     if (!stagingEnabled) {
       this
@@ -414,16 +428,23 @@ class ErgoMemPool private[mempool](private[mempool] val pool: OrderedTxPool,
     var progress = true
     while (progress && attempts < nodeSettings.stagingMaxValidationAttempts && work.canValidate) {
       val overlay = utxo.withUnconfirmedTransactions(result.getAll)
-      val ready = result.staging.byTxId.values.toSeq.sortBy(_.seq).find { entry =>
-        !attempted.contains(entry.txId) && entry.inputBoxIds.forall(b => overlay.boxById(b).isDefined)
+      val ready = result.staging.byTxId.values.toSeq.sortBy(e => (e.retryOrder, if (e.isOrphan) 0 else 1, e.seq)).find { entry =>
+        !attempted.contains(entry.txId) && entry.inputBoxIds.forall { b =>
+          overlay.boxById(b).isDefined || result.staging.creatorOf(b).flatMap(result.staging.get).exists(_.isHeld)
+        }
       }
       ready match {
         case None => progress = false
         case Some(entry) =>
           attempted += entry.txId
           attempts += 1
-          val stripped = new ErgoMemPool(result.pool, result.stats, sortingOption, result.staging.remove(entry.txId)._1)
-          result = stripped.processImpl(entry.utx, utxo, Some(work))._1
+          val (next, outcome) = result.processImpl(entry.utx, utxo, Some(work))
+          val remove = outcome.admitted.map(_.id) ++ (outcome match {
+            case _: ProcessingOutcome.Invalidated => Seq(entry.txId)
+            case _ => Seq.empty
+          })
+          val clean = remove.foldLeft(next.staging)((s, id) => s.remove(id)._1)
+          result = new ErgoMemPool(next.pool, next.stats, sortingOption, clean.markRetried(entry.txId))
       }
     }
     result
@@ -507,6 +528,8 @@ object ErgoMemPool extends ScorexLogging {
     val ns = settings.nodeSettings
     if (ns.stagingEnabled) log.info("Mempool staging enabled")
     if (ns.stagingEnabled) {
+      require(ns.stagingMaxPackageCost > 0, "staging.maxPackageCost must be positive")
+      require(ns.stagingMaxPackageTransactions > 0, "staging.maxPackageTransactions must be positive")
       require(ns.stagingTtlMillis > 0, "staging.ttlMillis must be positive")
       require(ns.stagingMaxValidationAttempts > 0, "staging.maxValidationAttempts must be positive")
       require(ns.stagingMaxValidationCost >= ns.maxTransactionCost, "staging.maxValidationCost must cover maxTransactionCost")

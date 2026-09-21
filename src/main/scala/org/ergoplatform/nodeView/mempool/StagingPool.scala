@@ -8,18 +8,49 @@ import scorex.util.ModifierId
 
 import scala.annotation.tailrec
 
-/** An unvalidated orphan waiting for one or more missing inputs.
-  * Orphans use FIFO eviction; their claimed fee has not been validated.
+/**
+  * Admission status of an entry in the staging store.
+  */
+sealed trait StagedKind
+object StagedKind {
+  /** Child-before-parent: inputs not yet resolvable. */
+  case object Orphan extends StagedKind
+  /** Parent-before-child: fully valid but lost an admission gate. */
+  case object Held extends StagedKind
+}
+
+/**
+  * A held/orphan entry in [[StagingPool]]. Never broadcast or pooled until it
+  * resolves through `ErgoMemPool`'s orphan/package logic.
+  *
+  * @param utx           the transaction; fully validated (cost known) for Held, as-is for Orphan
+  * @param kind           Orphan or Held
+  * @param priority      eviction/RBF weight - real weight for Held; ignored for Orphan
+  * @param missingInputs hex-encoded box ids not yet resolvable; empty for Held
+  * @param source        peer that delivered the tx (None if submitted via API)
+  * @param stagedTipId   best header id at staging time, for the resolve-time freshness gate
+  * @param seq           monotonic insertion sequence, FIFO eviction tiebreak
   */
 case class StagedTx(utx: UnconfirmedTransaction,
+                    kind: StagedKind,
                     priority: Long,
                     missingInputs: Set[String],
                     source: Option[ConnectedPeer],
+                    stagedTipId: Option[ModifierId],
                     seq: Long,
-                    receivedAt: Long = System.currentTimeMillis()) {
+                    receivedAt: Long = System.currentTimeMillis(),
+                    retryOrder: Long = 0L) {
   def txId: ModifierId = utx.id
   def size: Int = utx.transaction.size
+  def isHeld: Boolean = kind == StagedKind.Held
+  def isOrphan: Boolean = kind == StagedKind.Orphan
+
+  /** Eviction rank, higher = keep longer. Validated Held entries always
+    * outrank unvalidated Orphans (whose claimed fee is unverified), so orphans
+    * are evicted first regardless of claimed fee; ties break on real priority. */
+  def evictionRank: (Int, Long) = ((if (isHeld) 1 else 0), if (isHeld) priority else 0L)
   def inputBoxIds: IndexedSeq[BoxId] = utx.transaction.inputs.map(_.boxId)
+  def outputBoxIds: IndexedSeq[BoxId] = utx.transaction.outputs.map(_.id)
   def dataInputBoxIds: IndexedSeq[BoxId] = utx.transaction.dataInputs.map(_.boxId)
 }
 
@@ -61,13 +92,15 @@ object StageReject {
 }
 
 /**
-  * Bounded immutable holding store for child-before-parent transactions.
-  * Runs no validation and never
+  * Bounded holding store for orphans (child-before-parent) and held txs
+  * (parent-before-child that lost the fee/capacity/double-spend gate).
+  * Immutable. Runs no validation and never
   * gossips - wiring/broadcast decisions live in `ErgoMemPool` /
   * `ErgoNodeViewHolder`.
   */
 class StagingPool private(val byTxId: Map[ModifierId, StagedTx],
                           private val waitingOnInput: Map[String, Seq[ModifierId]],
+                          private val byOutput: Map[String, ModifierId],
                           val totalBytes: Long,
                           private val perPeerCount: Map[String, Int],
                           private val perPeerBytes: Map[String, Long],
@@ -79,6 +112,12 @@ class StagingPool private(val byTxId: Map[ModifierId, StagedTx],
     val address = peer.connectionId.remoteAddress
     Option(address.getAddress).map(_.getHostAddress).getOrElse(address.getHostString)
   }
+
+  /** Rotate unsuccessful retries without resetting FIFO eviction age or TTL. */
+  def markRetried(id: ModifierId): StagingPool = byTxId.get(id).map { entry =>
+    new StagingPool(byTxId.updated(id, entry.copy(retryOrder = seqCounter + 1)), waitingOnInput, byOutput,
+      totalBytes, perPeerCount, perPeerBytes, caps, seqCounter + 1)
+  }.getOrElse(this)
 
   def expire(now: Long, ttlMillis: Long): StagingPool =
     byTxId.values.filter(e => now - e.receivedAt >= ttlMillis)
@@ -94,6 +133,9 @@ class StagingPool private(val byTxId: Map[ModifierId, StagedTx],
   /** Staged tx ids waiting on `boxId` (orphans whose missing input is `boxId`). */
   def waitersOn(boxId: BoxId): Seq[ModifierId] = waitingOnInput.getOrElse(Algos.encode(boxId), Seq.empty)
 
+  /** The staged tx (either kind) that creates `boxId`, if any. */
+  def creatorOf(boxId: BoxId): Option[ModifierId] = byOutput.get(Algos.encode(boxId))
+
   /**
     * Stage an orphan (unresolved inputs). The priority argument is ignored:
     * an unvalidated claimed fee must not buy protection from eviction.
@@ -101,9 +143,29 @@ class StagingPool private(val byTxId: Map[ModifierId, StagedTx],
   def stageOrphan(utx: UnconfirmedTransaction,
                   priority: Long,
                   missingInputs: Set[BoxId],
-                  source: Option[ConnectedPeer]): Either[StageReject, StagingPool] = {
-    val entry = StagedTx(utx, 0L, missingInputs.map(Algos.encode), source, seqCounter)
+                  source: Option[ConnectedPeer],
+                  stagedTipId: Option[ModifierId] = None): Either[StageReject, StagingPool] = {
+    val entry = StagedTx(utx, StagedKind.Orphan, priority, missingInputs.map(Algos.encode), source, stagedTipId, seqCounter)
     insert(entry)
+  }
+
+  /**
+    * Stage a held tx (validated, lost an admission gate). `priority` is the
+    * caller-computed real weight (fee per the configured sorting option).
+    */
+  def stageHeld(utx: UnconfirmedTransaction,
+               priority: Long,
+               source: Option[ConnectedPeer],
+               stagedTipId: Option[ModifierId] = None): Either[StageReject, StagingPool] = {
+    val entry = StagedTx(utx, StagedKind.Held, priority, Set.empty, source, stagedTipId, seqCounter)
+    byTxId.get(utx.id) match {
+      case Some(previous) =>
+        // Refresh cost/tip or promote an orphan without extending retention or changing ownership.
+        val refreshed = entry.copy(seq = previous.seq, receivedAt = previous.receivedAt,
+          source = previous.source, retryOrder = previous.retryOrder)
+        Right(remove(utx.id)._1.commit(refreshed))
+      case None => insert(entry)
+    }
   }
 
   private def insert(entry: StagedTx): Either[StageReject, StagingPool] = {
@@ -148,7 +210,10 @@ class StagingPool private(val byTxId: Map[ModifierId, StagedTx],
     if (!overCount && !overBytes) {
       Right(Seq.empty)
     } else {
-      val ranked = byTxId.values.toList.sortBy(e => (e.priority, e.seq))
+      // Kind-tiered rank: orphans (unvalidated, unverified fee) are evicted
+      // before any validated held entry, so a fake-high-fee orphan can never
+      // push out an honest held tx.
+      val ranked = byTxId.values.toList.sortBy(e => (e.evictionRank, e.seq))
 
       @tailrec
       def loop(remaining: List[StagedTx], victims: Vector[ModifierId], freedCount: Int, freedBytes: Long): Either[StageReject, Seq[ModifierId]] = {
@@ -159,7 +224,7 @@ class StagingPool private(val byTxId: Map[ModifierId, StagedTx],
         } else remaining match {
           case Nil => Left(StageReject.Full)
           case head :: tail =>
-            if (head.priority > entry.priority) {
+            if (rankOrdering.gt(head.evictionRank, entry.evictionRank)) {
               Left(StageReject.Full)
             } else {
               loop(tail, victims :+ head.txId, freedCount + 1, freedBytes + head.size)
@@ -171,9 +236,14 @@ class StagingPool private(val byTxId: Map[ModifierId, StagedTx],
     }
   }
 
+  private val rankOrdering: Ordering[(Int, Long)] = Ordering[(Int, Long)]
+
   private def commit(entry: StagedTx): StagingPool = {
     val newWaiting = entry.missingInputs.foldLeft(waitingOnInput) { (m, box) =>
       m.updated(box, m.getOrElse(box, Seq.empty) :+ entry.txId)
+    }
+    val newByOutput = entry.outputBoxIds.foldLeft(byOutput) { (m, box) =>
+      m.updated(Algos.encode(box), entry.txId)
     }
     val (newPeerCount, newPeerBytes) = entry.source match {
       case Some(p) => (perPeerCount.updated(host(p), peerCount(p) + 1), perPeerBytes.updated(host(p), peerBytes(p) + entry.size))
@@ -182,6 +252,7 @@ class StagingPool private(val byTxId: Map[ModifierId, StagedTx],
     new StagingPool(
       byTxId.updated(entry.txId, entry),
       newWaiting,
+      newByOutput,
       totalBytes + entry.size,
       newPeerCount,
       newPeerBytes,
@@ -203,6 +274,10 @@ class StagingPool private(val byTxId: Map[ModifierId, StagedTx],
             case None => m
           }
         }
+        val newByOutput = entry.outputBoxIds.foldLeft(byOutput) { (m, box) =>
+          val key = Algos.encode(box)
+          if (m.get(key).contains(id)) m - key else m
+        }
         val (newPeerCount, newPeerBytes) = entry.source match {
           case Some(p) =>
             val c = peerCount(p) - 1
@@ -212,7 +287,7 @@ class StagingPool private(val byTxId: Map[ModifierId, StagedTx],
           case None => (perPeerCount, perPeerBytes)
         }
         val newPool = new StagingPool(
-          byTxId - id, newWaiting, math.max(0L, totalBytes - entry.size),
+          byTxId - id, newWaiting, newByOutput, math.max(0L, totalBytes - entry.size),
           newPeerCount, newPeerBytes, caps, seqCounter
         )
         (newPool, Some(entry))
@@ -242,5 +317,5 @@ class StagingPool private(val byTxId: Map[ModifierId, StagedTx],
 
 object StagingPool {
   def empty(caps: StagingCaps): StagingPool =
-    new StagingPool(Map.empty, Map.empty, 0L, Map.empty, Map.empty, caps, 0L)
+    new StagingPool(Map.empty, Map.empty, Map.empty, 0L, Map.empty, Map.empty, caps, 0L)
 }

@@ -61,7 +61,9 @@ case class NodeConfigurationSettings(override val stateType: StateType,
                                      stagingMaxWaitersPerInput: Int = 64,
                                      stagingTtlMillis: Long = 1200000L,
                                      stagingMaxValidationAttempts: Int = 32,
-                                     stagingMaxValidationCost: Long = 2000000L) extends ClientCapabilities {
+                                     stagingMaxValidationCost: Long = 2000000L,
+                                     stagingMaxPackageCost: Long = 10000000L,
+                                     stagingMaxPackageTransactions: Int = 32) extends ClientCapabilities {
   /**
     * Whether the node keeping all the full blocks of the blockchain or not.
     * @return true if the blockchain is pruned, false if not
@@ -115,7 +117,9 @@ trait NodeConfigurationReaders extends StateTypeReaders with CheckpointingSettin
       cfg.as[Option[Int]](s"$path.staging.maxWaitersPerInput").getOrElse(64),
       cfg.as[Option[Long]](s"$path.staging.ttlMillis").getOrElse(1200000L),
       cfg.as[Option[Int]](s"$path.staging.maxValidationAttempts").getOrElse(32),
-      cfg.as[Option[Long]](s"$path.staging.maxValidationCost").getOrElse(2000000L)
+      cfg.as[Option[Long]](s"$path.staging.maxValidationCost").getOrElse(2000000L),
+      cfg.as[Option[Long]](s"$path.staging.maxPackageCost").getOrElse(10000000L),
+      cfg.as[Option[Int]](s"$path.staging.maxPackageTransactions").getOrElse(32)
     )
   }
 

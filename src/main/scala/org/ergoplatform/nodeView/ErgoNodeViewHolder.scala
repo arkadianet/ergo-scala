@@ -267,6 +267,14 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
     }
   }
 
+  private def publishValidationFailure(tx: UnconfirmedTransaction, error: Throwable,
+                                       cost: Option[Int], recheck: Boolean): Unit = {
+    // A transaction validated before a tip change may legitimately cease to be valid.
+    // Account its work, but do not penalize its original sender for a context change.
+    val event = if (recheck) FailedOnRecheckTransaction(tx.id, error) else FailedTransaction(tx, error, cost)
+    context.system.eventStream.publish(event)
+  }
+
   private def publishStagingResult(newPool: ErgoMemPool, outcome: ProcessingOutcome,
                                     trigger: Option[ModifierId] = None): Unit = {
     val admitted = outcome.admitted
@@ -278,7 +286,7 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
     outcome.validationWork.foreach { work =>
       context.system.eventStream.publish(StagingValidationResult(work, admitted.map(_.id).toSet))
       work.filterNot(w => trigger.contains(w.transaction.id)).foreach { entry =>
-        entry.error.foreach(error => context.system.eventStream.publish(FailedTransaction(entry.transaction, error, Some(0))))
+        entry.error.foreach(error => publishValidationFailure(entry.transaction, error, Some(0), entry.recheck))
       }
     }
     admitted.foreach(tx => context.system.eventStream.publish(SuccessfulTransaction(tx, outcome.validationWork.map(_ => 0))))
@@ -302,7 +310,8 @@ abstract class ErgoNodeViewHolder[State <: ErgoState[State]](settings: ErgoSetti
         val e = i.e
         log.debug(s"Transaction $tx invalidated. Cause: ${e.getMessage}")
         updateNodeView(updatedMempool = Some(newPool))
-        context.system.eventStream.publish(FailedTransaction(unconfirmedTx.withCost(i.cost), e, costOverride))
+        val recheck = processingOutcome.validationWork.exists(_.exists(w => w.transaction.id == unconfirmedTx.id && w.recheck))
+        publishValidationFailure(unconfirmedTx.withCost(i.cost), e, costOverride, recheck)
       case dbl: ProcessingOutcome.DoubleSpendingLoser =>
         val winnerTxs = dbl.winnerTxIds
         log.debug(s"Transaction $tx declined, as other transactions $winnerTxs are paying more")

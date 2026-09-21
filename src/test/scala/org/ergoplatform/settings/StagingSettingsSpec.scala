@@ -22,6 +22,8 @@ class StagingSettingsSpec extends AnyFlatSpec with Matchers {
     node.stagingTtlMillis shouldBe 1200000L
     node.stagingMaxValidationAttempts shouldBe 32
     node.stagingMaxValidationCost shouldBe 2000000L
+    node.stagingMaxPackageCost shouldBe 10000000L
+    node.stagingMaxPackageTransactions shouldBe 32
   }
 
   it should "read explicit staging overrides from ergo.node.staging" in {
@@ -35,6 +37,8 @@ class StagingSettingsSpec extends AnyFlatSpec with Matchers {
       ttlMillis = 60000
       maxValidationAttempts = 7
       maxValidationCost = 3000000
+      maxPackageCost = 5000000
+      maxPackageTransactions = 11
     }""")
     node.stagingEnabled shouldBe true
     node.stagingMaxCount shouldBe 17
@@ -45,5 +49,7 @@ class StagingSettingsSpec extends AnyFlatSpec with Matchers {
     node.stagingTtlMillis shouldBe 60000L
     node.stagingMaxValidationAttempts shouldBe 7
     node.stagingMaxValidationCost shouldBe 3000000L
+    node.stagingMaxPackageCost shouldBe 5000000L
+    node.stagingMaxPackageTransactions shouldBe 11
   }
 }

@@ -4,7 +4,7 @@ import org.ergoplatform.modifiers.mempool.UnconfirmedTransaction
 import scala.util.{Failure, Try}
 
 /** Work actually executed, including unsuccessful and subsequently evicted transactions. */
-case class ValidationWork(transaction: UnconfirmedTransaction, cost: Int, error: Option[Throwable])
+case class ValidationWork(transaction: UnconfirmedTransaction, cost: Int, error: Option[Throwable], recheck: Boolean = false)
 
 /** Local to one actor invocation. Reserve a full transaction limit before starting
   * scripts, refund unused cost on success, and conservatively charge the reservation
@@ -17,13 +17,13 @@ private[mempool] final class StagingValidation(maxAttempts: Int, maxCost: Long, 
   def work: Seq[ValidationWork] = records
   def canValidate: Boolean = records.size < maxAttempts && maxCost - spent >= transactionLimit
 
-  def validate(tx: UnconfirmedTransaction)(run: => Try[Int]): Try[Int] = {
+  def validate(tx: UnconfirmedTransaction, recheck: Boolean = false)(run: => Try[Int]): Try[Int] = {
     if (!canValidate) Failure(StagingValidation.Deferred)
     else {
       val result = run
       val cost = result.getOrElse(transactionLimit)
       spent += cost
-      records :+= ValidationWork(tx, cost, result.failed.toOption)
+      records :+= ValidationWork(tx, cost, result.failed.toOption, recheck)
       result
     }
   }
