@@ -1429,6 +1429,26 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
   }
 
 
+  private val pendingInputAnnouncements = {
+    val caps = settings.matrix.pendingAnnouncements
+    new PendingInputAnnouncements(caps.maxEntries, caps.maxBytes, caps.perPeer,
+      2.minutes.toMillis, () => System.currentTimeMillis())
+  }
+
+  private def replayPendingInputAnnouncements(hr: ErgoHistoryReader,
+                                              mp: ErgoMemPoolReader,
+                                              usr: Option[UtxoStateReader]): Unit = {
+    // BlockApplied is published before ChangedState. In particular at an epoch
+    // boundary, replay must wait for the parent's new parameters, not the old ones.
+    usr.flatMap(_.stateContext.lastHeaderOpt).filter { tip =>
+      hr.bestFullBlockIdOpt.contains(tip.id)
+    }.foreach { tip =>
+      pendingInputAnnouncements.take(tip).foreach { case (announcement, peer) =>
+        processInputBlock(announcement, hr, mp, peer, usr)
+      }
+    }
+  }
+
   /**
    * Process an input block received from a peer.
    *
@@ -1548,7 +1568,9 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
         val orderingId = inputBlockInfo.header.parentId
 
-        // todo: save input block?
+        pendingInputAnnouncements.add(inputBlockInfo, remote)
+        // A held (or capacity-dropped) delivery must not time out against its supplier.
+        setReceivedIfRequested(subBlockId, InputBlockTypeId.value, remote)
 
         // todo: make it debug before release
         log.info(s"On processing $subBlockId, downloading its parent and unknown ordering block $orderingId from $remote")
@@ -2230,6 +2252,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
       deliveryTracker.setInvalid(modId, modTypeId).foreach(penalizeMisbehavingPeer)
 
     case ChangedHistory(newHistoryReader: ErgoHistory) =>
+      replayPendingInputAnnouncements(newHistoryReader, mempoolReader, utxoStateReaderOpt)
       context.become(initialized(newHistoryReader, mempoolReader, utxoStateReaderOpt, blockAppliedTxsCache))
 
     case ChangedMempool(newMempoolReader: ErgoMemPool) =>
@@ -2239,6 +2262,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
       activatedScriptVersion = Header.scriptFromBlockVersion(reader.stateContext.blockVersion)
       reader match {
         case utxoStateReader: UtxoStateReader =>
+          replayPendingInputAnnouncements(historyReader, mempoolReader, Some(utxoStateReader))
           context.become(initialized(historyReader, mempoolReader, Some(utxoStateReader), blockAppliedTxsCache))
         case _ =>
       }
@@ -2387,6 +2411,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
       peerManagerEvents orElse
       checkDelivery(hr) orElse {
       case CleanupLocalInputBlockChunks =>
+        pendingInputAnnouncements.expire()
         cleanupLocalInputBlockChunks()
       case a: Any => log.error("Strange input: " + a)
     }
