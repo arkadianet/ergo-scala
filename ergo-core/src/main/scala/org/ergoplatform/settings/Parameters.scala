@@ -88,7 +88,7 @@ class Parameters(val height: Height,
     val table2 = updateParams(table1, epochVotes, votingSettings)
     // insert sub-blocks per block parameter on next epoch after block version v4 (protocol v6) activation
     val table3 = if(table2.getOrElse(BlockVersion, -1) == 4 && !table2.contains(SubblocksPerBlockIncrease) && !activatedUpdate.rulesToDisable.contains(409)) {
-      table2.updated(SubblocksPerBlockIncrease, SubblocksPerBlockDefault)
+      table2.updated(SubblocksPerBlockIncrease, SubblocksPerBlockActivationDefault)
     } else {
       table2
     }
@@ -288,7 +288,11 @@ object Parameters {
   val SubblocksPerBlockIncrease: Byte = 9
   val SubblocksPerBlockDecrease: Byte = (-SubblocksPerBlockIncrease).toByte
 
-  val SubblocksPerBlockDefault: Int = 30
+  // TODO(F3/F10): Maintainer must decide between activation's 30 and genesis's
+  // SubsPerBlockDefault (64), and whether id 9 should be present from genesis.
+  // Issue attachment sketch: preserve both current values pending that decision.
+  val SubblocksPerBlockActivationDefault: Int = 30
+  val SubblocksPerBlockDefault: Int = SubblocksPerBlockActivationDefault
   val SubblocksPerBlockStep: Int = 1
   val SubblocksPerBlockMin: Int = 2
   val SubblocksPerBlockMax: Int = 2048 //0.00001 Erg
