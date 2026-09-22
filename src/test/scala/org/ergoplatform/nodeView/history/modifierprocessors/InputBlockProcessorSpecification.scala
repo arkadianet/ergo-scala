@@ -134,8 +134,16 @@ class InputBlockProcessorSpecification extends ErgoCorePropertyTest with ErgoCom
       val rightChild = f.block(Some(right))
       Seq(leftChild, rightChild, left, right).foreach(h.applyInputBlock)
       h.applyInputBlock(root) shouldBe None
-      h.inputBlocksTree().get.forks.map(_.chain).toSet shouldBe Set(
+      h.inputBlocksTree().get.forks.map(_.chain) shouldBe Seq(
         Seq(root.id, left.id, leftChild.id), Seq(root.id, right.id, rightChild.id))
+      Seq(root, left, leftChild).foreach { ib =>
+        h.applyInputBlockTransactions(ib.id, Seq.empty, f.state)
+      }
+      Seq(right, rightChild).foreach { ib =>
+        h.applyInputBlockTransactions(ib.id, Seq.empty, f.state) shouldBe
+          (Seq.empty -> Seq.empty)
+      }
+      h.bestInputBlocksChain() shouldBe Seq(leftChild.id, left.id, root.id)
       h.disconnectedWaitlist shouldBe empty
     } finally f.close()
   }
@@ -201,6 +209,42 @@ class InputBlockProcessorSpecification extends ErgoCorePropertyTest with ErgoCom
         (Seq(root.id, child.id, grandchild.id) -> Seq.empty)
       h.bestInputBlocksChain() shouldBe Seq(grandchild.id, child.id, root.id)
       h.disconnectedWaitlist shouldBe empty
+    } finally f.close()
+  }
+
+  property("waitlist graph (f): cached longer branch switches with exact rollback suffix") {
+    val f = new WaitlistFixture
+    val h = f.history
+    try {
+      val root = f.block()
+      val oldChild = f.block(Some(root))
+      val oldTip = f.block(Some(oldChild))
+      Seq(root, oldChild, oldTip).foreach { ib =>
+        h.applyInputBlock(ib) shouldBe None
+        h.applyInputBlockTransactions(ib.id, Seq.empty, f.state) shouldBe
+          (Seq(ib.id) -> Seq.empty)
+      }
+      val parent = f.block(Some(root))
+      val child = f.block(Some(parent))
+      val tip = f.block(Some(child))
+      Seq(tip, child).foreach { ib =>
+        h.applyInputBlock(ib) shouldBe ib.prevInputBlockId
+        h.applyInputBlockTransactions(ib.id, Seq.empty, f.state) shouldBe
+          (Seq.empty -> Seq.empty)
+        h.getInputBlockTransactions(ib.id) shouldBe Some(Seq.empty)
+      }
+      h.applyInputBlock(parent) shouldBe None
+      h.inputBlocksTree().get.forks.map(_.chain) shouldBe Seq(
+        Seq(root.id, oldChild.id, oldTip.id), Seq(root.id, parent.id, child.id, tip.id))
+      h.disconnectedWaitlist shouldBe empty
+      h.bestInputBlocksChain() shouldBe Seq(oldTip.id, oldChild.id, root.id)
+      h.applyInputBlockTransactions(parent.id, Seq.empty, f.state) shouldBe
+        (Seq.empty -> Seq.empty)
+      // The cached tip proves the competing branch is deeper and all bodies are ready.
+      val (forward, rollback) = h.applyInputBlockTransactions(tip.id, Seq.empty, f.state)
+      forward shouldBe Seq(parent.id, child.id, tip.id)
+      rollback shouldBe Seq(oldChild.id, oldTip.id)
+      h.bestInputBlocksChain() shouldBe Seq(tip.id, child.id, parent.id, root.id)
     } finally f.close()
   }
 
