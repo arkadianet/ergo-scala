@@ -1,4 +1,6 @@
-package org.ergoplatform.mining
+package org.ergoplatform.mining.llm_generated
+
+import org.ergoplatform.mining.{AutolykosPowScheme, CandidateBlock, CandidateGenerator, ErgoMiningThread, PrivateKey}
 
 import akka.actor.{Actor, ActorRef, ActorSystem, Props}
 import akka.pattern.StatusReply
@@ -180,9 +182,24 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
   }
 
   it should "(f) explicitly reject a submission with no active candidate" in withFixture { f =>
-    f.submit(f.accept(f.first)).isSuccess shouldBe true
-    f.view.expectMsgType[LocallyGeneratedInputBlock]
-    f.submit(solution(0)).isError shouldBe true
+    // Enter the real initialized receive with no active/retained work and no pending
+    // input. This exercises empty-cache completion, not the pending-input guard.
+    val empty = CandidateGenerator.CandidateGeneratorState(
+      None, None, f.history, f.state, ErgoMemPool.empty(f.config), 10.millis, None)
+    val generator = f.system.actorOf(Props(new CandidateGenerator(
+      defaultMinerSecret.publicImage, f.readers, f.view.ref, f.config) {
+      override def preStart(): Unit = ()
+      override def receive: Receive = {
+        val method = classOf[CandidateGenerator].getDeclaredMethods
+          .find(_.getName.endsWith("$$initialized")).get
+        method.setAccessible(true)
+        method.invoke(this, empty).asInstanceOf[Receive]
+      }
+    }))
+    generator.tell(InputSolutionFound(solution(0)), f.replies.ref)
+    f.replies.expectMsgType[StatusReply[Unit]].getError.getMessage shouldBe
+      "No retained candidate matches input solution PoW"
+    f.view.expectNoMessage(200.millis)
   }
 
   it should "(g) reject older work after an ordering parent change with a reason" in withFixture { f =>
@@ -197,8 +214,75 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
     f.candidate(forced = true).candidateBlock.parentOpt.map(_.id) shouldBe Some(block.id)
     val result = f.submit(oldSolution)
     result.isError shouldBe true
-    result.getError.getMessage.toLowerCase should include("parent")
+    result.getError.getMessage shouldBe "Stale input ordering parent"
     f.view.expectNoMessage(200.millis)
+  }
+
+  it should "C1 resume mining after the holder never replies" in withFixture { f =>
+    val miner = ErgoMiningThread(f.config, f.generator, defaultMinerSecret.w)(f.system)
+    val first = f.view.expectMsgType[LocallyGeneratedInputBlock](8.seconds)
+    val second = f.view.expectMsgType[LocallyGeneratedInputBlock](8.seconds)
+    second.sbi.header.timestamp should be > first.sbi.header.timestamp
+    f.system.stop(miner)
+  }
+
+  it should "C1 release the barrier on timeout even without candidate polling" in withFixture { f =>
+    val solved = f.accept(f.first)
+    f.submit(solved).isSuccess shouldBe true
+    f.view.expectMsgType[LocallyGeneratedInputBlock]
+    // Unlike the internal miner test, no GenerateCandidate requests drive retries.
+    f.replies.awaitAssert({
+      f.submit(solution(0)).getError.getMessage shouldBe
+        "No retained candidate matches input solution PoW"
+    }, 8.seconds, 250.millis)
+    f.candidate().candidateBlock.timestamp should be > f.first.candidateBlock.timestamp
+  }
+
+  it should "I3 report invalid solutions separately from PoW mismatches" in withFixture { f =>
+    f.generator.tell(InputSolutionFound(null), f.replies.ref)
+    f.replies.expectMsgType[StatusReply[Unit]].getError.getMessage shouldBe "Invalid mining solution"
+    f.candidate().candidateBlock.timestamp shouldBe f.first.candidateBlock.timestamp
+  }
+
+  it should "C2 complete retained ordering work while input application is pending" in withFixture { f =>
+    val solved = f.accept(f.first)
+    f.submit(solved).isSuccess shouldBe true
+    f.view.expectMsgType[LocallyGeneratedInputBlock]
+    f.generator.tell(OrderingSolutionFound(solved), f.replies.ref)
+    f.replies.expectMsg(StatusReply.success(()))
+    f.view.expectMsgType[LocallyGeneratedOrderingBlock]
+  }
+
+  it should "I1 accept retained ordering work after history advances" in withFixture { f =>
+    val solved = f.accept(f.first)
+    val txs = validTransactionsFromBoxHolder(f.txs._2, new RandomWrapper(Some(92)))._1
+    val block = validFullBlock(Some(f.root), f.state, txs)
+    f.history = applyChain(f.history, Seq(block))
+    f.generator.tell(ChangedHistory(f.history), f.replies.ref)
+    f.generator.tell(OrderingSolutionFound(solved), f.replies.ref)
+    f.replies.expectMsg(StatusReply.success(()))
+    f.view.expectMsgType[LocallyGeneratedOrderingBlock]
+  }
+
+  it should "I2 preserve work on a remote input event without a new best tip" in withFixture { f =>
+    f.generator.tell(NewBestInputBlock(None, local = false), f.replies.ref)
+    f.candidate().candidateBlock.timestamp shouldBe f.first.candidateBlock.timestamp
+  }
+
+  it should "I2 preserve work when the announced input tip is already current" in withFixture { f =>
+    f.submit(f.accept(f.first)).isSuccess shouldBe true
+    val input = f.view.expectMsgType[LocallyGeneratedInputBlock]
+    f.applyInput(input)
+    val current = f.candidate()
+    f.generator.tell(NewBestInputBlock(Some(input.sbi.id), local = false), f.replies.ref)
+    f.candidate().candidateBlock.timestamp shouldBe current.candidateBlock.timestamp
+  }
+
+  it should "I3 distinguish PoW mismatch and pending input replies" in withFixture { f =>
+    f.submit(solution(0)).getError.getMessage shouldBe "No retained candidate matches input solution PoW"
+    f.submit(f.accept(f.first)).isSuccess shouldBe true
+    f.view.expectMsgType[LocallyGeneratedInputBlock]
+    f.submit(solution(0)).getError.getMessage should startWith("Input block pending application")
   }
 
   it should "verify the previous ordering candidate before forwarding it" in withFixture { f =>
