@@ -150,10 +150,17 @@ class CandidateGenerator(
       context.become(initialized(state.copy(mpr = mp)))
     // Published only after input transactions have been applied to history and removed
     // from the pool. Refresh through the same GenerateCandidate path as ordering blocks.
-    case NewBestInputBlock(id, _) =>
-      val pending = state.pendingInput.filterNot(p => id.contains(p))
+    case NewBestInputBlock(Some(id), _) if needNewCandidate(state.cachedCandidate, id) =>
+      val pending = state.pendingInput.filterNot(_ == id)
       context.become(initialized(state.copy(cachedCandidate = None, pendingInput = pending)))
       self ! GenerateCandidate(Seq.empty, reply = false, forced = false, optPk = None)
+    case _: NewBestInputBlock => // no new tip, or active work already uses it
+
+    case PendingInputTimeout(id) if state.pendingInput.contains(id) =>
+      log.warn(s"Input processing timed out: $id; resuming candidate generation")
+      context.become(initialized(state.copy(pendingInput = None)))
+      self ! GenerateCandidate(Seq.empty, reply = false, forced = false)
+    case _: PendingInputTimeout => // obsolete barrier timer
 
     case InputWorkProcessed(id, h, s, m) if state.pendingInput.contains(id) =>
       context.become(initialized(state.copy(
@@ -197,11 +204,22 @@ class CandidateGenerator(
     case SyntacticallyFailedModification(_, modId, error) =>
       onSolvedBlockFailed(state, modId, error)
 
+    case DeferredGenerateCandidate(gen, id, retries) =>
+      if (state.pendingInput.contains(id) &&
+          retries < ergoSettings.nodeSettings.miningPendingInputMaxRetries) {
+        context.system.scheduler.scheduleOnce(state.avgGenTime.max(100.millis), self,
+          DeferredGenerateCandidate(gen, id, retries + 1))(context.dispatcher, sender())
+      } else {
+        if (state.pendingInput.contains(id)) {
+          log.warn(s"Input processing deferral limit reached: $id; resuming candidate generation")
+          context.become(initialized(state.copy(pendingInput = None)))
+        }
+        self.tell(gen, sender())
+      }
+
     case gen: GenerateCandidate if state.pendingInput.nonEmpty =>
-      // Do not offer same-prev siblings while the holder is applying our input block.
-      // Preserve the requester: the internal miner needs fresh work to restart MineCmd.
-      context.system.scheduler.scheduleOnce(state.avgGenTime.max(10.millis), self, gen)(
-        context.dispatcher, sender())
+      context.system.scheduler.scheduleOnce(state.avgGenTime.max(100.millis), self,
+        DeferredGenerateCandidate(gen, state.pendingInput.get, 1))(context.dispatcher, sender())
 
     case gen @ GenerateCandidate(txsToInclude, reply, forced, optPk) =>
       val senderOpt = if (reply) Some(sender()) else None
@@ -256,10 +274,12 @@ class CandidateGenerator(
       }
 
     case _: SolutionFound if state.solvedBlock.nonEmpty =>
+      log.info(s"Ordering block already solved: ${state.solvedBlock.map(_.id)}")
       sender() ! StatusReply.error(s"Block already solved : ${state.solvedBlock.map(_.id)}")
 
-    case _: SolutionFound if state.pendingInput.nonEmpty =>
-      sender() ! StatusReply.error(s"Input block already submitted, awaiting application: ${state.pendingInput}")
+    case _: InputSolutionFound if state.pendingInput.nonEmpty =>
+      log.info(s"Input block pending application: ${state.pendingInput}")
+      sender() ! StatusReply.error(s"Input block pending application: ${state.pendingInput}")
 
     case sf: SolutionFound =>
       // No work id accompanies SolutionFound. Each retained candidate must be completed
@@ -269,15 +289,9 @@ class CandidateGenerator(
         val solution = if (CryptoFacade.isInfinityPoint(preSolution.pk)) {
           new AutolykosSolution(minerPk.value, preSolution.w, preSolution.n, preSolution.d)
         } else preSolution
-        val candidates = state.retainedCandidates.filter { c =>
-          val parent = c.candidateBlock.parentOpt.map(_.id)
-          parent == state.hr.bestFullBlockOpt.map(_.id) &&
-            parent == state.sr.stateContext.lastHeaderOpt.map(_.id)
-        }
-        val noMatch = "No retained candidate matches solution PoW and current ordering parent"
         sf match {
           case _: OrderingSolutionFound =>
-            val completed = candidates.iterator.flatMap { c =>
+            val completed = state.retainedCandidates.iterator.flatMap { c =>
               Try(completeOrderingBlock(c.candidateBlock, solution)).toOption
                 .filter(b => ergoSettings.chainSettings.powScheme.validate(b.header).isSuccess)
                 .map(b => c -> b)
@@ -287,9 +301,14 @@ class CandidateGenerator(
                 sendOrderingToNodeView(block, candidate.candidateBlock.orderingBlockTransactions)
                 context.become(initialized(state.copy(solvedBlock = Some(block))))
                 StatusReply.success(())
-              case None => StatusReply.error(noMatch)
+              case None =>
+                log.warn("No retained candidate matches ordering solution PoW")
+                StatusReply.error("No retained candidate matches ordering solution PoW")
             }
           case _: InputSolutionFound =>
+            val candidates = state.retainedCandidates.filter { c =>
+              c.candidateBlock.parentOpt.map(_.id) == state.hr.bestFullBlockOpt.map(_.id)
+            }
             val completed = completeMatchingInputBlock(
               candidates, solution, ergoSettings.chainSettings.powScheme)
             completed match {
@@ -297,6 +316,7 @@ class CandidateGenerator(
                 // The same nonce may solve fresh work. Deduplicate completed blocks,
                 // not AutolykosSolution, which carries no candidate identity.
                 if (state.hr.getInputBlock(announcement.id).nonEmpty) {
+                  log.info(s"Input block already known: ${announcement.id}")
                   StatusReply.error("Input block already known")
                 } else {
                   sendInputToNodeView(announcement, transactions)
@@ -306,21 +326,37 @@ class CandidateGenerator(
                     InputWorkProcessed(announcement.id, v.history.getReader,
                       v.state, v.pool.getReader)
                   }
+                  val timeout = ergoSettings.nodeSettings.miningPendingInputTimeout
+                    .max(state.avgGenTime * 4)
+                  context.system.scheduler.scheduleOnce(timeout, self,
+                    PendingInputTimeout(announcement.id))(context.dispatcher)
                   context.become(initialized(state.copy(
                     cachedCandidate = None,
                     pendingInput = Some(announcement.id))))
                   StatusReply.success(())
                 }
-              case None => StatusReply.error(noMatch)
+              case None =>
+                val staleMatch = completeMatchingInputBlock(
+                  state.retainedCandidates.filterNot(candidates.contains), solution,
+                  ergoSettings.chainSettings.powScheme).nonEmpty
+                if (staleMatch) {
+                  log.warn("Stale input ordering parent")
+                  StatusReply.error("Stale input ordering parent")
+                } else {
+                  log.warn("No retained candidate matches input solution PoW")
+                  StatusReply.error("No retained candidate matches input solution PoW")
+                }
             }
         }
-      }.getOrElse(StatusReply.error("Invalid mining solution"))
+      }.recover { case ex =>
+        log.warn("Invalid mining solution", ex)
+        StatusReply.error("Invalid mining solution")
+      }.get
       sender() ! result
 
     case _: AutolykosSolution =>
-      sender() ! StatusReply.error(
-        s"Block already solved : ${state.solvedBlock.map(_.id)}"
-      )
+      log.warn("Invalid unwrapped mining solution")
+      sender() ! StatusReply.error("Invalid unwrapped mining solution")
 
   }
 
@@ -365,6 +401,10 @@ object CandidateGenerator extends ScorexLogging {
     forced: Boolean,
     optPk: Option[ProveDlog] = None
   )
+
+  private[mining] case class PendingInputTimeout(id: ModifierId)
+
+  private case class DeferredGenerateCandidate(gen: GenerateCandidate, id: ModifierId, retries: Int)
 
   private[mining] case class InputWorkProcessed(
     id: ModifierId,
@@ -435,6 +475,11 @@ object CandidateGenerator extends ScorexLogging {
     val parentHeaderIdOpt = cache.map(_.candidateBlock).flatMap(_.parentOpt).map(_.id)
     !parentHeaderIdOpt.contains(bestFullBlockHeader.id)
   }
+
+  /** Input-tip events only invalidate work that does not already build on that tip. */
+  def needNewCandidate(cache: Option[Candidate], bestInputId: ModifierId): Boolean =
+    !cache.flatMap(_.candidateBlock.inputBlockFields.prevInputBlockId)
+      .exists(_.sameElements(idToBytes(bestInputId)))
 
   /** Solution is valid only if bestFullBlock on the chain is its parent */
   def needNewSolution(
