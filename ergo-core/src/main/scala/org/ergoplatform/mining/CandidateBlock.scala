@@ -44,7 +44,9 @@ object InputBlockFields {
     // digest (Merkle tree root) of new first-class transactions since last input-block
     val txs = (InputBlockTransactionsDigestKey, transactionsDigest)
 
-    // digest (Merkle tree root) first class transactions since ordering block till last input-block
+    // Despite the prevTransactionsDigest name, the generator currently commits the NEW
+    // input-block transactions digest here too. Announcements must mirror that commitment;
+    // changing it to the accumulated previous-transactions digest is a separate protocol change.
     val prevTxs = (PreviousInputBlockTransactionsDigestKey, prevTransactionsDigest)
 
     ExtensionCandidate(prevInput ++ Seq(txs, prevTxs))

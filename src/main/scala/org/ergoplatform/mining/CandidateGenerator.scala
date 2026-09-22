@@ -746,16 +746,13 @@ object CandidateGenerator extends ScorexLogging {
       // digest (Merkle tree root) of new first-class transactions since last input-block
       val inputBlockTransactionsDigestValue = Algos.merkleTreeRoot(inputBlockTransactions.map(tx => LeafData @@ tx.serializedId))
 
-      // digest (Merkle tree root) first class transactions since ordering block till last input-block
-      val previousInputBlocksTransactionsDigest = Algos.merkleTreeRoot(previousOrderingBlockTransactionIds.map(id => LeafData @@ idToBytes(id)))
-
       val inputBlockExtCandidate = InputBlockFields.toExtensionFields(parentInputBlockIdOpt, inputBlockTransactionsDigestValue, inputBlockTransactionsDigestValue)
 
       val extensionCandidate = preExtensionCandidate ++ inputBlockExtCandidate
 
       val inputBlockFields = extensionCandidate.proofForInputBlockData match {
         case Some(inputBlockFieldsProof) =>
-          new InputBlockFields(parentInputBlockIdOpt, inputBlockTransactionsDigestValue, previousInputBlocksTransactionsDigest, inputBlockFieldsProof)
+          new InputBlockFields(parentInputBlockIdOpt, inputBlockTransactionsDigestValue, inputBlockTransactionsDigestValue, inputBlockFieldsProof)
         case None =>
           throw new IllegalArgumentException("Input block fields proof not available in extension candidate")
       }
@@ -835,7 +832,7 @@ object CandidateGenerator extends ScorexLogging {
                 InputBlockFields.toExtensionFields(parentInputBlockIdOpt, retryInputBlockTxsDigest, retryInputBlockTxsDigest)
               retryExtensionCandidate.proofForInputBlockData match {
                 case Some(retryInputBlockFieldsProof) =>
-                  val retryInputBlockFields = new InputBlockFields(parentInputBlockIdOpt, retryInputBlockTxsDigest, previousInputBlocksTransactionsDigest, retryInputBlockFieldsProof)
+                  val retryInputBlockFields = new InputBlockFields(parentInputBlockIdOpt, retryInputBlockTxsDigest, retryInputBlockTxsDigest, retryInputBlockFieldsProof)
                   Success(mkCandidate(retryTxs, adProof, adDigest, retryEliminate,
                     retryExtensionCandidate, retryInputBlockFields, retryInputBlockTransactions, retryOrderingTxs))
                 case None =>
@@ -852,7 +849,7 @@ object CandidateGenerator extends ScorexLogging {
                     case (adProof, adDigest) =>
                       // Both collections produced failed proofs; their rejections may be stale.
                       mkCandidate(Seq(emissionTx), adProof, adDigest, EliminateTransactions(Seq.empty),
-                        extensionCandidate, InputBlockFields.empty, inputBlockTransactions, Seq(emissionTx))
+                        extensionCandidate, inputBlockFields, inputBlockTransactions, Seq(emissionTx))
                   }
                 case None =>
                   log.error("Failed to produce proofs for transactions and no emission box available: ", ex)

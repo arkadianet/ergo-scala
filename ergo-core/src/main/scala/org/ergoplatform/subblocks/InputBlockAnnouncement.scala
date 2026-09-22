@@ -34,10 +34,14 @@ case class InputBlockAnnouncement(version: Byte,
              expectedNBits: Option[Long]): Boolean = {
     val powValid = powScheme.checkInputBlockPoW(header, parameters)
     val extValid = inputBlockFields.inputBlockFieldsProof.valid(header.extensionRoot)
-    val fieldsBound = InputBlockFields.fieldHashes(inputBlockFields).forall { expectedFieldHash =>
+    val expectedFieldHashes = InputBlockFields.fieldHashes(inputBlockFields)
+    val fieldsBound = expectedFieldHashes.nonEmpty && expectedFieldHashes.forall { expectedFieldHash =>
       inputBlockFields.inputBlockFieldsProof.indices.exists {
         case (_, provenFieldHash) => provenFieldHash.sameElements(expectedFieldHash)
       }
+    } && inputBlockFields.inputBlockFieldsProof.indices.forall {
+      case (_, provenFieldHash) =>
+        expectedFieldHashes.exists(_.sameElements(provenFieldHash))
     }
     val nBitsValid = expectedNBits.forall(header.nBits == _)
 
