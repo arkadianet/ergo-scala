@@ -76,6 +76,134 @@ class InputBlockProcessorSpecification extends ErgoCorePropertyTest with ErgoCom
     new InputBlockFields(None, digest, prevDigest, extCandidate.proofForInputBlockData.get)
   }
 
+  private class WaitlistFixture {
+    val state: UtxoState = UtxoState.fromBoxHolder(
+      BoxHolder(Seq(eb1, eb2)), None, createTempDir(), settings, parameters)
+    val history: org.ergoplatform.nodeView.history.ErgoHistory = generateHistory(
+      verifyTransactions = true, StateType.Utxo, PoPoWBootstrap = false,
+      blocksToKeep = -1, epochLength = 10000, useLastEpochs = 3,
+      initialDiffOpt = None, None)
+    applyChain(history, genChain(2, history, stateOpt = Some(state)))
+    private val header = genChain(1, history, stateOpt = Some(state)).last.header
+    private var serial = 0
+
+    def block(parent: Option[InputBlockAnnouncement] = None,
+              otherTree: Boolean = false): InputBlockAnnouncement = {
+      serial += 1
+      val orderingId = if (otherTree) bytesToId(Algos.hash("other ordering block"))
+      else header.parentId
+      InputBlockAnnouncement(1,
+        header.copy(timestamp = header.timestamp + serial, parentId = orderingId),
+        parent.map(p => parentOnly(idToBytes(p.id))).getOrElse(InputBlockFields.empty),
+        None)
+    }
+
+    def close(): Unit = {
+      history.closeStorage()
+      state.closeStorage()
+    }
+  }
+
+  property("waitlist graph (a): newest-first four descendants attach in one call") {
+    val f = new WaitlistFixture
+    val h = f.history
+    try {
+      val root = f.block()
+      val children = (1 to 4).foldLeft(Vector(root)) { (chain, _) =>
+        chain :+ f.block(Some(chain.last))
+      }.tail
+      children.reverse.foreach { ib =>
+        h.applyInputBlock(ib) shouldBe ib.prevInputBlockId
+      }
+      h.disconnectedWaitlist.toSet shouldBe children.toSet
+      h.applyInputBlock(root) shouldBe None
+      h.inputBlocksTree().get.forks.map(_.chain) shouldBe
+        Seq(root.id +: children.map(_.id))
+      h.disconnectedWaitlist shouldBe empty
+    } finally f.close()
+  }
+
+  property("waitlist graph (b): both siblings and their descendants attach") {
+    val f = new WaitlistFixture
+    val h = f.history
+    try {
+      val root = f.block()
+      val left = f.block(Some(root))
+      val right = f.block(Some(root))
+      val leftChild = f.block(Some(left))
+      val rightChild = f.block(Some(right))
+      Seq(leftChild, rightChild, left, right).foreach(h.applyInputBlock)
+      h.applyInputBlock(root) shouldBe None
+      h.inputBlocksTree().get.forks.map(_.chain).toSet shouldBe Set(
+        Seq(root.id, left.id, leftChild.id), Seq(root.id, right.id, rightChild.id))
+      h.disconnectedWaitlist shouldBe empty
+    } finally f.close()
+  }
+
+  property("waitlist graph (c): an interior parent forks without replacing the selected chain") {
+    val f = new WaitlistFixture
+    val h = f.history
+    try {
+      val root = f.block()
+      val tip = f.block(Some(root))
+      val extension = f.block(Some(tip))
+      val sibling = f.block(Some(root))
+      h.applyInputBlock(root)
+      h.applyInputBlock(tip)
+      h.applyInputBlockTransactions(root.id, Seq.empty, f.state)
+      h.applyInputBlockTransactions(tip.id, Seq.empty, f.state)
+      // Seed the deferred entry directly to exercise an already-interior parent.
+      h.disconnectedWaitlist.add(sibling)
+      h.applyInputBlock(extension) shouldBe None
+      val forks = h.inputBlocksTree().get.forks
+      forks.map(_.chain) shouldBe Seq(
+        Seq(root.id, tip.id, extension.id), Seq(root.id, sibling.id))
+      forks.map(_.processedBlocks.length) shouldBe Seq(2, 1)
+      h.bestInputBlocksChain() shouldBe Seq(tip.id, root.id)
+      h.disconnectedWaitlist shouldBe empty
+    } finally f.close()
+  }
+
+  property("waitlist graph (d): unrelated ordering trees remain untouched") {
+    val f = new WaitlistFixture
+    val h = f.history
+    try {
+      val root = f.block()
+      val child = f.block(Some(root))
+      val otherRoot = f.block(otherTree = true)
+      val otherChild = f.block(Some(otherRoot), otherTree = true)
+      // Even a reference to this root must not cross ordering-tree boundaries.
+      val crossTree = f.block(Some(root), otherTree = true)
+      Seq(child, otherChild, crossTree).foreach(h.applyInputBlock)
+      val otherBefore = h.getLongestChainLength(otherRoot.header.parentId)
+      h.applyInputBlock(root) shouldBe None
+      h.inputBlocksTree().get.forks.map(_.chain) shouldBe Seq(Seq(root.id, child.id))
+      h.getLongestChainLength(otherRoot.header.parentId) shouldBe otherBefore
+      h.disconnectedWaitlist.toSet shouldBe Set(otherChild, crossTree)
+    } finally f.close()
+  }
+
+  property("waitlist graph (e): cached early bodies resume after attachment") {
+    val f = new WaitlistFixture
+    val h = f.history
+    try {
+      val root = f.block()
+      val child = f.block(Some(root))
+      val grandchild = f.block(Some(child))
+      Seq(grandchild, child).foreach { ib =>
+        h.applyInputBlock(ib) shouldBe ib.prevInputBlockId
+        h.applyInputBlockTransactions(ib.id, Seq.empty, f.state) shouldBe
+          (Seq.empty -> Seq.empty)
+        h.getInputBlockTransactions(ib.id) shouldBe Some(Seq.empty)
+      }
+      h.applyInputBlock(root) shouldBe None
+      h.applyInputBlockTransactions(root.id, Seq.empty, f.state) shouldBe
+        (Seq(root.id, child.id, grandchild.id) -> Seq.empty)
+      h.bestInputBlocksChain() shouldBe Seq(grandchild.id, child.id, root.id)
+      h.disconnectedWaitlist shouldBe empty
+    } finally f.close()
+  }
+
   property("apply first input block after ordering block") {
 
     val us = UtxoState.fromBoxHolder(BoxHolder(Seq(eb1, eb2)), None, createTempDir, settings, parameters)
