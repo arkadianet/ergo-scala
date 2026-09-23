@@ -128,7 +128,7 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
     try test(f) finally f.close()
   }
 
-  it should "(a) accept older work with its own parameters after candidate replacement" in withFixture { f =>
+  it should "a late solution for the previous candidate is accepted with that candidate's parameters" in withFixture { f =>
     val oldSolution = f.accept(f.first)
     val previous = f.state.stateContext
     val changed = new UtxoState(f.state.persistentProver, f.state.version, f.state.store, f.config) {
@@ -148,7 +148,7 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
       f.first.candidateBlock.timestamp -> f.first.parameters.subBlocksPerBlock)
   }
 
-  it should "(b) resume the real internal miner with fresh work after input application" in withFixture { f =>
+  it should "the internal miner resumes with fresh work after input application" in withFixture { f =>
     val miner = ErgoMiningThread(f.config, f.generator, defaultMinerSecret.w)(f.system)
     val first = f.view.expectMsgType[LocallyGeneratedInputBlock](8.seconds)
     f.generator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false), f.replies.ref)
@@ -160,20 +160,20 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
     f.system.stop(miner)
   }
 
-  it should "(c) explicitly reject wrapped submissions while an ordering block is pending" in withFixture { f =>
+  it should "an input submission is rejected while an ordering block is pending" in withFixture { f =>
     f.generator.tell(OrderingSolutionFound(f.accept(f.first)), f.replies.ref)
     f.replies.expectMsg(StatusReply.success(()))
     f.view.expectMsgType[LocallyGeneratedOrderingBlock]
     f.submit(solution(0)).isError shouldBe true
   }
 
-  it should "(d) preserve cached work after an invalid input submission" in withFixture { f =>
+  it should "cached work remains usable after an invalid input submission" in withFixture { f =>
     f.submit(solution(0)).isError shouldBe true
     f.candidate().candidateBlock.timestamp shouldBe f.first.candidateBlock.timestamp
     f.submit(f.accept(f.first)).isSuccess shouldBe true
   }
 
-  it should "(e) reply to duplicates without applying the block twice" in withFixture { f =>
+  it should "a duplicate submission is rejected without applying the block twice" in withFixture { f =>
     val solved = f.accept(f.first)
     f.submit(solved).isSuccess shouldBe true
     f.view.expectMsgType[LocallyGeneratedInputBlock]
@@ -181,7 +181,7 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
     f.view.expectNoMessage(200.millis)
   }
 
-  it should "(f) explicitly reject a submission with no active candidate" in withFixture { f =>
+  it should "an input submission with no active or retained candidate reports unmatched work" in withFixture { f =>
     // Enter the real initialized receive with no active/retained work and no pending
     // input. This exercises empty-cache completion, not the pending-input guard.
     val empty = CandidateGenerator.CandidateGeneratorState(
@@ -202,7 +202,7 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
     f.view.expectNoMessage(200.millis)
   }
 
-  it should "(g) reject older work after an ordering parent change with a reason" in withFixture { f =>
+  it should "older input work after an ordering parent change is rejected with a stale parent reason" in withFixture { f =>
     val oldSolution = f.accept(f.first)
     val nextTxs = validTransactionsFromBoxHolder(f.txs._2, new RandomWrapper(Some(92)))._1
     val block = validFullBlock(Some(f.root), f.state, nextTxs)
@@ -218,7 +218,7 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
     f.view.expectNoMessage(200.millis)
   }
 
-  it should "C1 resume mining after the holder never replies" in withFixture { f =>
+  it should "the internal miner resumes when the holder never replies" in withFixture { f =>
     val miner = ErgoMiningThread(f.config, f.generator, defaultMinerSecret.w)(f.system)
     val first = f.view.expectMsgType[LocallyGeneratedInputBlock](8.seconds)
     val second = f.view.expectMsgType[LocallyGeneratedInputBlock](8.seconds)
@@ -226,7 +226,7 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
     f.system.stop(miner)
   }
 
-  it should "C1 release the barrier on timeout even without candidate polling" in withFixture { f =>
+  it should "the input barrier times out without candidate polling and fresh work becomes available" in withFixture { f =>
     val solved = f.accept(f.first)
     f.submit(solved).isSuccess shouldBe true
     f.view.expectMsgType[LocallyGeneratedInputBlock]
@@ -238,13 +238,13 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
     f.candidate().candidateBlock.timestamp should be > f.first.candidateBlock.timestamp
   }
 
-  it should "I3 report invalid solutions separately from PoW mismatches" in withFixture { f =>
+  it should "a null solution reports an invalid solution error and preserves cached work" in withFixture { f =>
     f.generator.tell(InputSolutionFound(null), f.replies.ref)
     f.replies.expectMsgType[StatusReply[Unit]].getError.getMessage shouldBe "Invalid mining solution"
     f.candidate().candidateBlock.timestamp shouldBe f.first.candidateBlock.timestamp
   }
 
-  it should "C2 complete retained ordering work while input application is pending" in withFixture { f =>
+  it should "retained ordering work is completed while input application is pending" in withFixture { f =>
     val solved = f.accept(f.first)
     f.submit(solved).isSuccess shouldBe true
     f.view.expectMsgType[LocallyGeneratedInputBlock]
@@ -253,7 +253,7 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
     f.view.expectMsgType[LocallyGeneratedOrderingBlock]
   }
 
-  it should "I1 accept retained ordering work after history advances" in withFixture { f =>
+  it should "retained ordering work is accepted after history advances" in withFixture { f =>
     val solved = f.accept(f.first)
     val txs = validTransactionsFromBoxHolder(f.txs._2, new RandomWrapper(Some(92)))._1
     val block = validFullBlock(Some(f.root), f.state, txs)
@@ -264,12 +264,12 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
     f.view.expectMsgType[LocallyGeneratedOrderingBlock]
   }
 
-  it should "I2 preserve work on a remote input event without a new best tip" in withFixture { f =>
+  it should "cached work is preserved when a remote input event has no new best tip" in withFixture { f =>
     f.generator.tell(NewBestInputBlock(None, local = false), f.replies.ref)
     f.candidate().candidateBlock.timestamp shouldBe f.first.candidateBlock.timestamp
   }
 
-  it should "I2 preserve work when the announced input tip is already current" in withFixture { f =>
+  it should "cached work is preserved when the announced input tip is already current" in withFixture { f =>
     f.submit(f.accept(f.first)).isSuccess shouldBe true
     val input = f.view.expectMsgType[LocallyGeneratedInputBlock]
     f.applyInput(input)
@@ -278,21 +278,21 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
     f.candidate().candidateBlock.timestamp shouldBe current.candidateBlock.timestamp
   }
 
-  it should "I3 distinguish PoW mismatch and pending input replies" in withFixture { f =>
+  it should "input submissions report distinct errors for unmatched work and pending application" in withFixture { f =>
     f.submit(solution(0)).getError.getMessage shouldBe "No retained candidate matches input solution PoW"
     f.submit(f.accept(f.first)).isSuccess shouldBe true
     f.view.expectMsgType[LocallyGeneratedInputBlock]
     f.submit(solution(0)).getError.getMessage should startWith("Input block pending application")
   }
 
-  it should "verify the previous ordering candidate before forwarding it" in withFixture { f =>
+  it should "an invalid ordering solution after candidate replacement is rejected without forwarding" in withFixture { f =>
     f.next()
     f.generator.tell(OrderingSolutionFound(solution(0)), f.replies.ref)
     f.replies.expectMsgType[StatusReply[Unit]].isError shouldBe true
     f.view.expectNoMessage(200.millis)
   }
 
-  it should "retain three candidates by default" in withFixture { f =>
+  it should "the oldest candidate remains usable after two replacements with the default cache size" in withFixture { f =>
     val solved = f.accept(f.first)
     val second = f.next()
     f.awaitCond(System.currentTimeMillis() > second.candidateBlock.timestamp)
@@ -300,7 +300,7 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
     f.submit(solved).isSuccess shouldBe true
   }
 
-  it should "bound retention at the configured size and keep active work after eviction" in {
+  it should "a full candidate cache evicts older work and keeps active work usable" in {
     val f = new Fixture(cacheSize = 1)
     try {
       val oldSolution = f.accept(f.first)
@@ -311,7 +311,7 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
     } finally f.close()
   }
 
-  it should "refresh after holder processing even when no best-input event is emitted" in withFixture { f =>
+  it should "work is refreshed after holder processing without a best input event" in withFixture { f =>
     import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.GetDataFromCurrentView
     import org.ergoplatform.nodeView.ErgoNodeViewHolder.CurrentView
     f.view.ignoreNoMsg()
@@ -326,7 +326,7 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
     f.submit(f.accept(next)).isSuccess shouldBe true
   }
 
-  it should "reject duplicates after application and active work refresh" in withFixture { f =>
+  it should "a duplicate after input application is rejected while refreshed work is preserved" in withFixture { f =>
     val solved = f.accept(f.first)
     f.submit(solved).isSuccess shouldBe true
     f.applyInput(f.view.expectMsgType[LocallyGeneratedInputBlock])
@@ -337,7 +337,7 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
     f.candidate().candidateBlock.timestamp shouldBe next.candidateBlock.timestamp
   }
 
-  it should "match retained work using real input PoW and source parameters" in withFixture { f =>
+  it should "a real input PoW solution matches retained work using its source parameters" in withFixture { f =>
     val realPow = settings.chainSettings.powScheme
     val older = f.first.copy(candidateBlock = f.first.candidateBlock.copy(
       nBits = org.ergoplatform.mining.difficulty.DifficultySerializer.encodeCompactBits(BigInt(128))),
@@ -359,7 +359,7 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
   }
 
 
-  it should "allow the same nonce on fresh work without applying the previous block twice" in withFixture { f =>
+  it should "a nonce reused on fresh work produces a distinct input block after the previous one is applied" in withFixture { f =>
     // Low-difficulty miners often solve successive candidates with nonce zero. Without a
     // work id, duplicate detection must use the completed header, not the raw solution.
     f.pow.acceptEveryNonce = true
