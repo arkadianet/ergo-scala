@@ -238,6 +238,48 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
     f.candidate().candidateBlock.timestamp should be > f.first.candidateBlock.timestamp
   }
 
+  it should "bound candidate deferrals across pending input turnover by the total request budget" in withFixture { f =>
+    case class SetPending(id: scorex.util.ModifierId)
+    case class FireDeferred(message: Any)
+    val deferred = TestProbe()(f.system)
+    val config = f.config.copy(nodeSettings = f.config.nodeSettings.copy(
+      miningPendingInputMaxRetries = 2))
+    val firstId = f.root.id
+    val secondId = scorex.util.bytesToId(Array.fill[Byte](32)(2))
+    val thirdId = scorex.util.bytesToId(Array.fill[Byte](32)(3))
+    val initial = CandidateGenerator.CandidateGeneratorState(
+      Some(f.first), None, f.history, f.state, ErgoMemPool.empty(config),
+      10.millis, None, pendingInput = Some(firstId))
+    val generator = f.system.actorOf(Props(new CandidateGenerator(
+      defaultMinerSecret.publicImage, f.readers, f.view.ref, config) {
+      private def behavior(id: scorex.util.ModifierId): Receive = {
+        val method = classOf[CandidateGenerator].getDeclaredMethods
+          .find(_.getName.endsWith("$$initialized")).get
+        method.setAccessible(true)
+        method.invoke(this, initial.copy(pendingInput = Some(id))).asInstanceOf[Receive]
+      }
+      override def preStart(): Unit = ()
+      override def receive: Receive = behavior(firstId)
+      override def aroundReceive(receive: Receive, message: Any): Unit = message match {
+        case SetPending(id) => context.become(behavior(id))
+        case FireDeferred(value) => super.aroundReceive(receive, value)
+        case value: Product if value.productPrefix == "DeferredGenerateCandidate" =>
+          deferred.ref ! value
+        case _ => super.aroundReceive(receive, message)
+      }
+    }))
+    generator.tell(GenerateCandidate(Seq.empty, reply = true, forced = false), f.replies.ref)
+    val firstRetry = deferred.expectMsgType[Product]
+    generator.tell(SetPending(secondId), f.replies.ref)
+    generator.tell(FireDeferred(firstRetry), f.replies.ref)
+    val secondRetry = deferred.expectMsgType[Product]
+    secondRetry.productElement(2) shouldBe 2
+    generator.tell(SetPending(thirdId), f.replies.ref)
+    generator.tell(FireDeferred(secondRetry), f.replies.ref)
+    f.replies.expectMsgType[StatusReply[Candidate]].getValue shouldBe f.first
+    deferred.expectNoMessage(200.millis)
+  }
+
   it should "a null solution reports an invalid solution error and preserves cached work" in withFixture { f =>
     f.generator.tell(InputSolutionFound(null), f.replies.ref)
     f.replies.expectMsgType[StatusReply[Unit]].getError.getMessage shouldBe "Invalid mining solution"
