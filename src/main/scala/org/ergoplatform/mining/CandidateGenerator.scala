@@ -204,17 +204,19 @@ class CandidateGenerator(
     case SyntacticallyFailedModification(_, modId, error) =>
       onSolvedBlockFailed(state, modId, error)
 
-    case DeferredGenerateCandidate(gen, id, retries) =>
-      if (state.pendingInput.contains(id) &&
+    case DeferredGenerateCandidate(gen, _, retries) =>
+      if (state.pendingInput.nonEmpty &&
           retries < ergoSettings.nodeSettings.miningPendingInputMaxRetries) {
         context.system.scheduler.scheduleOnce(state.avgGenTime.max(100.millis), self,
-          DeferredGenerateCandidate(gen, id, retries + 1))(context.dispatcher, sender())
+          DeferredGenerateCandidate(gen, state.pendingInput.get, retries + 1))(context.dispatcher, sender())
       } else {
-        if (state.pendingInput.contains(id)) {
-          log.warn(s"Input processing deferral limit reached: $id; resuming candidate generation")
-          context.become(initialized(state.copy(pendingInput = None)))
+        if (state.pendingInput.nonEmpty) {
+          log.warn(s"Input processing deferral limit reached: ${state.pendingInput.get}; resuming candidate generation")
         }
-        self.tell(gen, sender())
+        val resumed = state.copy(pendingInput = None)
+        context.become(initialized(resumed))
+        // Generate in this receive so another pending input cannot restart this request's budget.
+        initialized(resumed)(gen)
       }
 
     case gen: GenerateCandidate if state.pendingInput.nonEmpty =>
