@@ -28,13 +28,10 @@ import org.ergoplatform.wallet.utils.FileUtils
 import scorex.crypto.authds.{ADKey, SerializedAdProof}
 import scorex.util.{ModifierId, bytesToId, idToBytes}
 import org.ergoplatform.settings.Constants.{FalseTree, TrueTree}
-import org.ergoplatform.mining.InputBlockFields
 import org.ergoplatform.network.message.inputblocks.{InputBlockTransactionsData, OrderingBlockAnnouncement}
-import org.ergoplatform.subblocks.InputBlockAnnouncement
+import org.ergoplatform.utils.InputBlockTestHelpers.provedAnnouncement
 import scorex.core.network.ConnectedPeer
 import akka.testkit.TestProbe
-import scorex.crypto.hash.Digest32
-import scorex.crypto.authds.merkle.BatchMerkleProof
 
 class ErgoNodeViewHolderSpec extends ErgoCorePropertyTest with NodeViewTestOps with FileUtils {
   import org.ergoplatform.utils.ErgoNodeTestConstants._
@@ -61,7 +58,6 @@ class ErgoNodeViewHolderSpec extends ErgoCorePropertyTest with NodeViewTestOps w
     val validProgress = ChainProgress(block, 2, 3, acceptableDelay)
     ErgoNodeViewHolder.checkChainIsHealthy(validProgress, history, initSettings) shouldBe ChainIsHealthy
   }
-
 
   private val t1 = TestCase("check genesis state") { fixture =>
     import fixture._
@@ -466,7 +462,6 @@ class ErgoNodeViewHolderSpec extends ErgoCorePropertyTest with NodeViewTestOps w
     val (us, bh) = createUtxoState(fixture.settings)
     val wusGenesis = WrappedUtxoState(us, bh, fixture.settings)
 
-
     val chain1block1 = validFullBlock(parentOpt = None, us, bh)
     val expectedBestFullBlockOpt = if (verifyTransactions) Some(chain1block1) else None
     applyBlock(chain1block1) shouldBe 'success
@@ -542,11 +537,6 @@ class ErgoNodeViewHolderSpec extends ErgoCorePropertyTest with NodeViewTestOps w
     }
   }
 
-  /**
-    * Helper to create empty InputBlockFields (first input block after ordering block)
-    */
-  private def emptyInputBlockFields: InputBlockFields = InputBlockFields.empty
-
   private val t20 = TestCase("process input block from remote peer") { fixture =>
     import fixture._
     if (stateType == Utxo && verifyTransactions) {
@@ -557,7 +547,7 @@ class ErgoNodeViewHolderSpec extends ErgoCorePropertyTest with NodeViewTestOps w
       // Create a header for input block
       val (_, bh2) = createUtxoState(fixture.settings)
       val nextBlock = validFullBlock(Some(genesis), WrappedUtxoState(us, bh2, fixture.settings))
-      val inputBlock = InputBlockAnnouncement(1, nextBlock.header, emptyInputBlockFields, None)
+      val inputBlock = provedAnnouncement(nextBlock.header, Seq.empty)
 
       // Create a dummy peer for the message
       val dummyPeer = ConnectedPeer(
@@ -599,7 +589,7 @@ class ErgoNodeViewHolderSpec extends ErgoCorePropertyTest with NodeViewTestOps w
       // Create input block with the transaction
       val (_, bh2) = createUtxoState(fixture.settings)
       val nextBlock = validFullBlock(Some(genesis), WrappedUtxoState(us, bh2, fixture.settings))
-      val inputBlock = InputBlockAnnouncement(1, nextBlock.header, emptyInputBlockFields, None)
+      val inputBlock = provedAnnouncement(nextBlock.header, Seq.empty)
 
       val dummyPeer = ConnectedPeer(
         scorex.core.network.ConnectionId(
@@ -747,7 +737,7 @@ class ErgoNodeViewHolderSpec extends ErgoCorePropertyTest with NodeViewTestOps w
 
       val (_, bh2) = createUtxoState(fixture.settings)
       val nextBlock = validFullBlock(Some(genesis), WrappedUtxoState(us, bh2, fixture.settings))
-      val inputBlock = InputBlockAnnouncement(1, nextBlock.header, emptyInputBlockFields, None)
+      val inputBlock = provedAnnouncement(nextBlock.header, Seq.empty)
 
       subscribeEvents(classOf[NewBestInputBlock])
 
@@ -762,17 +752,6 @@ class ErgoNodeViewHolderSpec extends ErgoCorePropertyTest with NodeViewTestOps w
     }
   }
 
-  /**
-    * Helper to create InputBlockFields with only parent reference
-    */
-  private def parentOnlyFields(parentId: Array[Byte]): InputBlockFields = {
-    new InputBlockFields(
-      Some(parentId),
-      Digest32 @@ Array.fill(32)(0.toByte),
-      Digest32 @@ Array.fill(32)(0.toByte),
-      BatchMerkleProof(Seq.empty, Seq.empty)(Algos.hash))
-  }
-
   private val t26 = TestCase("input block with missing parent triggers download") { fixture =>
     import fixture._
     if (stateType == Utxo && verifyTransactions) {
@@ -784,7 +763,7 @@ class ErgoNodeViewHolderSpec extends ErgoCorePropertyTest with NodeViewTestOps w
       val (_, bh2) = createUtxoState(fixture.settings)
       val nextBlock = validFullBlock(Some(genesis), WrappedUtxoState(us, bh2, fixture.settings))
       val fakeParentId = bytesToId(Array.fill(32)(0x42.toByte))
-      val inputBlock = InputBlockAnnouncement(1, nextBlock.header, parentOnlyFields(idToBytes(fakeParentId)), None)
+      val inputBlock = provedAnnouncement(nextBlock.header, Seq.empty, Some(idToBytes(fakeParentId)))
 
       val dummyPeer = ConnectedPeer(
         scorex.core.network.ConnectionId(
@@ -826,7 +805,7 @@ class ErgoNodeViewHolderSpec extends ErgoCorePropertyTest with NodeViewTestOps w
       val (_, bh2) = createUtxoState(fixture.settings)
       val nextBlock = validFullBlock(Some(genesis), WrappedUtxoState(us, bh2, fixture.settings))
       val highHeader = nextBlock.header.copy(height = 100)
-      val inputBlock = InputBlockAnnouncement(1, highHeader, emptyInputBlockFields, None)
+      val inputBlock = provedAnnouncement(highHeader, Seq.empty)
 
       val dummyPeer = ConnectedPeer(
         scorex.core.network.ConnectionId(
@@ -856,7 +835,7 @@ class ErgoNodeViewHolderSpec extends ErgoCorePropertyTest with NodeViewTestOps w
 
       val (_, bh2) = createUtxoState(fixture.settings)
       val nextBlock = validFullBlock(Some(genesis), WrappedUtxoState(us, bh2, fixture.settings))
-      val inputBlock = InputBlockAnnouncement(1, nextBlock.header, emptyInputBlockFields, None)
+      val inputBlock = provedAnnouncement(nextBlock.header, Seq.empty)
 
       // Apply the input block first
       val dummyPeer = ConnectedPeer(
@@ -894,12 +873,12 @@ class ErgoNodeViewHolderSpec extends ErgoCorePropertyTest with NodeViewTestOps w
       // Create first input block (ib1)
       val (_, bh2) = createUtxoState(fixture.settings)
       val block1 = validFullBlock(Some(genesis), WrappedUtxoState(us, bh2, fixture.settings))
-      val ib1 = InputBlockAnnouncement(1, block1.header, emptyInputBlockFields, None)
+      val ib1 = provedAnnouncement(block1.header, Seq.empty)
 
       // Create second input block (ib2) on top of ib1
       val (_, bh3) = createUtxoState(fixture.settings)
       val block2 = validFullBlock(Some(block1), WrappedUtxoState(us, bh3, fixture.settings))
-      val ib2 = InputBlockAnnouncement(1, block2.header, parentOnlyFields(idToBytes(ib1.id)), None)
+      val ib2 = provedAnnouncement(block2.header, Seq.empty, Some(idToBytes(ib1.id)))
 
       val dummyPeer = ConnectedPeer(
         scorex.core.network.ConnectionId(
@@ -940,7 +919,7 @@ class ErgoNodeViewHolderSpec extends ErgoCorePropertyTest with NodeViewTestOps w
 
       val (_, bh2) = createUtxoState(fixture.settings)
       val nextBlock = validFullBlock(Some(genesis), WrappedUtxoState(us, bh2, fixture.settings))
-      val inputBlock = InputBlockAnnouncement(1, nextBlock.header, emptyInputBlockFields, None)
+      val inputBlock = provedAnnouncement(nextBlock.header, Seq.empty)
 
       val dummyPeer = ConnectedPeer(
         scorex.core.network.ConnectionId(
@@ -1133,7 +1112,7 @@ class ErgoNodeViewHolderSpec extends ErgoCorePropertyTest with NodeViewTestOps w
       val (_, bh2) = createUtxoState(fixture.settings)
       val nextBlock = validFullBlock(Some(genesis), WrappedUtxoState(us, bh2, fixture.settings))
       val fakeParentId = bytesToId(Array.fill(32)(0x42.toByte))
-      val inputBlock = InputBlockAnnouncement(1, nextBlock.header, parentOnlyFields(idToBytes(fakeParentId)), None)
+      val inputBlock = provedAnnouncement(nextBlock.header, Seq.empty, Some(idToBytes(fakeParentId)))
 
       // Send locally generated input block - should log error about missing parent
       val txData = InputBlockTransactionsData(inputBlock.id, Seq.empty)
@@ -1291,7 +1270,7 @@ class ErgoNodeViewHolderSpec extends ErgoCorePropertyTest with NodeViewTestOps w
 
       val (_, bh2) = createUtxoState(fixture.settings)
       val nextBlock = validFullBlock(Some(genesis), WrappedUtxoState(us, bh2, fixture.settings))
-      val inputBlock = InputBlockAnnouncement(1, nextBlock.header, emptyInputBlockFields, None)
+      val inputBlock = provedAnnouncement(nextBlock.header, Seq.empty)
 
       val dummyPeer = ConnectedPeer(
         scorex.core.network.ConnectionId(
@@ -1339,7 +1318,7 @@ class ErgoNodeViewHolderSpec extends ErgoCorePropertyTest with NodeViewTestOps w
 
       val (_, bh2) = createUtxoState(fixture.settings)
       val block1 = validFullBlock(Some(genesis), WrappedUtxoState(us, bh2, fixture.settings))
-      val ib1 = InputBlockAnnouncement(1, block1.header, emptyInputBlockFields, None)
+      val ib1 = provedAnnouncement(block1.header, Seq(tx1.transaction))
 
       val dummyPeer = ConnectedPeer(
         scorex.core.network.ConnectionId(
@@ -1367,7 +1346,7 @@ class ErgoNodeViewHolderSpec extends ErgoCorePropertyTest with NodeViewTestOps w
 
       // Create competing input block (ib1b) that starts a different fork (same parent as ib1)
       val block1b = validFullBlock(Some(genesis), WrappedUtxoState(us, bh2, fixture.settings))
-      val ib1b = InputBlockAnnouncement(1, block1b.header, emptyInputBlockFields, None)
+      val ib1b = provedAnnouncement(block1b.header, Seq.empty)
 
       // Apply competing chain ib1b (single block, same length as original chain; fork switch by depth not needed)
       nodeViewHolderRef ! ProcessInputBlock(ib1b, dummyPeer)
