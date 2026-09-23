@@ -378,21 +378,33 @@ trait InputBlocksProcessor extends ScorexLogging {
        * @return Updated sequence of chains with any newly connected blocks
        */
       def applyDisconnected(acc: Seq[InputBlocksChain]): Seq[InputBlocksChain] = {
-        disconnectedWaitlist.foldLeft(acc) {
-          case (a, ib) =>
-            // Find the index of the chain whose tip matches the parent of the disconnected block
-            val idx = acc.indexWhere(_.chain.lastOption == ib.prevInputBlockId)
+        // Snapshot in insertion order before consuming entries, preserving sibling arrival
+        // order in the queue. At a chain tip, the first sibling extends it in place.
+        val waiting = disconnectedWaitlist.iterator
+          .filter(ib => extractOrderingId(ib) == extractOrderingId(ibi)).toVector
+        val byParent = waiting.groupBy(_.prevInputBlockId)
+        val attached = mutable.Set.empty[ModifierId]
+        acc.foreach(c => attached ++= c.chain)
+        val ready = mutable.Queue.empty[InputBlockAnnouncement]
+        ready ++= waiting.filter(_.prevInputBlockId.exists(attached.contains))
+        var chains = acc
 
-            if (idx > -1) {
-              // Found a chain to attach to, create fork if needed
-              val c         = a(idx)
-              val newChains = c.fork(ib)  // May create a fork if ib references an earlier block in the chain
-              a.updated(idx, newChains.head) ++ newChains.tail  // Update the chain with new forks
-            } else {
-              // No matching parent found, leave the chain unchanged
-              a
-            }
+        while (ready.nonEmpty) {
+          val ib = ready.dequeue()
+          if (!attached.contains(ib.id)) {
+            // Search the evolving chains, including interior parents. Keep the first
+            // matching fork in place, as in normal insertion, and append new forks.
+            val idx = chains.indexWhere(c => ib.prevInputBlockId.exists(c.chain.contains))
+            require(idx >= 0, s"Waitlisted input block ${ib.id} has no attached parent")
+            val newChains = chains(idx).fork(ib)
+            chains = chains.updated(idx, newChains.head) ++ newChains.tail
+            attached += ib.id
+            // Every newly reachable parent wakes its children, on every branch.
+            ready ++= byParent.getOrElse(Some(ib.id), Vector.empty)
+          }
+          disconnectedWaitlist.remove(ib)
         }
+        chains
       }
 
       val prevId = ibi.prevInputBlockId
@@ -700,7 +712,7 @@ trait InputBlocksProcessor extends ScorexLogging {
   /**
     * Temporary cache of children which do not have parents downloaded yet
     */
-  private[modifierprocessors] val disconnectedWaitlist = mutable.Set[InputBlockAnnouncement]()
+  private[modifierprocessors] val disconnectedWaitlist = mutable.LinkedHashSet[InputBlockAnnouncement]()
 
   private def bestOrderingBlock(): Option[Header] = historyReader.bestFullBlockOpt.map(_.header)
 
