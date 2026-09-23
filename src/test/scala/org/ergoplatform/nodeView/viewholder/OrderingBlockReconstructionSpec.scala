@@ -4,6 +4,7 @@ import akka.testkit.TestProbe
 import org.ergoplatform.mining.{CandidateGenerator, InputBlockFields}
 import org.ergoplatform.modifiers.ErgoFullBlock
 import org.ergoplatform.modifiers.history.BlockTransactions
+import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.ProcessOrderingBlock
 import org.ergoplatform.network.message.inputblocks.OrderingBlockAnnouncement
@@ -11,7 +12,7 @@ import org.ergoplatform.nodeView.ErgoNodeViewHolder.DownloadRequest
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.GetDataFromCurrentView
 import org.ergoplatform.nodeView.mempool.ErgoMemPool
 import org.ergoplatform.nodeView.state.{BoxHolder, ErgoState, StateType}
-import org.ergoplatform.settings.Constants
+import org.ergoplatform.settings.{Algos, Constants}
 import org.ergoplatform.subblocks.InputBlockAnnouncement
 import org.ergoplatform.utils.{
   ErgoCorePropertyTest, HistoryTestHelpers, NodeViewTestConfig, NodeViewTestOps, RandomWrapper
@@ -22,6 +23,7 @@ import org.ergoplatform.utils.generators.ValidBlocksGenerators.{
   createUtxoState, validFullBlock, validTransactionsFromBoxHolder
 }
 import org.ergoplatform.{ErgoBoxCandidate, Input, OrderingBlockFound}
+import scorex.crypto.authds.LeafData
 
 import scala.concurrent.Await
 import scala.concurrent.duration.{DurationInt, FiniteDuration}
@@ -32,6 +34,18 @@ class OrderingBlockReconstructionSpec extends ErgoCorePropertyTest with NodeView
   }
 
   private val timeout: FiniteDuration = 5.seconds
+
+  private def provedAnnouncement(header: Header,
+                                 transactions: Seq[ErgoTransaction],
+                                 prevInputBlockId: Option[Array[Byte]] = None): InputBlockAnnouncement = {
+    val digest = Algos.merkleTreeRoot(transactions.map(tx => LeafData @@ tx.serializedId))
+    val extension = InputBlockFields.toExtensionFields(prevInputBlockId, digest, digest)
+    val fields = new InputBlockFields(
+      prevInputBlockId, digest, digest, extension.proofForInputBlockData.get)
+    InputBlockAnnouncement(
+      InputBlockAnnouncement.initialMessageVersion,
+      header.copy(extensionRoot = extension.digest), fields, None)
+  }
 
   Seq(
     (false, false, "reconstruct the parent's input chain before ordering transactions without downloading"),
@@ -74,7 +88,7 @@ class OrderingBlockReconstructionSpec extends ErgoCorePropertyTest with NodeView
 
         // Use the same real input-tree fixture as CandidateRetryReorgSpec.
         val inputHeader = genHeaderChain(1, minerHistory, diffBitsOpt = None, useRealTs = false).last
-        val inputBlock = InputBlockAnnouncement(1, inputHeader, InputBlockFields.empty, None)
+        val inputBlock = provedAnnouncement(inputHeader, Seq(inputTx))
         minerHistory.applyInputBlock(inputBlock) shouldBe None
         minerHistory.applyInputBlockTransactions(inputBlock.id, Seq(inputTx), state)._1 should
           contain(inputBlock.id)
@@ -117,12 +131,9 @@ class OrderingBlockReconstructionSpec extends ErgoCorePropertyTest with NodeView
             IndexedSeq(new ErgoBoxCandidate(extraInput.value, Constants.TrueTree,
               parent.height, extraInput.additionalTokens)))
           extraTx.statelessValidity().get
-          val fields = InputBlockFields.empty
-          val extraFields = new InputBlockFields(
-            Some(inputHeader.serializedId), fields.transactionsDigest,
-            fields.prevTransactionsDigest, fields.inputBlockFieldsProof)
           val extraHeader = inputHeader.copy(timestamp = inputHeader.timestamp + 1)
-          val extraBlock = InputBlockAnnouncement(1, extraHeader, extraFields, None)
+          val extraBlock = provedAnnouncement(
+            extraHeader, Seq(extraTx), Some(inputBlock.header.serializedId))
           extraHeader.parentId shouldBe parent.id
           extraBlock.prevInputBlockId shouldBe Some(inputBlock.id)
           followerHistory.applyInputBlock(extraBlock) shouldBe None
