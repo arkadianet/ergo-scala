@@ -92,10 +92,10 @@ class InputBlockProcessorSpecification extends ErgoCorePropertyTest with ErgoCom
       serial += 1
       val orderingId = if (otherTree) bytesToId(Algos.hash("other ordering block"))
       else header.parentId
-      InputBlockAnnouncement(1,
+      WaitlistFixtureSupport.provedAnnouncement(
         header.copy(timestamp = header.timestamp + serial, parentId = orderingId),
-        parent.map(p => parentOnly(idToBytes(p.id))).getOrElse(InputBlockFields.empty),
-        None)
+        Seq.empty,
+        parent.map(p => idToBytes(p.id)))
     }
 
     def close(): Unit = {
