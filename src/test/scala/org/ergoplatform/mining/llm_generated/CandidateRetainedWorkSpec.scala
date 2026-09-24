@@ -295,6 +295,49 @@ class CandidateRetainedWorkSpec extends AnyFlatSpec with Matchers {
     f.view.expectMsgType[LocallyGeneratedOrderingBlock]
   }
 
+  Seq(false, true).foreach { competing =>
+    val appliedWork = if (competing) "a competing ordering block" else "the solved ordering block"
+    it should s"resume mining after $appliedWork applies behind an input barrier" in withFixture { f =>
+      f.accept(f.first)
+      // This block becomes a parent: zero distance would imply an unbounded
+      // interlink level for the fixture's version-one header.
+      val solved = new AutolykosSolution(
+        defaultMinerSecret.publicImage.value, defaultMinerSecret.publicImage.value,
+        Longs.toByteArray(f.first.candidateBlock.timestamp), org.ergoplatform.mining.q / 2)
+      f.submit(solved).isSuccess shouldBe true
+      val input = f.view.expectMsgType[LocallyGeneratedInputBlock]
+      f.generator.tell(OrderingSolutionFound(solved), f.replies.ref)
+      f.replies.expectMsg(StatusReply.success(()))
+      val ordering = f.view.expectMsgType[LocallyGeneratedOrderingBlock].efb
+
+      f.applyInput(input)
+      // Wait until the applied input event has cleared the barrier and refreshed work.
+      f.candidate().candidateBlock.inputBlockFields.prevInputBlockId.map(_.toSeq) shouldBe
+        Some(scorex.util.idToBytes(input.sbi.id).toSeq)
+      f.generator.tell(OrderingSolutionFound(solved), f.replies.ref)
+      f.replies.expectMsgType[StatusReply[Unit]].getError.getMessage should
+        startWith("Block already solved")
+
+      val applied = if (competing) {
+        val txs = validTransactionsFromBoxHolder(f.txs._2, new RandomWrapper(Some(92)))._1
+        validFullBlock(Some(f.root), f.state, txs)
+      } else ordering
+      applied.height shouldBe ordering.height
+      if (competing) applied.id should not be ordering.id
+      f.state = f.state.applyModifier(applied, None)(_ => ()).get
+      f.history = applyChain(f.history, Seq(applied))
+      f.generator.tell(ChangedHistory(f.history), f.replies.ref)
+      f.generator.tell(ChangedState(f.state), f.replies.ref)
+      f.generator.tell(LocalBlockApplied(applied.header, applied.transactions.map(_.id)), f.replies.ref)
+
+      val next = f.candidate()
+      next.candidateBlock.parentOpt.map(_.id) shouldBe Some(applied.id)
+      f.generator.tell(OrderingSolutionFound(f.accept(next)), f.replies.ref)
+      f.replies.expectMsg(StatusReply.success(()))
+      f.view.expectMsgType[LocallyGeneratedOrderingBlock].efb.parentId shouldBe applied.id
+    }
+  }
+
   it should "retained ordering work is accepted after history advances" in withFixture { f =>
     val solved = f.accept(f.first)
     val txs = validTransactionsFromBoxHolder(f.txs._2, new RandomWrapper(Some(92)))._1
