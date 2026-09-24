@@ -1,6 +1,8 @@
 package org.ergoplatform.nodeView.history.modifierprocessors
 
 import com.google.common.cache.CacheBuilder
+import org.ergoplatform.mining.InputBlockFields
+import org.ergoplatform.modifiers.history.extension.Extension.PreviousInputBlockTransactionsDigestKey
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.network.message.inputblocks.OrderingBlockAnnouncement
@@ -713,8 +715,18 @@ trait InputBlocksProcessor extends ScorexLogging {
 
   private def transactionBodiesMatchAnnouncement(ib: InputBlockAnnouncement,
                                                  transactions: Seq[ErgoTransaction]): Boolean = {
-    ib.inputBlockFields.inputBlockFieldsProof.indices.isEmpty ||
-      inputBlockTransactionsDigest(transactions).sameElements(ib.inputBlockFields.transactionsDigest)
+    val fields = ib.inputBlockFields
+    val previousDigestLeaf = InputBlockFields.toExtensionFields(fields).fields
+      .zip(InputBlockFields.fieldHashes(fields))
+      .collectFirst {
+        case ((key, _), hash) if key.sameElements(PreviousInputBlockTransactionsDigestKey) => hash
+      }
+    inputBlockTransactionsDigest(transactions).sameElements(fields.transactionsDigest) &&
+      previousDigestLeaf.exists { leaf =>
+        fields.inputBlockFieldsProof.indices.exists { case (_, provenHash) =>
+          provenHash.sameElements(leaf)
+        }
+      }
   }
 
   private def inputBlockDigestMatches(sbId: ModifierId,
