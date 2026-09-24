@@ -14,7 +14,7 @@ import org.ergoplatform.modifiers.history.popow.NipopowAlgos
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction}
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages._
 import org.ergoplatform.network.message.inputblocks.InputBlockTransactionsData
-import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.EliminateTransactions
+import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.{EliminateTransactions, GetDataFromCurrentView}
 import org.ergoplatform.nodeView.ErgoReadersHolder.{GetReaders, Readers}
 import org.ergoplatform.nodeView.{LocallyGeneratedInputBlock, LocallyGeneratedOrderingBlock}
 import org.ergoplatform.nodeView.history.ErgoHistoryUtils.Height
@@ -102,7 +102,9 @@ class CandidateGenerator(
         error
       )
       context.become(
-        initialized(state.copy(cachedCandidate = None, cachedPreviousCandidate = None, solvedBlock = None))
+        initialized(state.copy(
+          cachedCandidate = None, retainedCandidates = Vector.empty,
+          pendingInput = None, solvedBlock = None))
       )
     }
   }
@@ -116,7 +118,6 @@ class CandidateGenerator(
         initialized(
           CandidateGeneratorState(
             cachedCandidate       = None,
-            cachedPreviousCandidate = None,
             solvedBlock = None,
             hr = h,
             sr = s,
@@ -147,6 +148,26 @@ class CandidateGenerator(
       context.become(initialized(state.copy(sr = s)))
     case ChangedMempool(mp: ErgoMemPoolReader) =>
       context.become(initialized(state.copy(mpr = mp)))
+    // Published only after input transactions have been applied to history and removed
+    // from the pool. Refresh through the same GenerateCandidate path as ordering blocks.
+    case NewBestInputBlock(Some(id), _) if needNewCandidate(state.cachedCandidate, id) =>
+      val pending = state.pendingInput.filterNot(_ == id)
+      context.become(initialized(state.copy(cachedCandidate = None, pendingInput = pending)))
+      self ! GenerateCandidate(Seq.empty, reply = false, forced = false, optPk = None)
+    case _: NewBestInputBlock => // no new tip, or active work already uses it
+
+    case PendingInputTimeout(id) if state.pendingInput.contains(id) =>
+      log.warn(s"Input processing timed out: $id; resuming candidate generation")
+      context.become(initialized(state.copy(pendingInput = None)))
+      self ! GenerateCandidate(Seq.empty, reply = false, forced = false)
+    case _: PendingInputTimeout => // obsolete barrier timer
+
+    case InputWorkProcessed(id, h, s, m) if state.pendingInput.contains(id) =>
+      context.become(initialized(state.copy(
+        cachedCandidate = None, pendingInput = None, hr = h, sr = s, mpr = m)))
+      self ! GenerateCandidate(Seq.empty, reply = false, forced = false, optPk = None)
+    case _: InputWorkProcessed => // already refreshed by the applied event
+
     case _: NodeViewChange =>
     // Just ignore all other NodeView Changes
 
@@ -163,9 +184,10 @@ class CandidateGenerator(
         state.copy(lastAppliedBlockTxs = Some(header.id -> applied.txIds.toSet))
       if (needNewCandidate(state.cachedCandidate, header)) {
         if (needNewSolution(state.solvedBlock, header.id))
-          context.become(initialized(stateWithAppliedTxs.copy(cachedCandidate = None, cachedPreviousCandidate = None, solvedBlock = None)))
+          context.become(initialized(stateWithAppliedTxs.copy(
+            cachedCandidate = None, pendingInput = None, solvedBlock = None)))
         else
-          context.become(initialized(stateWithAppliedTxs.copy(cachedCandidate = None, cachedPreviousCandidate = None)))
+          context.become(initialized(stateWithAppliedTxs.copy(cachedCandidate = None, pendingInput = None)))
         self ! GenerateCandidate(txsToInclude = Seq.empty, reply = false, forced = false, optPk = None)
       } else {
         context.become(initialized(stateWithAppliedTxs))
@@ -182,6 +204,25 @@ class CandidateGenerator(
     case SyntacticallyFailedModification(_, modId, error) =>
       onSolvedBlockFailed(state, modId, error)
 
+    case DeferredGenerateCandidate(gen, _, retries) =>
+      if (state.pendingInput.nonEmpty &&
+          retries < ergoSettings.nodeSettings.miningPendingInputMaxRetries) {
+        context.system.scheduler.scheduleOnce(state.avgGenTime.max(100.millis), self,
+          DeferredGenerateCandidate(gen, state.pendingInput.get, retries + 1))(context.dispatcher, sender())
+      } else {
+        if (state.pendingInput.nonEmpty) {
+          log.warn(s"Input processing deferral limit reached: ${state.pendingInput.get}; resuming candidate generation")
+        }
+        val resumed = state.copy(pendingInput = None)
+        context.become(initialized(resumed))
+        // Generate in this receive so another pending input cannot restart this request's budget.
+        initialized(resumed)(gen)
+      }
+
+    case gen: GenerateCandidate if state.pendingInput.nonEmpty =>
+      context.system.scheduler.scheduleOnce(state.avgGenTime.max(100.millis), self,
+        DeferredGenerateCandidate(gen, state.pendingInput.get, 1))(context.dispatcher, sender())
+
     case gen @ GenerateCandidate(txsToInclude, reply, forced, optPk) =>
       val senderOpt = if (reply) Some(sender()) else None
       val effectiveMinerPk = optPk.getOrElse(minerPk)
@@ -196,7 +237,8 @@ class CandidateGenerator(
           effectiveMinerPk,
           txsToInclude,
           state.lastAppliedBlockTxs,
-          ergoSettings
+          ergoSettings,
+          minimumTimestamp = state.lastTimestamp + 1
         ) match {
           case Some(Failure(ex)) =>
             log.error(s"Candidate generation failed", ex)
@@ -211,7 +253,12 @@ class CandidateGenerator(
             log.info(s"Generated new candidate in $generationTook ms")
             context.become(
               initialized(
-                state.copy(cachedCandidate = Some(candidate), cachedPreviousCandidate = state.cachedCandidate, avgGenTime = generationTook.millis)
+                state.copy(
+                  cachedCandidate = Some(candidate),
+                  retainedCandidates = (candidate +: state.retainedCandidates)
+                    .take(ergoSettings.nodeSettings.miningCandidateCacheSize),
+                  lastTimestamp = candidate.candidateBlock.timestamp,
+                  avgGenTime = generationTook.millis)
               )
             )
             senderOpt.foreach(_ ! StatusReply.success(candidate))
@@ -228,76 +275,111 @@ class CandidateGenerator(
         }
       }
 
-    case sf: SolutionFound
-        if state.solvedBlock.isEmpty && state.cachedCandidate.nonEmpty =>
-      // Inject node pk if it is not externally set (in Autolykos 2)
-      val preSolution = sf.as
-      val solution =
-        if (CryptoFacade.isInfinityPoint(preSolution.pk)) {
+    case _: SolutionFound if state.solvedBlock.nonEmpty =>
+      log.info(s"Ordering block already solved: ${state.solvedBlock.map(_.id)}")
+      sender() ! StatusReply.error(s"Block already solved : ${state.solvedBlock.map(_.id)}")
+
+    case _: InputSolutionFound if state.pendingInput.nonEmpty =>
+      log.info(s"Input block pending application: ${state.pendingInput}")
+      sender() ! StatusReply.error(s"Input block pending application: ${state.pendingInput}")
+
+    case sf: SolutionFound =>
+      // No work id accompanies SolutionFound. Each retained candidate must be completed
+      // and checked independently, with the parameters that produced that work.
+      val result: StatusReply[Unit] = Try {
+        val preSolution = sf.as
+        val solution = if (CryptoFacade.isInfinityPoint(preSolution.pk)) {
           new AutolykosSolution(minerPk.value, preSolution.w, preSolution.n, preSolution.d)
-        } else {
-          preSolution
-        }
-      val result: StatusReply[Unit] = {
+        } else preSolution
         sf match {
           case _: OrderingSolutionFound =>
-            // Try to complete the current candidate first; if the solution does not fit it
-            // (e.g. a new block arrived while we were mining), fall back to the previous candidate
-            val candidateAndBlock = state.cachedCandidate
-              .map(c => c -> completeOrderingBlock(c.candidateBlock, solution))
-              .filter { case (_, block) =>
-                ergoSettings.chainSettings.powScheme.validate(block.header).isSuccess
-              }
-              .orElse {
-                log.info(s"Using previous candidate as a solution: ${state.cachedPreviousCandidate}")
-                state.cachedPreviousCandidate.map(c => c -> completeOrderingBlock(c.candidateBlock, solution))
-              }
-
-            candidateAndBlock match {
-              case Some((sourceCandidate, block)) =>
-                log.info(s"New block mined, header: ${block.header}")
-                sendOrderingToNodeView(block, sourceCandidate.candidateBlock.orderingBlockTransactions)
+            val completed = state.retainedCandidates.iterator.flatMap { c =>
+              Try(completeOrderingBlock(c.candidateBlock, solution)).toOption
+                .filter(b => ergoSettings.chainSettings.powScheme.validate(b.header).isSuccess)
+                .map(b => c -> b)
+            }.take(1).toList.headOption
+            completed match {
+              case Some((candidate, block)) =>
+                sendOrderingToNodeView(block, candidate.candidateBlock.orderingBlockTransactions)
                 context.become(initialized(state.copy(solvedBlock = Some(block))))
                 StatusReply.success(())
               case None =>
-                log.warn(s"Removing candidates due to invalid block")
-                context.become(initialized(state.copy(cachedCandidate = None, cachedPreviousCandidate = None)))
-                StatusReply.error(
-                  new Exception(s"Invalid block mined: no candidate matches the solution")
-                )
+                log.warn("No retained candidate matches ordering solution PoW")
+                StatusReply.error("No retained candidate matches ordering solution PoW")
             }
           case _: InputSolutionFound =>
-            val cachedCandidate = state.cachedCandidate.get
-            val (sbi, sbt) = completeInputBlock(cachedCandidate.candidateBlock, solution)
-            val parameters = cachedCandidate.parameters
-            val powValid = ergoSettings.chainSettings.powScheme.checkInputBlockPoW(sbi.header, parameters)
-            if (powValid) { // check PoW only
-              log.info(s"Input-block ${sbi.id} mined @ height ${sbi.header.height}!")
-              sendInputToNodeView(sbi, sbt)
-              context.become(initialized(state.copy(cachedCandidate = None))) // todo: cache input block ?
-              StatusReply.success(())
-            } else {
-              log.warn(s"Removing candidate due to invalid input block")
-              context.become(initialized(state.copy(cachedCandidate = None)))
-              StatusReply.error(
-                new Exception(s"Invalid input block! PoW valid: $powValid")
-              )
+            val candidates = state.retainedCandidates.filter { c =>
+              c.candidateBlock.parentOpt.map(_.id) == state.hr.bestFullBlockOpt.map(_.id)
+            }
+            val completed = completeMatchingInputBlock(
+              candidates, solution, ergoSettings.chainSettings.powScheme)
+            completed match {
+              case Some((announcement, transactions)) =>
+                // The same nonce may solve fresh work. Deduplicate completed blocks,
+                // not AutolykosSolution, which carries no candidate identity.
+                if (state.hr.getInputBlock(announcement.id).nonEmpty) {
+                  log.info(s"Input block already known: ${announcement.id}")
+                  StatusReply.error("Input block already known")
+                } else {
+                  sendInputToNodeView(announcement, transactions)
+                  // Same sender/recipient ordering makes this a processing barrier. A
+                  // losing input fork (or failed application) emits no NewBestInputBlock.
+                  viewHolderRef ! GetDataFromCurrentView[UtxoStateReader, InputWorkProcessed] { v =>
+                    InputWorkProcessed(announcement.id, v.history.getReader,
+                      v.state, v.pool.getReader)
+                  }
+                  val timeout = ergoSettings.nodeSettings.miningPendingInputTimeout
+                    .max(state.avgGenTime * 4)
+                  context.system.scheduler.scheduleOnce(timeout, self,
+                    PendingInputTimeout(announcement.id))(context.dispatcher)
+                  context.become(initialized(state.copy(
+                    cachedCandidate = None,
+                    pendingInput = Some(announcement.id))))
+                  StatusReply.success(())
+                }
+              case None =>
+                val staleMatch = completeMatchingInputBlock(
+                  state.retainedCandidates.filterNot(candidates.contains), solution,
+                  ergoSettings.chainSettings.powScheme).nonEmpty
+                if (staleMatch) {
+                  log.warn("Stale input ordering parent")
+                  StatusReply.error("Stale input ordering parent")
+                } else {
+                  log.warn("No retained candidate matches input solution PoW")
+                  StatusReply.error("No retained candidate matches input solution PoW")
+                }
             }
         }
-      }
-      log.info(s"Processed solution $solution with the result $result")
+      }.recover { case ex =>
+        log.warn("Invalid mining solution", ex)
+        StatusReply.error("Invalid mining solution")
+      }.get
       sender() ! result
 
     case _: AutolykosSolution =>
-      sender() ! StatusReply.error(
-        s"Block already solved : ${state.solvedBlock.map(_.id)}"
-      )
+      log.warn("Invalid unwrapped mining solution")
+      sender() ! StatusReply.error("Invalid unwrapped mining solution")
 
   }
 
 }
 
 object CandidateGenerator extends ScorexLogging {
+  /** Completion must use the source candidate's parameters, never the current slot's. */
+  private[mining] def completeMatchingInputBlock(
+    candidates: Seq[Candidate],
+    solution: AutolykosSolution,
+    powScheme: AutolykosPowScheme
+  ): Option[(InputBlockAnnouncement, InputBlockTransactionsData)] = {
+    candidates.iterator.flatMap { candidate =>
+      Try(completeInputBlock(candidate.candidateBlock, solution)).toOption.filter {
+        case (announcement, _) =>
+          Try(powScheme.checkInputBlockPoW(announcement.header, candidate.parameters))
+            .getOrElse(false)
+      }
+    }.take(1).toList.headOption
+  }
+
 
   /**
     * Holder for both candidate block and data for external miners derived from it
@@ -322,16 +404,29 @@ object CandidateGenerator extends ScorexLogging {
     optPk: Option[ProveDlog] = None
   )
 
+  private[mining] case class PendingInputTimeout(id: ModifierId)
+
+  private case class DeferredGenerateCandidate(gen: GenerateCandidate, id: ModifierId, retries: Int)
+
+  private[mining] case class InputWorkProcessed(
+    id: ModifierId,
+    history: ErgoHistoryReader,
+    state: UtxoStateReader,
+    pool: ErgoMemPoolReader
+  )
+
   /** Local state of candidate generator to avoid mutable vars */
   case class CandidateGeneratorState(
     cachedCandidate: Option[Candidate],
-    cachedPreviousCandidate: Option[Candidate],
     solvedBlock: Option[ErgoFullBlock],
     hr: ErgoHistoryReader,
     sr: UtxoStateReader,
     mpr: ErgoMemPoolReader,
     avgGenTime: FiniteDuration, // approximation of average block generation time for more efficient retries
-    lastAppliedBlockTxs: Option[(ModifierId, Set[ModifierId])] // header id and tx ids of the last applied block
+    lastAppliedBlockTxs: Option[(ModifierId, Set[ModifierId])], // last applied ordering block
+    retainedCandidates: Vector[Candidate] = Vector.empty,
+    pendingInput: Option[ModifierId] = None,
+    lastTimestamp: Long = 0L
   )
 
   def apply(
@@ -382,6 +477,11 @@ object CandidateGenerator extends ScorexLogging {
     val parentHeaderIdOpt = cache.map(_.candidateBlock).flatMap(_.parentOpt).map(_.id)
     !parentHeaderIdOpt.contains(bestFullBlockHeader.id)
   }
+
+  /** Input-tip events only invalidate work that does not already build on that tip. */
+  def needNewCandidate(cache: Option[Candidate], bestInputId: ModifierId): Boolean =
+    !cache.flatMap(_.candidateBlock.inputBlockFields.prevInputBlockId)
+      .exists(_.sameElements(idToBytes(bestInputId)))
 
   /** Solution is valid only if bestFullBlock on the chain is its parent */
   def needNewSolution(
@@ -464,7 +564,8 @@ object CandidateGenerator extends ScorexLogging {
     pk: ProveDlog,
     txsToInclude: Seq[ErgoTransaction],
     lastAppliedBlockTxs: Option[(ModifierId, Set[ModifierId])],
-    ergoSettings: ErgoSettings
+    ergoSettings: ErgoSettings,
+    minimumTimestamp: Long = 0L
   ): Option[Try[(Candidate, EliminateTransactions)]] = {
     // mandatory transactions to include into next block taken from the previous candidate
     val stateWithMandatoryTxs = s.withTransactions(txsToInclude)
@@ -514,7 +615,8 @@ object CandidateGenerator extends ScorexLogging {
         poolTransactions,
         emissionTxOpt,
         unspentTxsToInclude,
-        ergoSettings
+        ergoSettings,
+        minimumTimestamp
       )
       if (!chainSynced) {
         log.debug(
@@ -602,7 +704,8 @@ object CandidateGenerator extends ScorexLogging {
                        poolTxs: Seq[UnconfirmedTransaction],
                        emissionTxOpt: Option[ErgoTransaction],
                        prioritizedTransactions: Seq[ErgoTransaction],
-                       ergoSettings: ErgoSettings
+                       ergoSettings: ErgoSettings,
+                       minimumTimestamp: Long = 0L
   ): Try[(Candidate, EliminateTransactions)] =
     Try {
 
@@ -616,7 +719,10 @@ object CandidateGenerator extends ScorexLogging {
 
       // Make progress in time since last block.
       // If no progress is made, then, by consensus rules, the block will be rejected.
-      val timestamp = Math.max(System.currentTimeMillis(), bestHeaderOpt.map(_.timestamp + 1).getOrElse(0L))
+      // Also advance past the previous work timestamp: the internal miner uses it as
+      // its work-change signal. Set it before transaction validation builds its context.
+      val timestamp = Math.max(System.currentTimeMillis(),
+        bestHeaderOpt.map(_.timestamp + 1).getOrElse(0L)).max(minimumTimestamp)
 
       // Calculate required difficulty for the new block, the same diff for subblock
       val nBits: Long = if (bestInputBlock.isDefined) {
@@ -746,16 +852,13 @@ object CandidateGenerator extends ScorexLogging {
       // digest (Merkle tree root) of new first-class transactions since last input-block
       val inputBlockTransactionsDigestValue = Algos.merkleTreeRoot(inputBlockTransactions.map(tx => LeafData @@ tx.serializedId))
 
-      // digest (Merkle tree root) first class transactions since ordering block till last input-block
-      val previousInputBlocksTransactionsDigest = Algos.merkleTreeRoot(previousOrderingBlockTransactionIds.map(id => LeafData @@ idToBytes(id)))
-
       val inputBlockExtCandidate = InputBlockFields.toExtensionFields(parentInputBlockIdOpt, inputBlockTransactionsDigestValue, inputBlockTransactionsDigestValue)
 
       val extensionCandidate = preExtensionCandidate ++ inputBlockExtCandidate
 
       val inputBlockFields = extensionCandidate.proofForInputBlockData match {
         case Some(inputBlockFieldsProof) =>
-          new InputBlockFields(parentInputBlockIdOpt, inputBlockTransactionsDigestValue, previousInputBlocksTransactionsDigest, inputBlockFieldsProof)
+          new InputBlockFields(parentInputBlockIdOpt, inputBlockTransactionsDigestValue, inputBlockTransactionsDigestValue, inputBlockFieldsProof)
         case None =>
           throw new IllegalArgumentException("Input block fields proof not available in extension candidate")
       }
@@ -835,7 +938,7 @@ object CandidateGenerator extends ScorexLogging {
                 InputBlockFields.toExtensionFields(parentInputBlockIdOpt, retryInputBlockTxsDigest, retryInputBlockTxsDigest)
               retryExtensionCandidate.proofForInputBlockData match {
                 case Some(retryInputBlockFieldsProof) =>
-                  val retryInputBlockFields = new InputBlockFields(parentInputBlockIdOpt, retryInputBlockTxsDigest, previousInputBlocksTransactionsDigest, retryInputBlockFieldsProof)
+                  val retryInputBlockFields = new InputBlockFields(parentInputBlockIdOpt, retryInputBlockTxsDigest, retryInputBlockTxsDigest, retryInputBlockFieldsProof)
                   Success(mkCandidate(retryTxs, adProof, adDigest, retryEliminate,
                     retryExtensionCandidate, retryInputBlockFields, retryInputBlockTransactions, retryOrderingTxs))
                 case None =>
@@ -852,7 +955,7 @@ object CandidateGenerator extends ScorexLogging {
                     case (adProof, adDigest) =>
                       // Both collections produced failed proofs; their rejections may be stale.
                       mkCandidate(Seq(emissionTx), adProof, adDigest, EliminateTransactions(Seq.empty),
-                        extensionCandidate, InputBlockFields.empty, inputBlockTransactions, Seq(emissionTx))
+                        extensionCandidate, inputBlockFields, inputBlockTransactions, Seq(emissionTx))
                   }
                 case None =>
                   log.error("Failed to produce proofs for transactions and no emission box available: ", ex)

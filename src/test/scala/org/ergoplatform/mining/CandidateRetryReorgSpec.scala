@@ -8,7 +8,7 @@ import org.ergoplatform.modifiers.mempool.{ErgoTransaction, OutputsHolder, Uncon
 import org.ergoplatform.nodeView.history.ErgoHistory
 import org.ergoplatform.nodeView.mempool.ErgoMemPool
 import org.ergoplatform.nodeView.state.{BoxHolder, StateType, UtxoState}
-import org.ergoplatform.settings.Constants
+import org.ergoplatform.settings.{Algos, Constants}
 import org.ergoplatform.subblocks.InputBlockAnnouncement
 import org.ergoplatform.utils.{HistoryTestHelpers, RandomWrapper}
 import org.ergoplatform.utils.generators.ChainGenerator.{applyChain, genHeaderChain}
@@ -16,7 +16,7 @@ import org.ergoplatform.utils.generators.ValidBlocksGenerators.{createUtxoState,
 import org.ergoplatform.{ErgoBoxCandidate, Input}
 import org.scalatest.flatspec.AnyFlatSpec
 import org.scalatest.matchers.should.Matchers
-import scorex.crypto.authds.{ADDigest, ADKey, SerializedAdProof}
+import scorex.crypto.authds.{ADDigest, ADKey, LeafData, SerializedAdProof}
 
 import scala.util.Try
 
@@ -75,7 +75,12 @@ class CandidateRetryReorgSpec extends AnyFlatSpec with Matchers {
     // generator picks it up as a previously collected (ordering block) transaction, and it
     // lands in the transaction set the candidate's proofs are generated for.
     private val inputBlockHeader = genHeaderChain(1, history, diffBitsOpt = None, useRealTs = false).last
-    private val inputBlock = InputBlockAnnouncement(1, inputBlockHeader, InputBlockFields.empty, None)
+    private val inputDigest = Algos.merkleTreeRoot(Seq(LeafData @@ transaction.serializedId))
+    private val inputExtension = InputBlockFields.toExtensionFields(None, inputDigest, inputDigest)
+    private val inputFields = new InputBlockFields(None, inputDigest, inputDigest,
+      inputExtension.proofForInputBlockData.get)
+    private val inputBlock = InputBlockAnnouncement(1,
+      inputBlockHeader.copy(extensionRoot = inputExtension.digest), inputFields, None)
     history.applyInputBlock(inputBlock) shouldBe None
     private val (newBestInputBlocks, _) = history.applyInputBlockTransactions(inputBlock.id, Seq(transaction), state)
     newBestInputBlocks should contain(inputBlock.id)
@@ -236,6 +241,11 @@ class CandidateRetryReorgSpec extends AnyFlatSpec with Matchers {
       emissionOnly: Boolean = false): Unit = {
       val (candidate, eliminate) = result
       val block = candidate.candidateBlock
+      block.inputBlockFields.inputBlockFieldsProof.valid(block.extension.digest) shouldBe true
+      InputBlockFields.toExtensionFields(block.inputBlockFields).fields.foreach { case (key, value) =>
+        val committed = block.extension.fields.find(_._1.sameElements(key)).get._2
+        withClue(s"announced field ${key.toSeq}: ") { value.toSeq shouldBe committed.toSeq }
+      }
       block.parentOpt.map(_.id) shouldBe Some(a2.id)
       if (emissionOnly) block.transactions shouldBe Seq(emissionTransaction)
       else block.transactions.map(_.id) should contain(transaction.id)
