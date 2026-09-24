@@ -3,12 +3,12 @@ package org.ergoplatform.mining
 import io.circe.Encoder
 import io.circe.syntax._
 import org.ergoplatform.modifiers.history.extension.Extension.{InputBlockTransactionsDigestKey, PrevInputBlockIdKey, PreviousInputBlockTransactionsDigestKey}
-import org.ergoplatform.modifiers.history.extension.ExtensionCandidate
+import org.ergoplatform.modifiers.history.extension.{Extension, ExtensionCandidate}
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.settings.Algos
-import scorex.crypto.authds.merkle.BatchMerkleProof
-import scorex.crypto.authds.{ADDigest, SerializedAdProof}
+import scorex.crypto.authds.merkle.{BatchMerkleProof, Leaf}
+import scorex.crypto.authds.{ADDigest, LeafData, SerializedAdProof}
 import scorex.crypto.hash.Digest32
 
 /**
@@ -44,10 +44,22 @@ object InputBlockFields {
     // digest (Merkle tree root) of new first-class transactions since last input-block
     val txs = (InputBlockTransactionsDigestKey, transactionsDigest)
 
-    // digest (Merkle tree root) first class transactions since ordering block till last input-block
+    // Despite the prevTransactionsDigest name, the generator currently commits the NEW
+    // input-block transactions digest here too. Announcements must mirror that commitment;
+    // changing it to the accumulated previous-transactions digest is a separate protocol change.
     val prevTxs = (PreviousInputBlockTransactionsDigestKey, prevTransactionsDigest)
 
     ExtensionCandidate(prevInput ++ Seq(txs, prevTxs))
+  }
+
+  def toExtensionFields(fields: InputBlockFields): ExtensionCandidate = {
+    toExtensionFields(fields.prevInputBlockId, fields.transactionsDigest, fields.prevTransactionsDigest)
+  }
+
+  def fieldHashes(fields: InputBlockFields): Seq[Digest32] = {
+    toExtensionFields(fields).fields.map { kv =>
+      Leaf[Digest32](LeafData @@ Extension.kvToLeaf(kv))(Algos.hash).hash
+    }
   }
 }
 

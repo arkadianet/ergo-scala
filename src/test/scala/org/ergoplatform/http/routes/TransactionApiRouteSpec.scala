@@ -9,13 +9,12 @@ import io.circe.Json
 import io.circe.syntax._
 import org.ergoplatform.ErgoBox.{AdditionalRegisters, NonMandatoryRegisterId, TokenId}
 import org.ergoplatform.http.api.{ApiCodecs, TransactionsApiRoute}
-import org.ergoplatform.mining.InputBlockFields
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction}
 import org.ergoplatform.nodeView.ErgoReadersHolder.{GetDataFromHistory, GetReaders, Readers}
 import org.ergoplatform.nodeView.mempool.ErgoMemPool
 import org.ergoplatform.nodeView.state.{BoxHolder, StateType, UtxoState}
 import org.ergoplatform.settings.RESTApiSettings
-import org.ergoplatform.subblocks.InputBlockAnnouncement
+import org.ergoplatform.utils.InputBlockTestHelpers.provedAnnouncement
 import org.ergoplatform.utils.HistoryTestHelpers
 import org.ergoplatform.utils.Stubs
 import org.ergoplatform.utils.generators.ChainGenerator.{applyChain, genChain}
@@ -116,7 +115,7 @@ class TransactionApiRouteSpec extends AnyFlatSpec
     val chainedTx = ErgoTransaction(IndexedSeq(chainedInput), IndexedSeq.empty, tx.outputCandidates)
 
     val c2 = genChain(2, h, stateOpt = Some(us)).tail
-    val inputBlock = InputBlockAnnouncement(1, c2(0).header, InputBlockFields.empty, None)
+    val inputBlock = provedAnnouncement(c2(0).header, Seq(tx))
     h.applyInputBlock(inputBlock) shouldBe None
     val (newBest, _) = h.applyInputBlockTransactions(inputBlock.id, Seq(tx), us)
     newBest should contain(inputBlock.id)

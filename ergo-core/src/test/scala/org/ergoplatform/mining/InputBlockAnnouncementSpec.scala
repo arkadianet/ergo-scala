@@ -20,6 +20,58 @@ class InputBlockAnnouncementSpec extends ErgoCorePropertyTest {
   private val powScheme = new AutolykosPowScheme(32, 26)
   private val defaultParams = Parameters(0, Parameters.DefaultParameters, ErgoValidationSettingsUpdate.empty)
 
+  // Isolate field authentication from PoW; every control must pass the complete valid gate.
+  private val acceptingPow = new AutolykosPowScheme(32, 26) {
+    override def checkInputBlockPoW(
+      header: org.ergoplatform.modifiers.history.header.Header,
+      parameters: Parameters
+    ): Boolean = true
+  }
+
+  private def bindingCase(change: InputBlockFields => InputBlockFields): Unit = {
+    val digest = Algos.hash("new transactions")
+    val previous = Algos.hash("previous transactions")
+    val extension = InputBlockFields.toExtensionFields(None, digest, previous)
+    val fields = new InputBlockFields(None, digest, previous, extension.proofForInputBlockData.get)
+    val header = invalidHeaderGen.sample.get.copy(extensionRoot = extension.digest)
+    val control = InputBlockAnnouncement(1, header, fields, None)
+    control.valid(acceptingPow, defaultParams, None) shouldBe true
+    control.copy(inputBlockFields = change(fields)).valid(acceptingPow, defaultParams, None) shouldBe false
+  }
+
+  property("binding rejects unrelated proven leaves even with a matching extension root") {
+    bindingCase(f => new InputBlockFields(None, Algos.hash("unrelated new"),
+      Algos.hash("unrelated previous"), f.inputBlockFieldsProof))
+  }
+
+  property("binding rejects empty proof indices") {
+    bindingCase(f => new InputBlockFields(None, f.transactionsDigest, f.prevTransactionsDigest,
+      createEmptyMerkleProof))
+  }
+
+  property("binding rejects a mismatched previous transactions digest") {
+    bindingCase(f => new InputBlockFields(None, f.transactionsDigest,
+      Algos.hash("forged previous"), f.inputBlockFieldsProof))
+  }
+
+  property("binding rejects an unbound optional previous input id") {
+    bindingCase(f => new InputBlockFields(Some(Array.fill(32)(1.toByte)),
+      f.transactionsDigest, f.prevTransactionsDigest, f.inputBlockFieldsProof))
+  }
+
+  property("binding rejects stripping a committed optional previous input id") {
+    val previousId = Some(Array.fill(32)(1.toByte))
+    val digest = Algos.hash("new transactions")
+    val previous = Algos.hash("previous transactions")
+    val extension = InputBlockFields.toExtensionFields(previousId, digest, previous)
+    val fields = new InputBlockFields(previousId, digest, previous, extension.proofForInputBlockData.get)
+    val header = invalidHeaderGen.sample.get.copy(extensionRoot = extension.digest)
+    val control = InputBlockAnnouncement(1, header, fields, None)
+    control.valid(acceptingPow, defaultParams, None) shouldBe true
+    val stripped = new InputBlockFields(None, digest, previous, fields.inputBlockFieldsProof)
+    control.copy(inputBlockFields = stripped).valid(acceptingPow, defaultParams, None) shouldBe false
+  }
+
   // Helper to create valid Merkle proof for input block fields
   private def createValidMerkleProof(
     prevInputBlockIdOpt: Option[Array[Byte]],
