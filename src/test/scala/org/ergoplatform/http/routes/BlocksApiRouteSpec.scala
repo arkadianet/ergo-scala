@@ -188,7 +188,7 @@ class BlocksApiRouteSpec
 
       status should not be StatusCodes.OK
       responseAs[Json] should not equal fullBlock
-      // F19: ApiRejectionHandler lacks a MethodRejection case for the existing POST
+      // ApiRejectionHandler lacks a MethodRejection case for the existing POST
       // routes. This 500 is a pre-existing handler defect, not the intended contract.
       status shouldBe StatusCodes.InternalServerError
     }
