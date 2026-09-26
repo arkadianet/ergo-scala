@@ -372,6 +372,10 @@ class ErgoWalletActor(settings: ErgoSettings,
       sender() ! GenerateCommitmentsResponse(resultTry)
 
     case SignTransaction(tx, secrets, hints, boxesToSpendOpt, dataBoxesOpt) =>
+      val signingContext = if (settings.chainSettings
+        .rentAuctionsActive(state.stateContext.currentHeight + 1)) {
+        state.stateContext.simplifiedUpcoming()
+      } else state.stateContext
       val txTry =
         ergoWalletService.signTransaction(
           state.walletVars.proverOpt,
@@ -381,7 +385,7 @@ class ErgoWalletActor(settings: ErgoSettings,
           boxesToSpendOpt,
           dataBoxesOpt,
           state.parameters,
-          state.stateContext
+          signingContext
         )(state.readBoxFromUtxoWithWalletFallback)
       sender() ! txTry
 

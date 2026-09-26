@@ -1,0 +1,44 @@
+{
+  "action" : "collect",
+  "height" : 2100001,
+  "parameters" : {
+    "storageFeeFactor" : 1250000,
+    "minValuePerByte" : 360
+  },
+  "sources" : [
+    {
+      "boxId" : "0be6620b3e76a33d3f26a08b0b83052b7eb8932ed7da88fd017bbcb9401b06df",
+      "value" : 1000000,
+      "ergoTree" : "10010100d17300",
+      "assets" : [
+        {
+          "tokenId" : "0707070707070707070707070707070707070707070707070707070707070707",
+          "amount" : 9223372036854775807
+        }
+      ],
+      "creationHeight" : 1048801,
+      "additionalRegisters" : {
+
+      },
+      "transactionId" : "92cdf578c47085a5992256f0dcf97d0b19f1f1c9de4d5fe30c3ace6191b6e5db",
+      "index" : 0
+    }
+  ],
+  "funding" : [
+    {
+      "boxId" : "80f60fd8e3ce0a950f2a2618d343769045c2107cda37e972110a93c75e6f7e65",
+      "value" : 30000000,
+      "ergoTree" : "10010101d17300",
+      "assets" : [
+      ],
+      "creationHeight" : 2100001,
+      "additionalRegisters" : {
+
+      },
+      "transactionId" : "31237cdb79ae1dfa7ffb87cde7ea8a80352d300ee5ac758a6cddd19d671925ec",
+      "index" : 0
+    }
+  ],
+  "beneficiary" : "0008cd038b0f29a60fa8d7e1aeafbe512288a6c6bc696547bbf8247db23c95e83014513c",
+  "change" : "10010101d17300"
+}

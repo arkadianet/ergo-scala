@@ -9,6 +9,8 @@ import org.ergoplatform.mining.groupElemFromBytes
 import org.ergoplatform.modifiers.BlockSection
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
+import org.ergoplatform.modifiers.mempool.rentauction.RentAuctionRules
+import org.ergoplatform.modifiers.history.extension.ExtensionCandidate
 import org.ergoplatform.modifiers.state.StateChanges
 import org.ergoplatform.nodeView.history.ErgoHistoryUtils._
 import org.ergoplatform.settings.ValidationRules._
@@ -105,9 +107,21 @@ object ErgoState extends ScorexLogging {
     */
   def execTransactions(transactions: Seq[ErgoTransaction],
                        currentStateContext: ErgoStateContext,
-                       nodeSettings: NodeConfigurationSettings)
+                       nodeSettings: NodeConfigurationSettings,
+                       rentExtension: Option[ExtensionCandidate] = None)
                       (checkBoxExistence: ErgoBox.BoxId => Try[ErgoBox]): ValidationResult[Long] = {
     val verifier: ErgoInterpreter = ErgoInterpreter(currentStateContext.currentParameters)
+    val auctionRules = if (currentStateContext.chainSettings
+      .rentAuctionsActive(currentStateContext.currentHeight)) {
+      Some(new RentAuctionRules(currentStateContext.chainSettings.rentAuctionContracts,
+        currentStateContext.currentParameters))
+    } else None
+    val extension = rentExtension.orElse(currentStateContext.lastExtensionOpt)
+      .getOrElse(ExtensionCandidate(Seq.empty))
+    val beneficiary = extension.fields.collectFirst {
+      case (key, value) if key.sameElements(RentAuctionRules.BENEFICIARY_KEY) => value
+    }
+    val resolved = Vector.newBuilder[(ErgoTransaction, IndexedSeq[ErgoBox])]
 
     def preAllocatedBuilder[T: ClassTag](sizeHint: Int): mutable.ArrayBuilder[T] = {
       val b = mutable.ArrayBuilder.make[T]()
@@ -133,7 +147,7 @@ object ErgoState extends ScorexLogging {
     }
 
     val checkpointHeight = nodeSettings.checkpoint.map(_.height).getOrElse(0)
-    if (currentStateContext.currentHeight <= checkpointHeight) {
+    if (currentStateContext.currentHeight <= checkpointHeight && auctionRules.isEmpty) {
       Valid(0L)
     } else {
       import spire.syntax.all.cfor
@@ -151,10 +165,35 @@ object ErgoState extends ScorexLogging {
           .validateNoFailure(txDataBoxes, dataBoxesTry, tx.id, tx.modifierTypeId)
           .payload[Long](validCostResult.value)
           .validateTry(boxes, e => ModifierValidator.fatal("Missed data boxes", tx.id, tx.modifierTypeId, e)) { case (_, (dataBoxes, toSpend)) =>
-            tx.validateStateful(toSpend, dataBoxes, currentStateContext, validCostResult.value)(verifier).result
+            resolved += tx -> toSpend
+            val extra = auctionRules.map(_.cost(tx, toSpend)).getOrElse(0L)
+            val newCost = validCostResult.value + extra
+            if (newCost > currentStateContext.currentParameters.maxBlockCost) {
+              ModifierValidator.fatal("Rent-auction validation exceeds block cost",
+                tx.id, tx.modifierTypeId)
+            } else {
+              val normal = tx.validateStateful(toSpend, dataBoxes,
+                currentStateContext, newCost)(verifier).result
+              if (!normal.isValid) normal else {
+                auctionRules.map(_.validate(tx, toSpend,
+                  currentStateContext.currentHeight, beneficiary)) match {
+                  case Some(Left(error)) =>
+                    ModifierValidator.fatal(error, tx.id, tx.modifierTypeId)
+                  case _ => normal
+                }
+              }
+            }
           }
       }
-      costResult
+      if (!costResult.isValid) costResult else {
+        auctionRules.map(_.validateExtension(resolved.result(),
+          currentStateContext.currentHeight, extension)) match {
+          case Some(Left(error)) => ModifierValidator.fatal(error,
+            transactions.headOption.map(_.id).getOrElse(ErgoBox.allZerosModifierId),
+            ErgoTransaction.modifierTypeId)
+          case _ => costResult
+        }
+      }
     }
   }
 

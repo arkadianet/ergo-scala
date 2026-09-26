@@ -10,6 +10,8 @@ import org.ergoplatform.wallet.boxes.ErgoBoxAssetExtractor
 import scorex.util.encode.Base16
 import sigma.data.{AvlTreeData, SigmaBoolean, SigmaLeaf}
 import sigma.interpreter.ContextExtension
+import sigma.interpreter.CostedProverResult
+import sigma.ast.SShort
 import sigma.validation.SigmaValidationSettings
 import sigmastate.crypto.SigmaProtocolPrivateInput
 import sigmastate.interpreter.ProverInterpreter
@@ -143,7 +145,21 @@ class ErgoProvingInterpreter(val secretKeys: IndexedSeq[SecretKey],
                 )
 
                 val hints = txHints.allHintsForInput(boxIdx)
-                prove(inputBox.ergoTree, context, unsignedTx.messageToSign, hints).flatMap { proverResult =>
+                val rentConstants = org.ergoplatform.wallet.protocol.Constants
+                val rentOutput = unsignedInput.extension.values
+                  .get(rentConstants.StorageIndexVarId)
+                  .filter(_.tpe == SShort)
+                  .flatMap(v => unsignedTx.outputCandidates.lift(
+                    v.value.asInstanceOf[Short].toInt))
+                val rentSpend = context.preHeader.height - inputBox.creationHeight >=
+                  rentConstants.StoragePeriod && rentOutput.exists(out =>
+                    checkExpiredBox(inputBox, out, context.preHeader.height))
+                val proof = if (rentSpend) {
+                  Success(CostedProverResult(Array.emptyByteArray,
+                    unsignedInput.extension,
+                    addExact(totalCost, rentConstants.StorageContractCost)))
+                } else prove(inputBox.ergoTree, context, unsignedTx.messageToSign, hints)
+                proof.flatMap { proverResult =>
                   //prove is accumulating cost under the hood, so proverResult.cost = totalCost + input check cost
                   val newTC = proverResult.cost
                   if (newTC > context.costLimit) {

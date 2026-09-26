@@ -4,6 +4,7 @@ import org.ergoplatform.ErgoBox
 import org.ergoplatform.mining.emission.EmissionRules
 import org.ergoplatform.modifiers.ErgoFullBlock
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction}
+import org.ergoplatform.modifiers.mempool.rentauction.RentAuctionRules
 import org.ergoplatform.modifiers.transaction.TooHighCostError
 import org.ergoplatform.nodeView.mempool.ErgoMemPoolReader
 import org.ergoplatform.settings.{Algos, ErgoSettings}
@@ -47,17 +48,31 @@ trait UtxoStateReader extends ErgoStateReader with UtxoSetSnapshotPersistence {
   def validateWithCost(tx: ErgoTransaction,
                        context: ErgoStateContext,
                        costLimit: Int,
-                       interpreterOpt: Option[ErgoInterpreter]): Try[Int] = {
+                       interpreterOpt: Option[ErgoInterpreter],
+                       rentBeneficiary: Option[Array[Byte]] = None,
+                       allowRent: Boolean = false): Try[Int] = {
     val parameters = context.currentParameters.withBlockCost(costLimit)
     val verifier = interpreterOpt.getOrElse(ErgoInterpreter(parameters))
 
     tx.statelessValidity().flatMap { _ =>
       val boxesToSpend = tx.inputs.flatMap(i => boxById(i.boxId))
-      tx.statefulValidity(
+      val rules = if (context.chainSettings.rentAuctionsActive(context.currentHeight)) {
+        Some(new RentAuctionRules(context.chainSettings.rentAuctionContracts,
+          context.currentParameters))
+      } else None
+      val extra = rules.map(_.cost(tx, boxesToSpend)).getOrElse(0L)
+      lazy val proposal = rules.map { r =>
+        if (!allowRent && r.claims(tx, boxesToSpend, context.currentHeight).nonEmpty) {
+          Left("Rent claims must be submitted to the producer's candidate endpoint")
+        } else r.validate(tx, boxesToSpend, context.currentHeight, rentBeneficiary)
+      }.getOrElse(Right(()))
+      if (extra > costLimit) Failure(TooHighCostError(tx, None))
+      else if (proposal.isLeft) Failure(new IllegalArgumentException(proposal.left.get))
+      else tx.statefulValidity(
         boxesToSpend,
         tx.dataInputs.flatMap(i => boxById(i.boxId)),
         context,
-        accumulatedCost = 0L)(verifier) match {
+        accumulatedCost = extra)(verifier) match {
         case Success(txCost) if txCost > costLimit =>
           Failure(TooHighCostError(tx, Some(txCost)))
         case Success(txCost) =>
