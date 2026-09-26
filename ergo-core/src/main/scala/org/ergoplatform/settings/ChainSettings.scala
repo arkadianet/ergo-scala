@@ -32,7 +32,19 @@ case class ChainSettings(protocolVersion: Byte,
                          genesisStateDigestHex: String,
                          initialDifficultyHex: String,
                          makeSnapshotEvery: Int,
-                         genesisId: Option[ModifierId] = None) {
+                         genesisId: Option[ModifierId] = None,
+                         rentAuctionActivationHeight: Option[Int] = None) {
+
+  require(rentAuctionActivationHeight.forall(_ > 0),
+    "rentAuctionActivationHeight must be positive when set")
+
+  /** Draft consensus feature; no network activation is assigned by default. */
+  def rentAuctionsActive(height: Int): Boolean =
+    rentAuctionActivationHeight.exists(h => h > 0 && height >= h)
+
+  lazy val rentAuctionContracts:
+    org.ergoplatform.modifiers.mempool.rentauction.RentAuctionContracts =
+    new org.ergoplatform.modifiers.mempool.rentauction.RentAuctionContracts(this)
 
   val isMainnet: Boolean = addressPrefix == ErgoAddressEncoder.MainnetNetworkPrefix
 

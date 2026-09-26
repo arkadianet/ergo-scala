@@ -9,6 +9,8 @@ import org.ergoplatform.mining.difficulty.DifficultySerializer
 import org.ergoplatform.modifiers.ErgoFullBlock
 import org.ergoplatform.modifiers.history._
 import org.ergoplatform.modifiers.history.extension.Extension
+import org.ergoplatform.modifiers.history.extension.ExtensionCandidate
+import org.ergoplatform.modifiers.mempool.rentauction.RentAuctionRules
 import org.ergoplatform.modifiers.history.header.{Header, HeaderWithoutPow}
 import org.ergoplatform.modifiers.history.popow.NipopowAlgos
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction}
@@ -286,6 +288,21 @@ class CandidateGenerator(
 }
 
 object CandidateGenerator extends ScorexLogging {
+
+  /** Local producer policy; deliberately independent of a Lithos lender's key. */
+  def rentBeneficiaryHash(minerPk: ProveDlog, settings: ErgoSettings): Array[Byte] = {
+    val tree = settings.nodeSettings.rentAuctionBeneficiaryHex.map { hex =>
+      val bytes = Base16.decode(hex).get
+      val parsed = sigma.serialization.ErgoTreeSerializer.DefaultSerializer
+        .deserializeErgoTree(bytes)
+      require(parsed.root.isRight && new sigma.ast.ErgoTree(parsed.header,
+        parsed.constants, parsed.root).bytes.sameElements(bytes),
+        "rentAuctionBeneficiaryHex must contain a canonical parsed ErgoTree")
+      parsed
+    }.getOrElse(ErgoTreePredef.rewardOutputScript(
+      settings.chainSettings.monetary.minerRewardDelay, minerPk))
+    scorex.crypto.hash.Blake2b256(tree.bytes)
+  }
 
   /**
     * Holder for both candidate block and data for external miners derived from it
@@ -675,6 +692,7 @@ object CandidateGenerator extends ScorexLogging {
       )
 
       val emissionTxs = emissionTxOpt.toSeq
+      val rentBeneficiary = rentBeneficiaryHash(minerPk, ergoSettings)
 
       // todo: remove in 5.0
       // we allow for some gap, to avoid possible problems when different interpreter version can estimate cost
@@ -693,10 +711,25 @@ object CandidateGenerator extends ScorexLogging {
         state.stateContext.currentParameters.maxBlockSize,
         state,
         upcomingContext,
-        emissionTxs ++ prioritizedTransactions ++ poolTxs.map(_.transaction)
+        emissionTxs ++ prioritizedTransactions ++ poolTxs.map(_.transaction),
+        Some(rentBeneficiary)
       )
 
       val eliminateTransactions = EliminateTransactions(toEliminate)
+
+      def extensionFor(transactions: Seq[ErgoTransaction]): ExtensionCandidate = {
+        if (!ergoSettings.chainSettings.rentAuctionsActive(upcomingContext.currentHeight)) {
+          extensionCandidate
+        } else {
+          val rules = new RentAuctionRules(ergoSettings.chainSettings.rentAuctionContracts,
+            upcomingContext.currentParameters)
+          val withTransactions = state.withTransactions(transactions)
+          val resolved = transactions.map(tx =>
+            tx -> tx.inputs.flatMap(i => withTransactions.boxById(i.boxId)))
+          extensionCandidate ++ rules.extension(resolved,
+            upcomingContext.currentHeight, rentBeneficiary)
+        }
+      }
 
       if (txs.isEmpty) {
         throw new IllegalArgumentException(
@@ -722,7 +755,7 @@ object CandidateGenerator extends ScorexLogging {
             adProof,
             txs,
             timestamp,
-            extensionCandidate,
+            extensionFor(txs),
             votes
           )
           val ext = deriveWorkMessage(candidate)
@@ -754,7 +787,7 @@ object CandidateGenerator extends ScorexLogging {
                     adProof,
                     fallbackTxs,
                     timestamp,
-                    extensionCandidate,
+                    extensionFor(fallbackTxs),
                     votes
                   )
                   Candidate(
@@ -943,7 +976,8 @@ object CandidateGenerator extends ScorexLogging {
                   maxBlockSize: Int,
                   us: UtxoStateReader,
                   upcomingContext: ErgoStateContext,
-                  transactions: Seq[ErgoTransaction]
+                  transactions: Seq[ErgoTransaction],
+                  rentBeneficiary: Option[Array[Byte]] = None
                 ): (Seq[ErgoTransaction], Seq[ModifierId]) = {
 
     val currentHeight = us.stateContext.currentHeight
@@ -981,7 +1015,12 @@ object CandidateGenerator extends ScorexLogging {
               tx,
               upcomingContext,
               maxBlockCost,
-              Some(verifier)
+              Some(verifier),
+              rentBeneficiary.orElse(Some(scorex.crypto.hash.Blake2b256(
+                ErgoTreePredef.rewardOutputScript(
+                  upcomingContext.chainSettings.monetary.minerRewardDelay,
+                  minerPk).bytes))),
+              allowRent = true
             ) match {
               case Success(costConsumed) =>
                 val newTxs = acc :+ (tx -> costConsumed)
@@ -992,7 +1031,13 @@ object CandidateGenerator extends ScorexLogging {
                     val boxesToSpend = feeTx.inputs.flatMap(i =>
                       newBoxes.find(b => java.util.Arrays.equals(b.id, i.boxId))
                     )
-                    feeTx.statefulValidity(boxesToSpend, IndexedSeq(), upcomingContext)(verifier) match {
+                    val extraCost = if (upcomingContext.chainSettings
+                      .rentAuctionsActive(nextHeight)) {
+                      new RentAuctionRules(upcomingContext.chainSettings.rentAuctionContracts,
+                        upcomingContext.currentParameters).cost(feeTx, boxesToSpend)
+                    } else 0L
+                    feeTx.statefulValidity(boxesToSpend, IndexedSeq(),
+                      upcomingContext, extraCost)(verifier) match {
                       case Success(cost) =>
                         val blockTxs: Seq[CostedTransaction] = (feeTx -> cost) +: newTxs
                         if (correctLimits(blockTxs, maxBlockCost, maxBlockSize)) {

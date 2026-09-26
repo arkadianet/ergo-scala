@@ -1,0 +1,167 @@
+diff --git a/app/tasks/StartMiningServer.scala b/app/tasks/StartMiningServer.scala
+index bdef60b..82d0543 100644
+--- a/app/tasks/StartMiningServer.scala
++++ b/app/tasks/StartMiningServer.scala
+@@ -97,11 +97,17 @@ class StartMiningServer @Inject()(system: ActorSystem, config: Configuration,
+         def limitsFor(name: String): configs.CandidateSourceConfig =
+           stratumParams.candidate.sources.getOrElse(name, configs.CandidateConfig.Default.sources(name))
+         val rentLimits = limitsFor(configs.CandidateSourceConfig.Rent)
++        val auctionQueue = config.getOptional[String](
++          "stratum.candidate.sources.rent.auctionQueueDirectory")
++        val rentProps = auctionQueue.map { path =>
++          akka.actor.Props(new transactions.rent.AuctionRentSource(
++            java.nio.file.Paths.get(path), rentLimits))
++        }.getOrElse(akka.actor.Props(new transactions.rent.StorageRentSource(
++          nodeConfig, configs.RentConfig(config), rentLimits,
++          stratumParams.candidate.useTruePropCollection)))
+         val rentSource = if (!rentLimits.enabled) None else Some(
+           mining.MiningMessages.CandidateSource(configs.CandidateSourceConfig.Rent,
+-            system.actorOf(akka.actor.Props(new transactions.rent.StorageRentSource(
+-              nodeConfig, configs.RentConfig(config), rentLimits,
+-              stratumParams.candidate.useTruePropCollection)), "storage-rent-source")))
++            system.actorOf(rentProps, "storage-rent-source")))
+ 
+         // Batchers run from Module either way; this only decides whether the stratum asks them.
+         def batcherSource(name: String, batcher: ActorRef): Option[mining.MiningMessages.CandidateSource] =
+diff --git a/app/transactions/rent/AuctionRentSource.scala b/app/transactions/rent/AuctionRentSource.scala
+new file mode 100644
+--- /dev/null
++++ b/app/transactions/rent/AuctionRentSource.scala
+@@ -0,0 +1,79 @@
++package transactions.rent
++
++import java.nio.charset.StandardCharsets
++import java.nio.file.Files
++import java.nio.file.Path
++
++import akka.actor.Actor
++import akka.actor.ActorRef
++import configs.CandidateSourceConfig
++import node.rest.NodeCodecs
++import org.slf4j.LoggerFactory
++import transactions.candidate.BlockTxMessages.BlockTxsReady
++import transactions.candidate.BlockTxMessages.CandidateTx
++import transactions.candidate.BlockTxMessages.CandidateTxsDropped
++import transactions.candidate.BlockTxMessages.PrepareBlockTxs
++import transactions.candidate.BlockTxMessages.RequestBlockTxs
++import transactions.candidate.CandidateBundle
++import transactions.candidate.CandidatePreparation
++
++import scala.util.Try
++
++/** Offers a pre-funded, signed auction collection to Lithos's existing candidate path. */
++class AuctionRentSource(directory: Path, limits: CandidateSourceConfig) extends Actor {
++  private val logger = LoggerFactory.getLogger("AuctionRentSource")
++  private val worker = context.system.dispatchers.lookup(
++    configs.Contexts.key(configs.Contexts.Polling))
++  private val preparation = new CandidatePreparation(worker, self)
++
++  private def build(height: Int, replyTo: Option[ActorRef]): Unit =
++    if (!limits.enabled) preparation.answerEmpty(height, replyTo)
++    else preparation.start(height, replyTo) {
++      Try(AuctionRentSource.read(directory, height, limits)).recover { case error =>
++        logger.warn(s"Auction collection for $height refused: ${error.getMessage}")
++        Seq.empty[CandidateBundle]
++      }.get
++    }
++
++  override def receive: Receive = ({
++    case PrepareBlockTxs(height, _) => build(height, None)
++    case RequestBlockTxs(height, _, refresh) =>
++      preparation.preparedFor(height).filterNot(_ => refresh) match {
++        case Some(bundles) => sender() ! BlockTxsReady(height, bundles)
++        case None => build(height, Some(sender()))
++      }
++    case CandidateTxsDropped(height) => preparation.drop(height)
++  }: Receive).orElse(preparation.receive)
++}
++
++object AuctionRentSource {
++  /** Local queue metadata is not consensus evidence; the node validates every transaction. */
++  def read(directory: Path, height: Int,
++           limits: CandidateSourceConfig): Seq[CandidateBundle] = {
++    require(height > 0, "Invalid candidate height")
++    val file = directory.resolve(s"$height.json")
++    if (!Files.isRegularFile(file)) return Seq.empty
++    require(Files.size(file) <= 4194304L, "Queue entry exceeds 4 MiB")
++    val bytes = Files.readAllBytes(file)
++    require(bytes.length <= 4194304, "Queue entry exceeds 4 MiB")
++    val envelope = new com.google.gson.JsonParser()
++      .parse(new String(bytes, StandardCharsets.UTF_8)).getAsJsonObject
++    require(envelope.get("height").getAsInt == height, "Stale queue height")
++    val json = envelope.getAsJsonObject("transaction")
++    val tx = NodeCodecs.transaction(json)
++    require(tx.id.matches("[0-9a-f]{64}"), "Invalid transaction id")
++    require(tx.inputs.nonEmpty && tx.inputs.map(_.boxId).distinct.size == tx.inputs.size,
++      "Missing or duplicated inputs")
++    require(tx.outputs.nonEmpty && tx.outputs.forall(_.creationHeight == height),
++      "Collection must be rebuilt for this height")
++    require(tx.inputs.exists(i => i.spendingProof.proofBytes.isEmpty &&
++      i.spendingProof.extension.contains("127")), "Queue entry is not a rent claim")
++    require(limits.maxCost > 0L, "A positive candidate cost budget is required")
++    // Reserve the source's entire cost allowance for this one batch. JSON bytes
++    // conservatively overestimate wire bytes; the node checks actual size and cost.
++    val member = CandidateTx(tx.id, json.toString, "rent-auction",
++      tx.inputs.map(_.boxId).toSet, bytes.length, limits.maxCost, tx.id)
++    CandidateBundle.fit(Seq(CandidateBundle(Vector(member))),
++      limits.maxTxs, limits.budget)
++  }
++}
+diff --git a/test/transactions/rent/AuctionRentSourceSpec.scala b/test/transactions/rent/AuctionRentSourceSpec.scala
+new file mode 100644
+--- /dev/null
++++ b/test/transactions/rent/AuctionRentSourceSpec.scala
+@@ -0,0 +1,53 @@
++package transactions.rent
++
++import java.nio.charset.StandardCharsets
++import java.nio.file.Files
++
++import configs.CandidateSourceConfig
++import org.scalatest.flatspec.AnyFlatSpec
++import org.scalatest.matchers.should.Matchers
++import transactions.candidate.CandidateBundle
++
++class AuctionRentSourceSpec extends AnyFlatSpec with Matchers {
++  private val directory = Files.createTempDirectory("auction-rent-queue-")
++  private val limits = CandidateSourceConfig(true, 5, 100000L, 1000000L)
++  private val id = "ab" * 32
++  private val input = "cd" * 32
++  private def write(height: Int, envelopeHeight: Int): Unit = {
++    val json = s"""{"height":$envelopeHeight,"transaction":{
++      "id":"$id","inputs":[{"boxId":"$input",
++        "spendingProof":{"proofBytes":"","extension":{"127":"0400"}}}],
++      "dataInputs":[],"outputs":[{"value":1000000,"ergoTree":"10010101d17300",
++        "creationHeight":$height,"assets":[],"additionalRegisters":{}}]}}"""
++    Files.write(directory.resolve(s"$height.json"), json.getBytes(StandardCharsets.UTF_8))
++  }
++
++  "Auction rent queue" should "preserve the signed JSON and enter candidate selection" in {
++    write(101, 101)
++    val bundles = AuctionRentSource.read(directory, 101, limits)
++    val chosen = CandidateBundle.select(bundles, 5, limits.budget)
++    chosen.map(_.id) shouldBe Vector(id)
++    chosen.head.inputIds shouldBe Set(input)
++    chosen.head.cost shouldBe limits.maxCost
++    chosen.head.leaf shouldBe id
++    bundles.head.capital shouldBe empty
++  }
++
++  it should "reject stale height and ignore absent height files" in {
++    write(102, 101)
++    intercept[IllegalArgumentException](AuctionRentSource.read(directory, 102, limits))
++    AuctionRentSource.read(directory, 103, limits) shouldBe empty
++  }
++
++  it should "obey byte and transaction budgets" in {
++    AuctionRentSource.read(directory, 101, limits.copy(maxBytes = 1)) shouldBe empty
++    AuctionRentSource.read(directory, 101, limits.copy(maxTxs = 0)) shouldBe empty
++  }
++
++  it should "reject malformed and oversized entries" in {
++    Files.write(directory.resolve("104.json"), "{}".getBytes(StandardCharsets.UTF_8))
++    intercept[Exception](AuctionRentSource.read(directory, 104, limits))
++    Files.write(directory.resolve("105.json"), new Array[Byte](4194305))
++    intercept[IllegalArgumentException](AuctionRentSource.read(directory, 105, limits))
++  }
++}
