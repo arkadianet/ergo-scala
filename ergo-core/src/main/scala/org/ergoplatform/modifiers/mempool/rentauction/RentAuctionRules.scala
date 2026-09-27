@@ -22,6 +22,8 @@ import sigma.Coll
 import sigma.data.Digest32Coll
 import sigma.serialization.ErgoTreeSerializer
 
+import scala.util.Failure
+import scala.util.Success
 import scala.util.Try
 
 /** Additional restrictions; baseline transaction validation is always required. */
@@ -43,6 +45,7 @@ final class RentAuctionRules(contracts: RentAuctionContracts, params: Parameters
   import RentAuctionRules.ATTESTATION_KEY
   import RentAuctionRules.BENEFICIARY_KEY
   import RentAuctionRules.Rent
+  import RentAuctionRules.toEither
 
   def auctionTokens(b: ErgoBox, h: Int): Seq[(Digest32Coll, Long)] = {
     val reemission = contracts.chain.reemission
@@ -177,7 +180,7 @@ final class RentAuctionRules(contracts: RentAuctionContracts, params: Parameters
     inputs: IndexedSeq[ErgoBox],
     h: Int,
     beneficiaryHash: Option[Array[Byte]]
-  ): Either[String, Unit] = Try {
+  ): Either[String, Unit] = toEither(Try {
     def check(ok: Boolean, message: String): Unit = require(ok, message)
     check(inputs.size == tx.inputs.size && inputs.zip(tx.inputs).forall {
       case (b, in) => b.id.sameElements(in.boxId)
@@ -251,10 +254,9 @@ final class RentAuctionRules(contracts: RentAuctionContracts, params: Parameters
       else check(auctionInputs == Seq(0) && auctionOutputs == Set(0),
         "bidding requires one auction input and one successor at index zero")
     } else check(auctionOutputs.isEmpty, "auction creation requires a rent source")
-  }.toEither.left.map(e => Option(e.getMessage).getOrElse(e.getClass.getSimpleName)
-    .stripPrefix("requirement failed: "))
+  })
 
-  private def validateClose(tx: ErgoTransaction, inputs: IndexedSeq[ErgoBox], h: Int): Either[String, Unit] = Try {
+  private def validateClose(tx: ErgoTransaction, inputs: IndexedSeq[ErgoBox], h: Int): Either[String, Unit] = toEither(Try {
     require(inputs.nonEmpty && inputs.size <= MAX_CLOSE_LOTS &&
       inputs.forall(_.ergoTree == contracts.auction), "close requires 1 to 32 lots and no funding inputs")
     val outputs = tx.outputs
@@ -312,8 +314,7 @@ final class RentAuctionRules(contracts: RentAuctionContracts, params: Parameters
       }
     }
     require(outputs.forall(_.ergoTree != contracts.auction), "close cannot recreate auctions")
-  }.toEither.left.map(e => Option(e.getMessage).getOrElse(e.getClass.getSimpleName)
-    .stripPrefix("requirement failed: "))
+  })
 
   def attestation(
     transactions: Seq[(ErgoTransaction, IndexedSeq[ErgoBox])],
@@ -356,6 +357,12 @@ final class RentAuctionRules(contracts: RentAuctionContracts, params: Parameters
 }
 
 object RentAuctionRules {
+  private[rentauction] def toEither(t: Try[Unit]): Either[String, Unit] = t match {
+    case Success(_) => Right(())
+    case Failure(e) => Left(Option(e.getMessage).getOrElse(e.getClass.getSimpleName)
+      .stripPrefix("requirement failed: "))
+  }
+
   final case class Rent(outputIndex: Int, fullyConsumed: Boolean)
 
   // Experimental keys only; assignment and activation need a reviewed node EIP.

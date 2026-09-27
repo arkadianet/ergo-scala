@@ -90,7 +90,7 @@ class RentAuctionParameterSpec extends ErgoCorePropertyTest with RentAuctionFixt
 
   property("bidding at the maximum Int boundary retains the absolute cap") {
     val at = Int.MaxValue - 1
-    val b = lot(end = Int.MaxValue, cap = Int.MaxValue, created = Int.MaxValue - 1440)
+    val b: ErgoBox = lot(end = Int.MaxValue, cap = Int.MaxValue, created = Int.MaxValue - 1440)
     val bid = bidSpend(b, MINIMUM_BID, at, Int.MaxValue, Int.MaxValue)
     bid.result.get should be > 0
     settleSpend(bid.tx.outputs.head, Int.MaxValue).result.get should be > 0

@@ -419,12 +419,19 @@ def merge_due(node, index, builder, output_dir, execute=False):
             result = publish_plan(node, plan, output_dir, execute)
             results.append(dict(result, deposits=batch, fee=plan["feePaid"]))
             pending = pending[len(batch):]
-            reserve = plan["outputBoxes"][0]
             retries = 0
             if not execute:
                 if pending:
                     results.append({"deferred": pending, "reason": "awaiting reserve successor"})
                 break
+            if pending:
+                successor = plan["outputBoxes"][0]
+                assets = successor.get("assets")
+                if successor.get("ergoTree") != manifest["reserve"]["ergoTree"] or not assets or \
+                        assets[0].get("tokenId") != manifest["reserveNft"] or assets[0].get("amount") != 1:
+                    results.append({"deferred": pending, "reason": "invalid reserve successor tree or NFT"})
+                    break
+                reserve = successor
         except SpentInput as error:
             if error.box_id == reserve["boxId"]:
                 results.append({"deferred": pending, "reason": "reserve spent; sync and rebuild with the producer"})

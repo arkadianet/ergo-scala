@@ -189,7 +189,7 @@ final class RentAuctionTransactions(
       val principal = if (seed == 0L) rules.openingSeed(template) else seed
       require(principal >= rules.openingSeed(template), "Auction seed is too small")
       outputs += out(amount(BigInt(principal) + CLOSE_ALLOWANCE), contracts.auction,
-        lotTokens, registers.updated(ErgoBox.R8, LongConstant(principal)))
+        lotTokens, registers ++ Map(ErgoBox.R8 -> LongConstant(principal)))
     }
     outputs += funded(out(amount(rentAmount), beneficiary))
     if (contracts.chain.reemission.checkReemissionRules &&

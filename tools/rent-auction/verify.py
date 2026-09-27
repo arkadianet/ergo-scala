@@ -9,10 +9,18 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from datetime import datetime, timezone
+
+from package import packaged_files
 
 ROOT = Path(__file__).resolve().parents[2]
 LITHOS_BASE = "88bb1822022bf9521c281314c060a8943521d0f6"
+REGENERATED_VECTORS = {
+    "docs/rent-auction/vectors/collect-request.json",
+    "docs/rent-auction/vectors/collect-plan.json",
+    "docs/rent-auction/vectors/mainnet-contracts.json",
+}
 
 
 def launcher(path):
@@ -28,21 +36,79 @@ def launcher(path):
     raise RuntimeError("Install sbt or set SBT_LAUNCH_JAR to sbt-launch.jar")
 
 
-def source_fingerprint():
-    from package import NEW_FILES, NEW_ROOTS
-    names = set(subprocess.check_output(["git", "ls-files", "-z"], cwd=ROOT)
-                .decode().split("\0")) - {""}
-    names.update(NEW_FILES)
-    for folder in NEW_ROOTS:
-        names.update(p.relative_to(ROOT).as_posix() for p in (ROOT / folder).rglob("*")
-                     if p.is_file() and "__pycache__" not in p.parts)
+def source_fingerprint(exclude=()):
     digest = hashlib.sha256()
-    for name in sorted(names):
+    for name in packaged_files(ROOT):
+        if name == "docs/rent-auction/verification.json" or name in exclude:
+            continue
         path = ROOT / name
         if path.is_file() and path.suffix in (
-                ".scala", ".es", ".sbt", ".conf", ".py", ".patch", ".properties"):
+                ".scala", ".es", ".sbt", ".conf", ".py", ".patch", ".properties", ".md", ".json"):
             digest.update(name.encode("utf-8") + b"\0" + path.read_bytes() + b"\0")
     return digest.hexdigest()
+
+
+def scala_test_count(text, commands):
+    groups = [command for command in commands if "testOnly" in command]
+    counts = list(map(int, re.findall(r"Tests: succeeded (\d+)", text)))
+    for i, group in enumerate(groups):
+        if i >= len(counts) or counts[i] == 0:
+            raise RuntimeError(f"No tests succeeded for {group}")
+    if len(counts) != len(groups):
+        raise RuntimeError("Unexpected test summaries for " + "; ".join(groups))
+    return sum(counts)
+
+
+def python_test_count(text):
+    summary = re.search(r"^Ran (\d+) tests?\b", text, re.MULTILINE)
+    if not summary or int(summary.group(1)) == 0:
+        raise RuntimeError("No tests ran for Python unittest tools/rent-auction")
+    return int(summary.group(1))
+
+
+def verify_lithos_tree(checkout, patch):
+    head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout,
+                                   text=True).strip()
+    if head != LITHOS_BASE:
+        raise RuntimeError("Lithos checkout must be at the documented baseline")
+    status = subprocess.check_output(
+        ["git", "--no-optional-locks", "status", "--porcelain", "-z", "--untracked-files=all"],
+        cwd=checkout)
+    paths = set()
+    records = iter(status.decode().split("\0"))
+    for record in records:
+        if record:
+            paths.add(record[3:])
+            if "R" in record[:2] or "C" in record[:2]:
+                paths.add(next(records))
+    paths = {name for name in paths
+             if not {"target", ".bsp", ".idea"}.intersection(Path(name).parts)}
+    with tempfile.TemporaryDirectory(prefix="rent-auction-lithos-") as directory:
+        expected = Path(directory)
+        archive = subprocess.check_output(["git", "archive", LITHOS_BASE], cwd=checkout)
+        subprocess.run(["tar", "-x", "-C", directory], input=archive, check=True)
+        baseline_paths = {path.relative_to(expected).as_posix() for path in expected.rglob("*")
+                          if path.is_file() or path.is_symlink()}
+        patch_data = patch.read_bytes()
+        stats = subprocess.check_output(["git", "apply", "--numstat", "-z"],
+                                        input=patch_data, cwd=expected)
+        paths.update(record.split("\t", 2)[2] for record in stats.decode().split("\0") if record)
+        subprocess.run(["git", "apply", "-"], input=patch_data, cwd=expected, check=True)
+        paths.update(name for name in baseline_paths
+                     if not (expected / name).exists() and not (expected / name).is_symlink())
+
+        def contents(path):
+            if path.is_symlink():
+                return ("symlink", os.readlink(path))
+            if path.is_file():
+                return ("file", path.read_bytes())
+            return ("directory",) if path.exists() else None
+
+        mismatches = [name for name in sorted(paths)
+                      if contents(checkout / name) != contents(expected / name)]
+        if mismatches:
+            raise RuntimeError("Lithos tree differs from the submitted patch:\n" +
+                               "\n".join(mismatches))
 
 
 def run(command, cwd, log):
@@ -68,7 +134,8 @@ def main():
     args = parser.parse_args()
     logs = ROOT / "target/rent-auction-verification"
     logs.mkdir(parents=True, exist_ok=True)
-    initial_fingerprint = source_fingerprint()
+    regenerated = REGENERATED_VECTORS if args.assemble else ()
+    initial_fingerprint = source_fingerprint(exclude=regenerated)
     commands = [
         "set Test / parallelExecution := false",
         "ergoCore/testOnly *RentAuction*Spec org.ergoplatform.reemission.ReemissionRulesSpec",
@@ -83,6 +150,7 @@ def main():
     if generated_vectors.exists():
         shutil.rmtree(generated_vectors)
     node_text = run(sbt + commands, ROOT, logs / "node.log")
+    scala_count = scala_test_count(node_text, commands)
     vector_names = ("collect-request.json", "collect-plan.json")
     missing_vectors = [name for name in vector_names if not (generated_vectors / name).is_file()]
     if missing_vectors:
@@ -93,9 +161,9 @@ def main():
     report = {
         "createdUtc": datetime.now(timezone.utc).isoformat(),
         "nodeBaseline": "5528ef569a41ebccbc8658212e6ee3c97d990b96",
-        "scalaTestsPassed": sum(map(int, re.findall(r"Tests: succeeded (\d+)", node_text))),
+        "scalaTestsPassed": scala_count,
         "scalaTestsIgnored": sum(map(int, re.findall(r"ignored (\d+)", node_text))),
-        "pythonTestsPassed": int(re.search(r"Ran (\d+) tests", python_text).group(1)),
+        "pythonTestsPassed": python_test_count(python_text),
         "lithosTestsPassed": None,
         "lithosBaseline": LITHOS_BASE,
         "assemblyBuilt": args.assemble,
@@ -107,16 +175,12 @@ def main():
     }
     if args.lithos:
         checkout = args.lithos.resolve()
-        head = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=checkout,
-                                       text=True).strip()
-        if head != LITHOS_BASE:
-            raise RuntimeError("Lithos checkout must be at the documented baseline")
+        verify_lithos_tree(checkout, ROOT / "tools/rent-auction/lithos/lithos-rent-auction.patch")
         tests = "testOnly transactions.rent.AuctionRentSourceSpec " + \
                 "transactions.rent.StorageRentSourceSpec transactions.rent.StorageRentBuilderSpec"
         text = run(sbt + ['set Test / scalacOptions ++= Seq("-encoding", "UTF-8")', tests],
                    checkout, logs / "lithos.log")
-        report["lithosTestsPassed"] = sum(map(int,
-            re.findall(r"Tests: succeeded (\d+)", text)))
+        report["lithosTestsPassed"] = scala_test_count(text, [tests])
     if args.assemble:
         jar = max((ROOT / "target/scala-2.12").glob("ergo-*.jar"),
                   key=lambda p: p.stat().st_mtime)
@@ -136,9 +200,9 @@ def main():
             raise RuntimeError("Standalone JAR plan differs from the Scala test vector")
         report["standaloneCliMatchesScalaVector"] = True
     destination = ROOT / "docs/rent-auction/verification.json"
-    report["sourceFingerprintSha256"] = source_fingerprint()
-    if report["sourceFingerprintSha256"] != initial_fingerprint:
+    if source_fingerprint(exclude=regenerated) != initial_fingerprint:
         raise RuntimeError("Source changed during verification; rerun on a stable checkout")
+    report["sourceFingerprintSha256"] = source_fingerprint()
     destination.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
     print(f"Verified. Evidence: {destination}")
 

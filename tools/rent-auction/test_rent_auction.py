@@ -203,6 +203,7 @@ class WorkerBuilder:
         ins = [{"boxId": b["boxId"], "extension": {"0": "0400", "1": "0580897a", "2": "04d005"}}
                for b in inputs]
         out = box("successor-" + members[0]["boxId"], tree="reserve", created=request["height"])
+        out["assets"] = [{"tokenId": "nft", "amount": 1}]
         signed = {"id": members[0]["boxId"] + str(request["height"]),
                   "inputs": [{"boxId": i["boxId"], "spendingProof": {
                       "proofBytes": "", "extension": i["extension"]}} for i in ins], "outputs": [out]}
@@ -340,6 +341,32 @@ class BatchTests(unittest.TestCase):
         result = ra.merge_due(node, self.index, builder, self.directory.name)
         self.assertEqual(len(result[1]["deferred"]), 2)
         self.assertEqual(len([r for r in builder.requests if r["action"] == "merge"]), 1)
+
+    def test_merge_successor_invalid_tree_or_nft_defers_remaining_deposits(self):
+        invalid = [
+            {"ergoTree": "other"},
+            {"assets": []},
+            {"assets": [{"tokenId": "other", "amount": 1}]},
+            {"assets": [{"tokenId": "nft", "amount": 2}]},
+            {"assets": [{"tokenId": "other", "amount": 1}, {"tokenId": "nft", "amount": 1}]},
+        ]
+        for replacement in invalid:
+            with self.subTest(replacement=replacement):
+                node, builder = self.deposits(12)
+                run = builder.run
+
+                def build(command, request=None):
+                    plan = run(command, request)
+                    if request and request["action"] == "merge":
+                        plan["outputBoxes"][0].update(replacement)
+                    return plan
+
+                with patch.object(builder, "run", side_effect=build):
+                    result = ra.merge_due(node, self.index, builder, self.directory.name, execute=True)
+                self.assertEqual(result[1]["deferred"], [f"{10:064x}", f"{11:064x}"])
+                self.assertIn("invalid reserve successor", result[1]["reason"])
+                self.assertEqual(len([r for r in builder.requests if r["action"] == "merge"]), 1)
+                self.assertEqual(len([c for c in node.calls if c[0] == "/transactions"]), 1)
 
     def test_spent_reserve_reports_producer_rebuild(self):
         node, builder = self.deposits(2)

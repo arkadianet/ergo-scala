@@ -30,6 +30,20 @@ def git(*args):
     return subprocess.check_output(["git", *args], cwd=ROOT)
 
 
+def packaged_files(root):
+    tracked = subprocess.check_output(["git", "ls-files", "-z"], cwd=root)
+    return sorted((set(tracked.decode().split("\0")) - {""}) | set(NEW_FILES))
+
+
+def reject_untracked(root):
+    output = subprocess.check_output(
+        ["git", "ls-files", "--others", "--exclude-standard", "-z", "--", *NEW_ROOTS],
+        cwd=root)
+    names = sorted(name for name in output.decode().split("\0") if name)
+    if names:
+        raise RuntimeError("Untracked package inputs:\n" + "\n".join(names))
+
+
 def new_file_patch(name):
     text = (ROOT / name).read_text(encoding="utf-8")
     lines = text.splitlines()
@@ -45,6 +59,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--with-jar", action="store_true")
     args = parser.parse_args()
+    reject_untracked(ROOT)
     if subprocess.run(["git", "merge-base", "--is-ancestor", BASE, "HEAD"],
                       cwd=ROOT, check=False).returncode:
         raise RuntimeError("Packaging requires a checkout descended from the pinned baseline")
@@ -56,15 +71,9 @@ def main():
     if report.get("sourceFingerprintSha256") != source_fingerprint():
         raise RuntimeError("Source changed after verification; rerun verify.py")
     tracked = set(git("ls-files", "-z").decode().split("\0")) - {""}
-    owned = set(NEW_FILES)
-    for root in NEW_ROOTS:
-        for path in (ROOT / root).rglob("*"):
-            if path.is_file() and "__pycache__" not in path.parts and \
-                    path.suffix not in (".sqlite", ".db", ".pyc"):
-                owned.add(path.relative_to(ROOT).as_posix())
-    files = sorted(tracked | owned)
+    files = packaged_files(ROOT)
     patch = git("diff", "--binary", BASE, "--")
-    patch += b"".join(new_file_patch(name) for name in sorted(owned - tracked))
+    patch += b"".join(new_file_patch(name) for name in sorted(set(NEW_FILES) - tracked))
     destination = ROOT / "dist"
     destination.mkdir(exist_ok=True)
     node_patch = destination / "rent-auction-node.patch"

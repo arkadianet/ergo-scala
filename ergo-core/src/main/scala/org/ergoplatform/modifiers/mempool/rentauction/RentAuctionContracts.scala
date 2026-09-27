@@ -32,7 +32,10 @@ final class RentAuctionContracts(val chain: ChainSettings) {
     Base64.getEncoder.encodeToString(bytes)
 
   private def compile(name: String, replacements: Map[String, String]): ErgoTree = {
-    val resource = Source.fromResource(s"rent-auction/$name.es")
+    val path = s"rent-auction/$name.es"
+    val stream = getClass.getClassLoader.getResourceAsStream(path)
+    require(stream != null, s"Missing contract resource $path")
+    val resource = Source.fromInputStream(stream, "UTF-8")
     val source = try resource.mkString finally resource.close()
     val code = replacements.foldLeft(source) { case (text, (key, value)) =>
       text.replace(s"__${key}__", value)

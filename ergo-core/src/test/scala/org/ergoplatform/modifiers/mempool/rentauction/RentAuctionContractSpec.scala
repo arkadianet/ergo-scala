@@ -16,6 +16,7 @@ import sigma.interpreter.ProverResult
 class RentAuctionContractSpec extends ErgoCorePropertyTest with RentAuctionFixture {
   import RentAuctionContracts.INCREMENT
   import RentAuctionContracts.MAXIMUM_WINDOW
+  import RentAuctionContracts.MAX_PARTY_BYTES
   import RentAuctionContracts.MERGE_BUDGET
   import RentAuctionContracts.MINIMUM_BID
   import RentAuctionContracts.WINDOW
@@ -39,6 +40,16 @@ class RentAuctionContractSpec extends ErgoCorePropertyTest with RentAuctionFixtu
     chain.isMainnet shouldBe true
     chain.reemission.checkReemissionRules shouldBe true
     params.blockVersion shouldBe 4
+  }
+
+  property("protected contract trees exceed the party-script limit") {
+    // An R7 recipient or R9 collector equal to a protected tree invalidates every later
+    // bid and close, permanently freezing the lot and seed while protected boxes are
+    // rent-immune. validRecipient admits any canonical script up to MAX_PARTY_BYTES;
+    // this length margin excludes all protected trees.
+    Seq(contracts.auction, contracts.deposit, contracts.reserve).foreach { tree =>
+      tree.bytes.length should be > MAX_PARTY_BYTES
+    }
   }
 
   property("ordinary token-free funding passes full node transaction validation") {
@@ -89,7 +100,7 @@ class RentAuctionContractSpec extends ErgoCorePropertyTest with RentAuctionFixtu
     val next = outs.head
     val wrongLot = new ErgoBoxCandidate(
       next.value, next.ergoTree, height, next.additionalTokens,
-      next.additionalRegisters.updated(ErgoBox.R4,
+      next.additionalRegisters ++ Map(ErgoBox.R4 ->
         ByteArrayConstant(Array.fill(32)(1.toByte)))
     )
     rejects(spend.withOutputs(outs.updated(0, wrongLot)))
@@ -110,8 +121,8 @@ class RentAuctionContractSpec extends ErgoCorePropertyTest with RentAuctionFixtu
     val wrong = new ErgoBoxCandidate(
       late.tx.outputCandidates.head.value, contracts.auction, end - 1,
       late.tx.outputCandidates.head.additionalTokens,
-      late.tx.outputCandidates.head.additionalRegisters.updated(
-        ErgoBox.R5, IntArrayConstant(Array(end, cap))
+      late.tx.outputCandidates.head.additionalRegisters ++ Map(
+        ErgoBox.R5 -> IntArrayConstant(Array(end, cap))
       )
     )
     rejects(late.withOutputs(late.tx.outputCandidates.updated(0, wrong)))
@@ -172,7 +183,7 @@ class RentAuctionContractSpec extends ErgoCorePropertyTest with RentAuctionFixtu
     val in = spend.tx.inputs(1)
     in.spendingProof.extension.values.keySet shouldBe Set(0.toByte, 1.toByte, 2.toByte)
     val sharing = Input(in.boxId, ProverResult(in.spendingProof.proof,
-      ContextExtension(in.spendingProof.extension.values.updated(0.toByte, IntConstant(0)))))
+      ContextExtension(in.spendingProof.extension.values ++ Map(0.toByte -> IntConstant(0)))))
     // Only the second input's payout index changes. Prices, fees, tags and outputs stay valid.
     val tx = ErgoTransaction(spend.tx.inputs.updated(1, sharing), spend.tx.outputCandidates)
     val shared = Spend(tx, spend.boxes, spend.at)
@@ -185,7 +196,7 @@ class RentAuctionContractSpec extends ErgoCorePropertyTest with RentAuctionFixtu
     val spend = bidSpend(lot(), MINIMUM_BID)
     val next = spend.tx.outputCandidates.head
     val malformed = new ErgoBoxCandidate(next.value, next.ergoTree, height,
-      next.additionalTokens, next.additionalRegisters.updated(ErgoBox.R6, IntConstant(5)))
+      next.additionalTokens, next.additionalRegisters ++ Map(ErgoBox.R6 -> IntConstant(5)))
     rejects(spend.withOutputs(spend.tx.outputCandidates.updated(0, malformed)))
   }
 }
