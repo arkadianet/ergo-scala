@@ -79,7 +79,15 @@ def main():
     if args.assemble:
         commands.append("assembly")
     sbt = launcher(args.sbt_launcher)
+    generated_vectors = ROOT / "target/rent-auction-vectors"
+    if generated_vectors.exists():
+        shutil.rmtree(generated_vectors)
     node_text = run(sbt + commands, ROOT, logs / "node.log")
+    vector_names = ("collect-request.json", "collect-plan.json")
+    missing_vectors = [name for name in vector_names if not (generated_vectors / name).is_file()]
+    if missing_vectors:
+        raise RuntimeError("RentAuctionCliSpec did not generate fresh verification vectors in "
+                           f"{generated_vectors}: missing {', '.join(missing_vectors)}")
     python_text = run([sys.executable, "-m", "unittest", "discover", "-s",
                        "tools/rent-auction", "-v"], ROOT, logs / "python.log")
     report = {
@@ -119,8 +127,8 @@ def main():
         cli = ["java", "-cp", str(jar), "org.ergoplatform.tools.RentAuctionCli"]
         run(cli + ["manifest", "mainnet", str(vectors / "mainnet-contracts.json")],
             ROOT, logs / "cli-manifest.log")
-        for name in ("collect-request.json", "collect-plan.json"):
-            shutil.copy2(ROOT / "target/rent-auction-vectors" / name, vectors / name)
+        for name in vector_names:
+            shutil.copy2(generated_vectors / name, vectors / name)
         run(cli + ["prepare", "mainnet", str(logs / "collect-plan.json"),
                    str(vectors / "collect-request.json")], ROOT, logs / "cli-prepare.log")
         if json.loads((logs / "collect-plan.json").read_text()) != \
