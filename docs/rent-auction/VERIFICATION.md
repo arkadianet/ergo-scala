@@ -31,13 +31,13 @@ vector. It also checks that the source fingerprint did not change during the run
 | Component | Selected result | Scope |
 | --- | ---: | --- |
 | ergoCore rent-auction + `ReemissionRulesSpec` | 44 passed; 1 pre-existing ignored | Baseline, contracts, rules, builders, serializer envelopes |
-| Root rent-auction + `ExpirationSpecification` | 48 passed | Activated execution, state, CLI vectors and economics |
+| Root rent-auction + `ExpirationSpecification` | 50 passed | Activated execution, state, CLI vectors and economics |
 | `ErgoProvingInterpreterSpec` | 4 passed | Existing signing regressions |
 | Candidate and wallet-service suites | 47 passed | `CandidateGeneratorSpec`, `CandidateGeneratorPropSpec`, `ErgoWalletServiceSpec` |
 | Python operator suites | 31 passed | Index, batching, stale rebuilds and HTTP transport |
 | Patched Lithos rent suites | 41 passed | 6 adapter tests and 35 existing rent tests |
 
-Total supplied by the reviewer: **215 passed, 1 pre-existing ignored**. The command
+Total in `verification.json`: **217 passed, 1 pre-existing ignored**. The command
 set is in `verify.py`; the machine-readable report remains the run authority.
 This selection does not cover the entire repository matrix, Docker integration
 suites or mainnet bootstrap/replay. Expected-negative cases may log validation

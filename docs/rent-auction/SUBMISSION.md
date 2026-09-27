@@ -28,7 +28,7 @@ Suggested description:
 > compatibility with any separate EIP-48 activation. The comparison with EIP-0051
 > acknowledges that it also does not require consensus price discovery.
 >
-> The reviewer's last clean selected runs report 215 passed and one pre-existing
+> The regenerated verification report records 217 passed and one pre-existing
 > ignored test. The regenerated machine-readable report is authoritative for an
 > artifact. This is a reference implementation, not activation or an independent audit.
 
@@ -54,7 +54,7 @@ Suggested description:
 > redemption. It adds no new script version or assigned mainnet activation. CLI,
 > indexer, transaction builders and reproduction instructions ship with the EIP.
 >
-> Reviewer-reported selected results: core 44 plus one ignored, root 48, prover 4,
+> Reviewer-reported selected results: core 44 plus one ignored, root 50, prover 4,
 > candidate/wallet 47, Python 31 and patched Lithos 41. Persistent tests use synthetic
 > UTXO snapshots and fake PoW. Regenerate `docs/rent-auction/verification.json` for
 > exact commands and artifact identity; this description does not certify a stale report.
