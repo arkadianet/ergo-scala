@@ -175,9 +175,9 @@ final case class ErgoSyncTracker(networkSettings: NetworkSettings) extends Score
     * Return the peers to which this node should send a sync signal, including:
     * outdated peers, if any, otherwise, all the peers with unknown status plus a random peer with
     * `Older` status.
-    * Updates lastSyncSentTime for all returned peers as a side effect
+    * Updates lastSyncSentTime for returned peers unless the caller records actual emissions.
     */
-  def peersToSyncWith(): IndexedSeq[ConnectedPeer] = {
+  def peersToSyncWith(markSent: Boolean = true): IndexedSeq[ConnectedPeer] = {
     clearOldStatuses()
     val outdated = outdatedPeers
     val peers =
@@ -200,7 +200,7 @@ final case class ErgoSyncTracker(networkSettings: NetworkSettings) extends Score
         }.map(_._1)
       }
 
-    peers.foreach(updateLastSyncSentTime)
+    if (markSent) peers.foreach(updateLastSyncSentTime)
     peers
   }
 

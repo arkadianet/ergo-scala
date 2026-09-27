@@ -2165,7 +2165,11 @@ class ErgoNodeViewSynchronizerSpecification
       invData.typeId shouldBe BlockTransactions.modifierTypeId
       invData.ids shouldBe Seq(oba.header.transactionsId)
 
-      // No OBA announcement should be sent to the peer far behind.
+      // Applying the announcement refreshes its supplier, but does not relay to the distant peer.
+      val refresh = ncProbe.expectMsgClass(classOf[SendToNetwork])
+      refresh.message.spec shouldBe ErgoSyncInfoMessageSpec
+      refresh.sendingStrategy shouldBe scorex.core.network.SendToPeer(peer)
+      refresh.message.data.get.asInstanceOf[ErgoSyncInfoV2].lastHeaders.head.id shouldBe oba.header.id
       ncProbe.expectNoMessage(300.millis)
     }
   }
@@ -2230,7 +2234,11 @@ class ErgoNodeViewSynchronizerSpecification
       invData.typeId shouldBe BlockTransactions.modifierTypeId
       invData.ids shouldBe Seq(oba.header.transactionsId)
 
-      // No OBA announcement should be sent to the peer far ahead.
+      // Applying the announcement refreshes its supplier, but does not relay to the distant peer.
+      val refresh = ncProbe.expectMsgClass(classOf[SendToNetwork])
+      refresh.message.spec shouldBe ErgoSyncInfoMessageSpec
+      refresh.sendingStrategy shouldBe scorex.core.network.SendToPeer(peer)
+      refresh.message.data.get.asInstanceOf[ErgoSyncInfoV2].lastHeaders.head.id shouldBe oba.header.id
       ncProbe.expectNoMessage(300.millis)
     }
   }
