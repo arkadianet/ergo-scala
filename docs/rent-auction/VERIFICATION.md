@@ -24,21 +24,34 @@ Before sbt, the verifier deletes `target/rent-auction-vectors/`. `RentAuctionCli
 must recreate `collect-request.json` and `collect-plan.json`; a missing file is an
 error even if sbt exits successfully. With assembly enabled, the verifier generates
 the mainnet manifest and requires the standalone JAR's plan to equal the Scala
-vector. It also checks that the source fingerprint did not change during the run.
+vector. The fingerprint covers submitted documentation and vectors as well as code;
+it excludes the report itself. The stability check allows the three vectors to be
+regenerated during an assembly run, then fingerprints their final contents.
+Packaging rejects changes to those inputs after verification.
+
+Every selected test group must run at least one test; zero or missing counts stop
+verification. The Lithos checkout must equal its pinned baseline plus the submitted
+patch, apart from ignored files, build output and application logs. A matching base
+commit alone is insufficient.
 
 ## Selected suites
 
-| Component | Selected result | Scope |
-| --- | ---: | --- |
-| ergoCore rent-auction + `ReemissionRulesSpec` | 44 passed; 1 pre-existing ignored | Baseline, contracts, rules, builders, serializer envelopes |
-| Root rent-auction + `ExpirationSpecification` | 50 passed | Activated execution, state, CLI vectors and economics |
-| `ErgoProvingInterpreterSpec` | 4 passed | Existing signing regressions |
-| Candidate and wallet-service suites | 47 passed | `CandidateGeneratorSpec`, `CandidateGeneratorPropSpec`, `ErgoWalletServiceSpec` |
-| Python operator suites | 31 passed | Index, batching, stale rebuilds and HTTP transport |
-| Patched Lithos rent suites | 41 passed | 6 adapter tests and 35 existing rent tests |
+| Group | Result |
+| --- | --- |
+| ergoCore rent-auction + `ReemissionRulesSpec` | 45 passed; 1 pre-existing ignored |
+| Root rent-auction + `ExpirationSpecification` | 60 passed |
+| ergoWallet `ErgoProvingInterpreterSpec` | 4 passed |
+| Candidate and wallet-service suites | 49 passed |
+| Python operator suites | 64 passed |
+| Patched Lithos rent suites | 41 passed (6 adapter + 35 existing rent tests) |
 
-Total in `verification.json`: **217 passed, 1 pre-existing ignored**. The command
-set is in `verify.py`; the machine-readable report remains the run authority.
+Total in `verification.json`: **263 passed (Scala 158, Python 64, Lithos 41),
+1 pre-existing ignored**. The command set is in `verify.py`; the machine-readable
+report remains the run authority. The candidate and wallet-service group selects
+`CandidateGeneratorSpec`, `CandidateGeneratorPropSpec` and `ErgoWalletServiceSpec`.
+The reviewer also reports `ergoCore/test` and `ergoWallet/test` passing on Scala
+2.11.12, 2.12.20 and 2.13.18, the CI matrix. Those full runs are separate from the
+selected total.
 This selection does not cover the entire repository matrix, Docker integration
 suites or mainnet bootstrap/replay. Expected-negative cases may log validation
 errors; suite outcomes determine success.
@@ -64,6 +77,10 @@ deposit tree. Full trees, fee/reserve scripts and NFT belong in the regenerated
 [manifest](vectors/mainnet-contracts.json). Changes to constants or compiler
 versions require reviewing new identities and regenerating vectors.
 
+Contract bytes and hashes are unchanged. The regenerated vectors differ only by
+`parameters.disabledRules: []` in the collection request and `votingLength: 1024`
+in the manifest; the collection plan is unchanged.
+
 ## What the tests establish
 
 Consensus evidence uses native `ErgoTransaction.statefulValidity` and, for the new
@@ -74,14 +91,23 @@ supporting evidence, not proof of full transaction or block validity.
 
 * **Baseline behavior:** `RentAuctionBaselineSpec` covers funded recreation aliasing,
   malformed Short witnesses, inclusive age, owner spending and both wrapped-Int fee
-  regions. `ExpirationSpecification` supplies the existing rent regressions.
+  regions. `RentAuctionV2Spec` pins the exact 1,717/1,718 and 3,435/3,436-byte wrap
+  boundaries at the default factor, including native acceptance of more valuable
+  recreations and rejection of token stripping. `ExpirationSpecification` supplies
+  the existing rent regressions.
 * **Opening and bundling:** `RentAuctionV2Spec` covers same-ID aggregation, explicit
   partitions, dense sources, exact commitments, source requirements, seed minimum,
   token-entry cap and token-free funding/change. It excludes funded recreations
-  from fresh lots and from the beneficiary payment.
+  from fresh lots and from the beneficiary payment. Only fresh beneficiary outputs
+  count; unrelated older payments remain valid, including with rule 124 disabled.
 * **EIP-27 and protected state:** `RentAuctionV2Spec` checks accounting-token burns
-  with separate native payment and rejects rent bypass through well-formed auction,
-  deposit and authentic reserve boxes. Malformed imitations retain the normal path.
+  with separate, freshly dated native payments and auctions those tokens when rule
+  123 is disabled. Funded accounting-token tests check builder refusal and native
+  rejection when redemption triggers, plus the 100,000 ERG boundary and larger
+  inputs alone or mixed with a triggering input. Rent bypass through well-formed
+  auctions, deposits and authentic reserve boxes is rejected. Malformed imitations
+  retain the normal path. `RentAuctionContractSpec` pins all three protected trees
+  above the 256-byte party-script limit.
 * **Bids:** `RentAuctionContractSpec` and `RentAuctionV2Spec` cover full refunds,
   preserved lot state, minimum/increment rejection, recipient parsing, bounded
   deadlines and refund creation height. `RentAuctionParameterSpec` covers Int limits.
@@ -91,7 +117,7 @@ supporting evidence, not proof of full transaction or block validity.
   and shared obligations even when native validation alone would allow them.
 * **Dust and envelopes:** `RentAuctionParameterSpec` serializes maximum-width return,
   winner, deposit, successor and fee boxes. `RentAuctionV2Spec` executes lifecycles at
-  byte prices 360 and 10,000, including a vote after opening, invalid 0.001 ERG fees,
+  byte prices 0, 360 and 10,000, including a vote after opening, invalid 0.001 ERG fees,
   and singleton merges needing sponsorship at the high price.
 * **Reserve accounting:** `RentAuctionDepositSpec` and `RentAuctionV2Spec` cover exact
   principal increases, multiple deposits, authentic reserve selection, fee limits,
@@ -102,18 +128,28 @@ supporting evidence, not proof of full transaction or block validity.
 * **Persistent integration:** `RentAuctionStateSpec` applies collection to UTXO and
   digest state, rejects missing attestation, rolls back and reapplies. It checks
   mempool rejection, producer candidate admission, beneficiary matching and cost limits.
+  Its two-block extension property rejects missing, inherited and extraneous rent
+  fields in the second block in both states. Unresolved inputs retain native errors.
 * **Builders and vectors:** `RentAuctionBuilderSpec` checks lifecycle builders and
   wallet signing with an empty rent proof. `RentAuctionCliSpec` checks schema-2
-  plans, context variables and token quantities, and generates fixed four-source,
-  two-lot vectors with a P2PK collector. The standalone comparison is a verifier gate.
+  plans, context variables, token quantities, explicit disabled-rule status and its
+  ID validation, rule-123-disabled auctions, and manifest `votingLength`. It generates
+  fixed four-source, two-lot vectors with a P2PK collector. The standalone comparison
+  is a verifier gate. `ErgoWalletServiceSpec` builds a real epoch-boundary vote and
+  requires upcoming signing parameters; signing with the parent's parameters fails.
 * **Economics and timing:** `RentAuctionEconomicsSpec` checks 1/20/32-source lifecycle
   outcomes at both byte prices through native and activated validation. It measures
   the block-cost boundary, a 32-lot sale close and similarly sized plain controls.
   Results and assumptions are in [ECONOMICS.md](ECONOMICS.md) and [REVIEW.md](REVIEW.md).
 * **Operator transport:** `test_rent_auction.py` covers rollback, network isolation,
   batching, preserved extensions, stale rebuilds, unfunded merges and ambiguous
-  submission failures. `test_operator_http.py` checks live request replacement,
+  submission failures. It also checks explicit disabled-rule status, stale plans
+  after status changes, voting-boundary deferral and reserve successor tree/NFT
+  checks. `test_operator_http.py` checks live request replacement,
   signing/candidate payloads, height-bound queues and check-before-broadcast.
+* **Verification gates:** `test_verification.py` checks tracked package inputs,
+  documentation/vector fingerprints, exact patched Lithos contents and positive
+  test counts for every selected group.
 * **Lithos transport:** patched `AuctionRentSourceSpec` checks schema-2 queue admission,
   exact JSON preservation, repeated serialized Short witnesses, R9, stale height,
   budgets and malformed entries. Its fixture comes from native- and activated-

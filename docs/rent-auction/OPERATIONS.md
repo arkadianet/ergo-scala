@@ -47,6 +47,13 @@ operator. That config must include the matching network parameters and reserve N
 The mainnet and testnet CLI profiles use their actual native reserve scripts/NFTs;
 their availability does not enable the feature on those networks.
 
+Activate EIP-27 before rent auctions on a custom network. Otherwise accounting
+tokens in lots created before redemption activates can become impossible to bid
+on or close. After auction activation, a node configured with a checkpoint does
+not skip transaction validation below it: rent-auction rules and scripts are
+always checked. Synchronisation below the checkpoint is therefore slower for
+activated blocks.
+
 ## Connection, manifests and amounts
 
 Set `ERGO_API_KEY` in the environment for authenticated operations. API keys are
@@ -56,12 +63,21 @@ needed to sign owned funding inputs. Remote connections carrying an API key requ
 HTTPS; localhost HTTP is supported.
 
 ```
-python tools/rent-auction/rent_auction.py --jar NODE.jar manifest
-python tools/rent-auction/rent_auction.py --node http://127.0.0.1:9053 --db rent.sqlite sync
-python tools/rent-auction/rent_auction.py --jar NODE.jar --db rent.sqlite rent-candidates
+python tools/rent-auction/rent_auction.py --disabled-rules none \
+  --jar NODE.jar manifest
+python tools/rent-auction/rent_auction.py --disabled-rules none \
+  --node http://127.0.0.1:9053 --db rent.sqlite sync
+python tools/rent-auction/rent_auction.py --disabled-rules none \
+  --jar NODE.jar --db rent.sqlite rent-candidates
 ```
 
-Global options (`--node`, `--jar`, `--network`, `--db`) go before the subcommand.
+Global options (`--node`, `--jar`, `--network`, `--db`, `--disabled-rules`) go before
+the subcommand. Every invocation requires `--disabled-rules none` or a comma-separated
+list of validation rule IDs disabled on the network, such as `--disabled-rules 123`.
+Only rule 123 changes builder behavior. The node API does not report disabled rules,
+so the operator must state them. `none` is correct on mainnet while rule 123 is active;
+update the option if a validation-settings vote changes the network's rule status.
+
 Amounts in JSON are integer nanoERG. Token quantities are integer Long values and
 must not pass through a JavaScript floating-point conversion. Scripts are ErgoTree
 hex, not Ergo addresses. Convert wallet addresses to their locking scripts before
@@ -96,16 +112,26 @@ Create `collect.json` using real unspent source and funding IDs:
 ```
 
 ```
-python tools/rent-auction/rent_auction.py --jar NODE.jar prepare collect.json collect-plan.json
-python tools/rent-auction/rent_auction.py sign collect-plan.json collect-signed.json
-python tools/rent-auction/rent_auction.py candidate collect-signed.json --miner-pk HEADER_PUBLIC_KEY
+python tools/rent-auction/rent_auction.py --disabled-rules none \
+  --jar NODE.jar prepare collect.json collect-plan.json
+python tools/rent-auction/rent_auction.py --disabled-rules none \
+  sign collect-plan.json collect-signed.json
+python tools/rent-auction/rent_auction.py --disabled-rules none \
+  candidate collect-signed.json --miner-pk HEADER_PUBLIC_KEY
 ```
 
-The live wrapper supplies next-block height and current storage/dust parameters;
-offline values in the request cannot override them. It resolves IDs into complete
-boxes and invokes the Scala builder. Requests and plans use schema 2. `collector`
-is required; it fixes the seed-return script in R9. It may equal the beneficiary,
-but the producer's beneficiary commitment is unchanged.
+The live wrapper supplies next-block height, current storage/dust parameters and
+operator-stated disabled rules; offline values in the request cannot override them.
+It resolves IDs into complete boxes and invokes the Scala builder. Requests and
+plans use schema 2. `collector` is required; it fixes the seed-return script in R9.
+It may equal the beneficiary, but the producer's beneficiary commitment is unchanged.
+
+The manifest reports the network's `votingLength`. Live preparation and workers
+defer when the target height satisfies `height % votingLength == 0`, because
+parameters can change at that voting-epoch boundary. Retry at the next block.
+The wrapper records the voting length and parameter snapshot in the plan. Before
+signing or queueing, it checks the target height against that voting length and
+rechecks height, parameters and the operator-stated rule status.
 
 The builder aggregates auctionable tokens across fully consumed sources, sorts by
 token ID and packs up to 32 distinct entries per lot. The R4 commitment covers all
@@ -125,6 +151,20 @@ An optional integer `seed` sets R8 principal for every lot, subject to the node 
 it excludes the separate 2,000,000 nanoERG close allowance. Omitting `seed` lets the
 builder size it from the serializer envelope and active byte price.
 
+The builder refuses an entire collection containing a non-positive wrapped rent
+charge. At the default storage factor 1,250,000 this affects serialized sizes
+1,718–3,435 bytes; collecting those boxes requires a recreation worth more than
+the input, and their tokens cannot enter lots at that factor. Remove such sources
+before rebuilding. See the EIP's [Activation and scope](EIP-XXXX.md#activation-and-scope)
+for the vote-dependent bands and small positive charges above 3,435 bytes.
+
+It also refuses a funded source holding the accounting token when native EIP-27
+redemption triggers: recreation must preserve the token, while redemption forbids
+it in any output. With EIP-27 checks enabled, above activation and rule 123 active,
+any accounting-token input of at most 100,000 ERG triggers redemption. Larger
+funded inputs do not trigger it alone but cannot join a triggering collection.
+If rule 123 is disabled, the token is treated like any other auctionable token.
+
 Inspect the plan before signing: source IDs, lots, token quantities, beneficiary,
 collector, seed principal, allowance, fees, funding and change are explicit.
 Variable 127 remains a serialized Short rent witness. Fully consumed inputs may
@@ -135,8 +175,9 @@ The header public key is optional for a conventional node and is the lender/cust
 key when using the matching Lithos flow. The node may filter a submitted transaction;
 check its inclusion proof and eventual confirmation.
 
-Rebuild after a tip change. Required auction and recreation heights are exact.
-Do not automatically use an old signed collection at a new height.
+Rebuild after a tip change. Lots, recreations and counted beneficiary payments
+must use the target height, as must triggered redemption payments. Do not
+automatically use an old signed collection at a new height.
 
 ## Bid
 
@@ -154,9 +195,12 @@ Do not automatically use an old signed collection at a new height.
 ```
 
 ```
-python tools/rent-auction/rent_auction.py --jar NODE.jar prepare bid.json bid-plan.json
-python tools/rent-auction/rent_auction.py sign bid-plan.json bid-signed.json
-python tools/rent-auction/rent_auction.py broadcast bid-signed.json
+python tools/rent-auction/rent_auction.py --disabled-rules none \
+  --jar NODE.jar prepare bid.json bid-plan.json
+python tools/rent-auction/rent_auction.py --disabled-rules none \
+  sign bid-plan.json bid-signed.json
+python tools/rent-auction/rent_auction.py --disabled-rules none \
+  broadcast bid-signed.json
 ```
 
 The minimum gross bid is 50,000,000 nanoERG and the minimum improvement is
@@ -190,7 +234,8 @@ assigned to the earliest inputs. The seed and unused allowance return to R9.
 For a one-pass scan:
 
 ```
-python tools/rent-auction/rent_auction.py --jar NODE.jar --db rent.sqlite settle-due
+python tools/rent-auction/rent_auction.py --disabled-rules none \
+  --jar NODE.jar --db rent.sqlite settle-due
 ```
 
 The worker command retains the name `settle-due`; the transaction action is `close`.
@@ -206,9 +251,15 @@ Without `--fee`, live close preparation uses 1,000,000 nanoERG at byte prices up
 360 and 2,000,000 above that. The total close fee may not exceed 2,000,000. Fee
 allocation comes from the allowances; it does not give the closer a bounty.
 
-The workers rebuild for changed height or storage/dust parameters and remove spent
-members before rebuilding the remaining batch. Repeated stale preparation is bounded
-to three attempts. Plans are saved before submission. A failure after submission
+The workers admit only auction and deposit boxes whose shape the node rules accept;
+`inspect` reports `auctionShape` and `depositShape`, so malformed boxes created with
+the published trees before activation are skipped. If the builder rejects a batch
+while preparing it, the worker splits the batch and reports and drops a single
+failing box instead of stopping. The workers rebuild for changed height,
+storage/dust parameters or stated disabled rules and remove spent members before
+rebuilding the remaining batch. Repeated
+stale preparation is bounded to three attempts. Plans are saved before submission.
+A failure after submission
 may have an ambiguous outcome; the worker does not automatically retry that broadcast.
 Check the saved transaction ID before retrying. Workers do not auto-bid or select
 extra wallet funding.
@@ -241,13 +292,15 @@ the submitter. Before re-emission, a merge funded by its budgets costs a volunte
 no ERG, although it pays no private reward.
 
 ```
-python tools/rent-auction/rent_auction.py --jar NODE.jar --db rent.sqlite merge-due
+python tools/rent-auction/rent_auction.py --disabled-rules none \
+  --jar NODE.jar --db rent.sqlite merge-due
 ```
 
 Without `--execute`, this writes the first batch's plan under `merges/`; later
 batches depend on its new reserve output. With `--execute`, it submits successive
-batches using the updated reserve output. IDs are sorted and batches avoid leaving
-a singleton when splitting into two funded batches can consume the same set.
+batches using the updated reserve output after checking its tree and authentic NFT.
+IDs are sorted and batches avoid leaving a singleton when splitting into two
+funded batches can consume the same set.
 At byte price 10,000 a singleton budget cannot fund fee dust. The worker reports
 `unfunded`, the deposit IDs and their `mergeBudget`; wait for more deposits or
 prepare a merge with an explicit sponsor. Other pending work is reported as
@@ -271,7 +324,8 @@ Follow [the adapter instructions](../../tools/rent-auction/lithos/README.md).
 After preparing and signing one collection batch for the next height:
 
 ```
-python tools/rent-auction/rent_auction.py lithos-queue collect-plan.json collect-signed.json /path/to/lithos-rent-queue
+python tools/rent-auction/rent_auction.py --disabled-rules none \
+  lithos-queue collect-plan.json collect-signed.json /path/to/lithos-rent-queue
 ```
 
 This atomically writes a schema-2 `HEIGHT.json` envelope with `height` and one
@@ -294,7 +348,10 @@ java -cp NODE.jar org.ergoplatform.tools.RentAuctionCli prepare mainnet plan.jso
 ```
 
 Offline requests supply full box JSON, exact `height`, and `parameters` containing
-`storageFeeFactor` and `minValuePerByte`. The live wrapper normally supplies these.
+`storageFeeFactor`, `minValuePerByte` and the required `disabledRules` array (`[]`
+when none are disabled). Rule IDs must be distinct, known and disableable.
+The live wrapper normally supplies these values, taking rule status from
+`--disabled-rules`. Only rule 123 affects builder behavior.
 The `inspect` action reports native serialized box size, wrapped charge, age,
 auction/deposit type, bid, deadline, seed principal, collector and collection
 commitment. It does not report token prices. The offline CLI defaults to a 0.001 ERG
@@ -304,5 +361,6 @@ fee; supply a spendable fee explicitly when using a higher byte price.
 Scala test examples, **not live UTXOs**. `RentAuctionCliSpec` now generates four
 fully consumed sources, two lots of two token entries, and a P2PK collector return.
 After a code change, regenerate these files through the verifier before using them
-as artifact evidence. `mainnet-contracts.json` records full trees, hashes, reserve NFT and draft parameters. Recompilation must reproduce the hashes
-before the same draft contracts are used.
+as artifact evidence. `mainnet-contracts.json` records full trees, hashes, reserve
+NFT, draft parameters and `votingLength` (1,024 on mainnet). Recompilation must
+reproduce the hashes before the same draft contracts are used.

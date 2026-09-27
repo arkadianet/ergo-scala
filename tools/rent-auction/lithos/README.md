@@ -43,10 +43,13 @@ The queue contains one `HEIGHT.json` envelope:
 }
 ```
 
-The transaction above is a schema illustration, not a valid claim. Generate the
-real file using `rent_auction.py lithos-queue PLAN SIGNED DIRECTORY`. That command
-requires a schema-2 plan, preserves proofs/extensions and writes atomically. Prepare
-collections with an explicit `collector` ErgoTree as well as `beneficiary` and
+The transaction above is a schema illustration, not a valid claim. Generate it with
+`rent_auction.py --disabled-rules none lithos-queue PLAN SIGNED DIRECTORY`.
+Every invocation requires `--disabled-rules none` or a comma-separated list of
+disabled validation rule IDs. The node API does not report them; `none` is correct
+on mainnet while rule 123 is active. That command requires a schema-2 plan,
+preserves proofs/extensions and writes atomically. Prepare collections with an
+explicit `collector` ErgoTree as well as `beneficiary` and
 `change`. The Scala builder bundles tokens across fully consumed sources by default;
 optional `lots` partitions can separate valuable tokens. The fresh lot records the
 collector in R9 and the collection commitment in R4. Repeated var-127 output indices
@@ -71,7 +74,9 @@ does not validate consensus independently and is not a substitute for node check
 Queue mode replaces the legacy collector when configured; remove the optional
 setting to use the unmodified legacy source on a network where auctions are not
 active. Do not use the legacy source after auction activation. Rebuild height-bound
-plans when the tip changes, and clean old queue files as an operator task.
+plans when the tip changes, and clean old queue files as an operator task. The
+operator defers preparation at voting-epoch boundary heights, using the manifest's
+`votingLength`; retry at the next block.
 
 Rent pays the configured recipient directly. This first adapter does not create
 Lithos `CapitalEntry` records or automatically put rent into holding top-ups. No

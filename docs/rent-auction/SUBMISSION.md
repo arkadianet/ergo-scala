@@ -28,9 +28,10 @@ Suggested description:
 > compatibility with any separate EIP-48 activation. The comparison with EIP-0051
 > acknowledges that it also does not require consensus price discovery.
 >
-> The regenerated verification report records 217 passed and one pre-existing
-> ignored test. The regenerated machine-readable report is authoritative for an
-> artifact. This is a reference implementation, not activation or an independent audit.
+> The verification total is 263 passed (Scala 158, Python 64, Lithos 41) and one
+> pre-existing ignored test. The regenerated machine-readable report is authoritative
+> for an artifact. This is a reference implementation, not activation or an
+> independent audit.
 
 Copy `EIP-XXXX.md` into the EIP repository under the filename agreed with its
 maintainers. Include the implementation URL when a review branch is published.
@@ -50,15 +51,36 @@ Suggested description:
 > costs enter a reserve-increase covenant. UTXO and digest validation, candidate
 > assembly, mempool policy and wallet signing follow the same activation setting.
 >
-> The implementation preserves current rent fee arithmetic and native EIP-27 debt
-> redemption. It adds no new script version or assigned mainnet activation. CLI,
-> indexer, transaction builders and reproduction instructions ship with the EIP.
+> Rent fee arithmetic is preserved, including `Int` wrapping and its disclosed size
+> bands; a non-wrapping repair is a separate, non-soft-fork change. The accounting-token
+> exception applies only with chain EIP-27 checks enabled, above its activation
+> height, and while rule 123 is active. Disabling that rule makes the token auctionable.
+> Beneficiary payments count only at the collection height; triggered redemption
+> payments must also use that height. The builder refuses funded accounting-token
+> sources when native redemption triggers. No new script version or mainnet activation
+> is assigned. CLI, indexer, builders and reproduction instructions ship with the EIP.
 >
-> Reviewer-reported selected results: core 44 plus one ignored, root 50, prover 4,
-> candidate/wallet 47, Python 31 and patched Lithos 41. Persistent tests use synthetic
+> Reviewer-reported selected results: core 45 plus one ignored, root 60, prover 4,
+> candidate/wallet 49, Python 64 and patched Lithos 41 (6 adapter + 35 existing rent
+> tests): 263 passed, including 158 Scala tests. `ergoCore/test` and `ergoWallet/test`
+> also pass on the
+> CI matrix of Scala 2.11.12, 2.12.20 and 2.13.18. Persistent tests use synthetic
 > UTXO snapshots and fake PoW. Regenerate `docs/rent-auction/verification.json` for
 > exact commands and artifact identity; this description does not certify a stale report.
 > See `ECONOMICS.md` for measured collection results and `REVIEW.md` for cost calibration.
+
+The selected regressions cover payment dates, live rule-123 status, funded
+accounting-token sources, exact wrap boundaries, byte price 0, protected-tree
+lengths, each block's own extension and upcoming wallet signing parameters.
+The CLI requires disabled-rule status; operator preparation defers at voting
+boundaries. The auction remains 991 bytes (Blake2b-256 `3643df8a` prefix) and the
+deposit 816 bytes, with unchanged hashes recorded in `VERIFICATION.md`.
+Regenerated vectors add only `parameters.disabledRules: []` to the request and
+`votingLength: 1024` to the manifest.
+
+`verify.py` fingerprints submitted docs and vectors, checks that Lithos equals
+its baseline plus the submitted patch, and requires every test group to run at
+least one test. Regenerate evidence after documentation changes before packaging.
 
 The patch targets node commit `5528ef569a41ebccbc8658212e6ee3c97d990b96` in the
 provided checkout. Rebase and reverify against the target upstream branch before

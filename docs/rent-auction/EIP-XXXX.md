@@ -58,10 +58,25 @@ proposal's rent rules when an input has an empty proof, is at least the existing
 in-range output. Classification follows the Scala interpreter's rent entry path;
 the existing interpreter must also accept the transaction.
 
-The current `Int * Int` storage-fee multiplication, including wrapping, is preserved.
-This draft does not implement EIP-48. A separate fee repair changes eligibility and
-must be specified, activated and tested independently. The supplied collector skips
-non-positive wrapped charges. Nodes still classify them using the baseline rules.
+The current `Int * Int` storage-fee multiplication is preserved, including wrapping.
+This draft does not implement EIP-48. The reference builder refuses a collection
+containing a non-positive wrapped charge. Nodes still classify those inputs using
+the baseline rules.
+
+At the default `storageFeeFactor` of 1,250,000, serialized sizes 1,718–3,435 bytes
+have non-positive wrapped charges: 1,718 of the 4,096 legal sizes, about 42%.
+Such inputs are never fully consumed, so their tokens cannot enter an auction
+through rent collection at that factor. Collecting one costs the collector the
+absolute charge: its funded recreation must be worth more than the input.
+Sizes 3,436–4,096 have small positive wrapped charges, from 32,704 to 825,032,704
+nanoERG, and pay a fraction of the unwrapped charge.
+
+The non-positive band moves with votes. There is none at factors 25,000–500,000;
+it covers sizes 4,091–4,096 at 525,000, and 859–1,717 plus 2,577–3,435 at the
+2,500,000 maximum. At factor 0 no box is ever charged. These bounds assume native
+box-size rule 120 remains active. A non-wrapping repair must make the interpreter
+accept spends it rejects under the current rule, so it is not a soft fork and is
+outside this draft; see [Backwards compatibility](#backwards-compatibility).
 
 ## Draft constants
 
@@ -116,7 +131,12 @@ draft. A future combined proposal should use one ordered attestation convention.
 For each claim, credit all input ERG if fully consumed; otherwise credit
 `max(0, input.value - recreation.value)`. Sum these credits using non-wrapping
 arithmetic. Outputs whose script hash matches `0x0301`, excluding every required
-recreation and auction output, must together pay at least the credited amount.
+recreation and auction output, count toward this payment only if created at `H`;
+their total must be at least the credited amount. Older-dated outputs to the same
+script are allowed but do not count. A payment dated far enough back would be
+immediately rent-collectable and move the payment to a later producer; collections
+reach blocks only through the producer's candidate submission, so the risk is a
+collection preparer the producer admits.
 
 The producer may choose any beneficiary. Consensus cannot identify a human miner,
 prove who constructed the transaction, or prohibit a miner voluntarily paying a
@@ -158,11 +178,27 @@ The default builder aggregates by token ID, sorts IDs by their hexadecimal encod
 and packs up to 32 entries per lot. An explicit partition may separate assets or
 split a quantity across lots; the same exact totals and per-entry limits apply.
 
-There is one exception to auctionable tokens: when native EIP-27 debt redemption
-rules apply, the EIP-27 accounting token must be burned and its existing ERG
-payment obligation met. It cannot be transferred into an auction. All other token
-entries are auctioned. This exception does not exempt SigUSD, SigRSV, LP tokens or
-NFTs merely because they represent financial claims. The node performs no valuation.
+There is one exception to auctionable tokens: native EIP-27 debt redemption applies
+when the chain's EIP-27 checks are enabled, `H` is above its EIP-27 activation height,
+and validation rule 123 (`txReemission`) is active. The accounting token is excluded
+from auctions under these conditions. If a validation-settings vote disables rule
+123, the accounting token is auctioned like any other token.
+
+Under these conditions, native redemption is triggered by any input of at most
+100,000 ERG holding the accounting token. It requires burning the tokens and
+meeting their existing ERG payment obligation. When triggered in a collection, all matching
+pay-to-reemission outputs must be created at `H`, using the native tree comparison
+on mainnet and proposition comparison on other networks.
+
+A funded rent input holding the accounting token cannot be collected in a
+transaction where native redemption is triggered: the baseline rent rule requires
+its recreation to keep every token, while redemption forbids any output holding
+the accounting token. This is baseline behavior; the reference builder refuses
+such inputs. Funded inputs above 100,000 ERG do not trigger redemption by themselves.
+
+All other token entries are auctioned. This exception does not exempt SigUSD,
+SigRSV, LP tokens or NFTs merely because they represent financial claims.
+The node performs no valuation.
 
 Fully consumed inputs with no auctionable tokens contribute no lot or commitment
 entry. Their rent witness must still be in range. End-height addition must not
@@ -411,17 +447,24 @@ also receives the producer's beneficiary payment. Consensus cannot force collect
 
 # Backwards compatibility
 
-Before activation, node behavior is unchanged. After activation, some transactions
-accepted previously are rejected: uncommitted claims, token seizure without auction,
-shared funded recreation outputs, noncanonical or underfunded lots, aliased close
-payouts, unauthenticated close byte prices, bypass of protected protocol boxes,
-and transactions exceeding the adjusted cost limit. Other existing transaction and script rules are
-not relaxed. The accounting-token exception preserves existing EIP-27 redemption.
+Before activation, node behavior is unchanged. After activation, the additional
+rules reject uncommitted claims, token seizure without auction, shared funded
+recreation outputs, noncanonical or underfunded lots, aliased close payouts,
+unauthenticated close byte prices, bypass of protected protocol boxes, and
+transactions exceeding the adjusted cost limit. Beneficiary payments not created
+at `H` do not count toward the required payment. Triggered redemption payments
+not created at `H` are rejected. Other existing transaction and script rules are
+not relaxed. The accounting-token exception follows native redemption and rule
+123's live status. The inherited rent wrap bands and the separate, non-soft-fork
+repair are described in [Activation and scope](#activation-and-scope).
 
-This revision also replaces the earlier draft's per-source mapping, R4 source ID,
-fixed seed/carrier and R4–R8 state. Schema-1 tooling and earlier draft contract trees
-are incompatible with these draft identities; there is no migration mechanism for
-private-network boxes created under those earlier trees. Activation remains unset.
+On a custom network, EIP-27 must be active before rent-auction activation.
+Otherwise a lot holding the accounting token created before redemption activates
+could become impossible to bid on or close. Mainnet satisfies this ordering.
+
+Schema-1 tooling and contract trees using per-source mapping or R4–R8 state are
+incompatible with these draft identities. There is no migration mechanism for
+private-network boxes using those trees. Activation remains unset.
 
 Old collectors must be upgraded. Old nodes would not enforce the new restrictions.
 Network-wide adoption requires the usual Ergo review and activation process. This
@@ -437,6 +480,11 @@ See [README](README.md), [verification](VERIFICATION.md),
 [operator guide](OPERATIONS.md), and [review notes](REVIEW.md).
 The `.es` sources, compiled contract manifests, node implementation, transaction
 builders, wallet changes, CLI, indexer and Lithos patch ship together.
+
+The wallet prover can give an empty proof to an input carrying a Short variable 127
+that the baseline rent rule already accepts. This is off by default; the node wallet
+enables it only when rent auctions are active at the next height, and then signs
+with the next block's context and parameters.
 
 Coverage includes legacy-rent regressions, transaction-wide bundling, funded-output
 aliasing, disjoint batch payouts, seed returns across byte-price votes, token amounts,
@@ -455,6 +503,19 @@ not guaranteed. Seed principal remains protected. Disjoint output ranges prevent
 Serializer envelopes and native dust/size rules keep prescribed outputs structurally
 spendable within the stated byte-price range; users must still choose scripts they
 can satisfy. Raising that ceiling requires another review.
+
+Unclosed lots and unmerged deposits are rent-protected with no expiry. They remain
+in the UTXO set until someone closes or merges them. Each lot locks only the
+collector's seed and close allowance, recoverable only through closing, less the
+allocated close fee; collection transaction fees are separate.
+
+Collector and recipient scripts are limited to 256 bytes. The auction, deposit
+and reserve trees are longer, preventing either party from naming a protected
+tree and freezing a lot. A regression in `RentAuctionContractSpec` pins this margin.
+
+Native fee outputs of bid, collection and merge transactions carry no creation-height
+condition in these rules. They belong to the including miner, whose fee transaction
+spends them in the same block. The close fee output is pinned to `H`.
 
 Economic review must consider miner censorship, bid ordering, insufficient collection
 incentives, nuisance auctions, dust-price changes, reserve contention, keeper outages

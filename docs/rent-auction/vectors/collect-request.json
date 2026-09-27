@@ -3,6 +3,8 @@
   "action" : "collect",
   "height" : 2100001,
   "parameters" : {
+    "disabledRules" : [
+    ],
     "storageFeeFactor" : 1250000,
     "minValuePerByte" : 360
   },

@@ -1,9 +1,9 @@
 {
-  "createdUtc": "2026-09-27T03:39:00.175892+00:00",
+  "createdUtc": "2026-09-27T08:40:45.848173+00:00",
   "nodeBaseline": "5528ef569a41ebccbc8658212e6ee3c97d990b96",
-  "scalaTestsPassed": 145,
+  "scalaTestsPassed": 158,
   "scalaTestsIgnored": 1,
-  "pythonTestsPassed": 31,
+  "pythonTestsPassed": 64,
   "lithosTestsPassed": 41,
   "lithosBaseline": "88bb1822022bf9521c281314c060a8943521d0f6",
   "assemblyBuilt": true,
@@ -21,8 +21,8 @@
     "No live Lithos pool/collateral-lender deployment",
     "No independent security audit"
   ],
-  "jar": "ergo-6.0.5-6-9c964909-SNAPSHOT.jar",
-  "jarSha256": "b2de31956ba9f956ae99cea58f9b0548cf8a7f01c1b1daa8cb9af986b25970bf",
+  "jar": "ergo-6.0.5-11-2a50d0f3-20260927-1839-SNAPSHOT.jar",
+  "jarSha256": "4305ec792416883f42c577e4577b1f8a1a7c69ca26da3dbac91733650c0c914e",
   "standaloneCliMatchesScalaVector": true,
-  "sourceFingerprintSha256": "a230d4193e270ab33361bf593231858453d3a922ba2955961296bd6df67a2b33"
+  "sourceFingerprintSha256": "29d344ae537b857c1a74296e5a5118860c2b37d73ddbf82eb0b87e7dd8f4c310"
 }
