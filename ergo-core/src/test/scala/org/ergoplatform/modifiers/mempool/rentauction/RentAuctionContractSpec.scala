@@ -2,12 +2,16 @@ package org.ergoplatform.modifiers.mempool.rentauction
 
 import org.ergoplatform.ErgoBox
 import org.ergoplatform.ErgoBoxCandidate
+import org.ergoplatform.Input
+import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.utils.ErgoCorePropertyTest
 import scorex.crypto.hash.Blake2b256
 import scorex.util.encode.Base16
 import sigma.ast.ByteArrayConstant
 import sigma.ast.IntArrayConstant
 import sigma.ast.IntConstant
+import sigma.interpreter.ContextExtension
+import sigma.interpreter.ProverResult
 
 class RentAuctionContractSpec extends ErgoCorePropertyTest with RentAuctionFixture {
   import RentAuctionContracts.INCREMENT
@@ -160,15 +164,21 @@ class RentAuctionContractSpec extends ErgoCorePropertyTest with RentAuctionFixtu
     rejects(sold.withOutputs(IndexedSeq(output(sold.boxes.head.value, contracts.fee, sold.at))))
   }
 
-  property("two auction inputs cannot share a single refund or settlement") {
-    val b = lot(MINIMUM_BID)
-    val other = lot(MINIMUM_BID)
-    val spend = settleSpend(b, height + WINDOW)
-    val outs = spend.tx.outputCandidates
-    val inputs = IndexedSeq(b, other)
-    val tx = transaction(inputs, outs.updated(3,
-      change(outs(3), outs(3).value + other.value, contracts.fee)))
-    rejects(Spend(tx, inputs, spend.at))
+  property("two sold auction inputs cannot share settlement slots tagged for the first input") {
+    val plan = new RentAuctionTransactions(contracts, params, height + WINDOW)
+      .close(IndexedSeq(lot(MINIMUM_BID), lot(MINIMUM_BID)), 1000000L).get
+    val spend = Spend(plan.transaction, plan.boxes, plan.height)
+    spend.result.get should be > 0
+    val in = spend.tx.inputs(1)
+    in.spendingProof.extension.values.keySet shouldBe Set(0.toByte, 1.toByte, 2.toByte)
+    val sharing = Input(in.boxId, ProverResult(in.spendingProof.proof,
+      ContextExtension(in.spendingProof.extension.values.updated(0.toByte, IntConstant(0)))))
+    // Only the second input's payout index changes. Prices, fees, tags and outputs stay valid.
+    val tx = ErgoTransaction(spend.tx.inputs.updated(1, sharing), spend.tx.outputCandidates)
+    val shared = Spend(tx, spend.boxes, spend.at)
+    rejects(shared)
+    // The second script evaluates to false, rather than throwing on a missing context variable.
+    shared.result.failed.get.getMessage should include("#1 => Success((false,")
   }
 
   property("malformed register types are rejected by the compiled contract") {

@@ -136,7 +136,8 @@ final class RentAuctionRules(contracts: RentAuctionContracts, params: Parameters
     b.additionalRegisters.size == 1 && tagged(b) && b.additionalTokens.isEmpty &&
       b.value >= MIN_DEPOSIT_VALUE
 
-  private def auctionShape(b: ErgoBoxCandidate): Boolean = Try {
+  /** Checks auction state shape; callers must check the auction tree separately. */
+  def auctionShape(b: ErgoBoxCandidate): Boolean = Try {
     val rs = b.additionalRegisters
     val types = rs.size == 6 && tagged(b) &&
       rs(ErgoBox.R5).tpe == SCollection(SInt) && rs(ErgoBox.R6).tpe == SLong &&

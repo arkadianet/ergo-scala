@@ -150,7 +150,25 @@ class RentAuctionV2Spec extends ErgoCorePropertyTest with RentAuctionFixture {
     rejected(withOutputs(fees, feeOuts.updated(0, change(feeOuts(0), feeOuts(0).value + 1, feeOuts(0).ergoTree))
       .updated(3, change(feeOuts(3), feeOuts(3).value - 1, feeOuts(3).ergoTree))),
       "incorrect deterministic close fee allocation")
-    rejected(extension(closed, 1, 0.toByte, IntConstant(0)), scriptFailure, nativePasses = false)
+  }
+
+  property("sharing close slots fails native and activated validation with valid context variables") {
+    val collections = IndexedSeq(collectPlan(), collectPlan())
+    collections.foreach(accepted(_))
+    val sales = collections.map(bid(_))
+    sales.foreach(accepted(_))
+    val closed = new RentAuctionTransactions(contracts, params, height + WINDOW)
+      .close(sales.map(_.transaction.outputs.head), 1000000L).get
+    accepted(closed)
+    val sharing = extension(closed, 1, 0.toByte, IntConstant(0))
+    sharing.transaction.inputs(1).spendingProof.extension.values.keySet shouldBe
+      Set(0.toByte, 1.toByte, 2.toByte)
+    rejected(sharing, "#1 => Success((false,", nativePasses = false)
+    // Native validation runs first in execTransactions and rejects the second input's tag.
+    // This direct check is supporting evidence for the additional node rule's precise reason.
+    new RentAuctionRules(contracts, params)
+      .validate(sharing.transaction, sharing.boxes, sharing.height, None) shouldBe
+      Left("close payout ranges must be disjoint")
   }
 
   property("unsold quantities cannot escape through extra outputs or collector tokens") {

@@ -153,7 +153,7 @@ object RentAuctionCli extends ApiCodecs {
     }
     val rules = new RentAuctionRules(chain.rentAuctionContracts, params)
     val accounting = (plan.boxes ++ plan.transaction.outputs)
-      .filter(_.ergoTree == chain.rentAuctionContracts.auction).map { b =>
+      .filter(b => b.ergoTree == chain.rentAuctionContracts.auction && rules.auctionShape(b)).map { b =>
         val bid = b.additionalRegisters(ErgoBox.R6).value.asInstanceOf[Long]
         val seed = b.additionalRegisters(ErgoBox.R8).value.asInstanceOf[Long]
         val recipient = b.additionalRegisters(ErgoBox.R7).value.asInstanceOf[sigma.Coll[Byte]]

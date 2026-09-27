@@ -115,6 +115,31 @@ class RentAuctionCliSpec extends ErgoCorePropertyTest
 
   }
 
+  property("collection accounting skips expired token-free auction imitations without registers") {
+    val imitation = box(1000000L, contracts.auction, height - Constants.StoragePeriod)
+    val source = box(1000000L, nobody, height - Constants.StoragePeriod, Seq(token -> 100L))
+    val request = Json.obj(
+      "schemaVersion" -> 2.asJson,
+      "action" -> "collect".asJson,
+      "height" -> height.asJson,
+      "parameters" -> Json.obj("storageFeeFactor" -> params.storageFeeFactor.asJson,
+        "minValuePerByte" -> params.minValuePerByte.asJson),
+      "sources" -> Vector(imitation, source).asJson,
+      "funding" -> Vector(box(30000000L)).asJson,
+      "beneficiary" -> Base16.encode(owner.bytes).asJson,
+      "collector" -> Base16.encode(owner.bytes).asJson,
+      "change" -> Base16.encode(anyone.bytes).asJson)
+    val json = RentAuctionCli.prepare(request, chain).get
+    val plan = checkedJson(json)
+    val auctions = plan.transaction.outputs.filter(_.ergoTree == contracts.auction)
+    auctions.size shouldBe 1
+    val accounting = json.hcursor.get[Vector[Json]]("auctionAccounting").toTry.get
+    accounting.map(_.hcursor.get[String]("boxId").toTry.get) shouldBe
+      auctions.map(b => Base16.encode(b.id))
+    new RentAuctionRules(contracts, params).claims(plan.transaction, plan.boxes, plan.height)
+      .map(_._1) should contain(imitation)
+  }
+
   property("malformed recipients and missing live parameters fail closed") {
     RentAuctionCli.prepare(Json.obj("action" -> "collect".asJson), chain)
       .failed.get.getMessage should include("height")
