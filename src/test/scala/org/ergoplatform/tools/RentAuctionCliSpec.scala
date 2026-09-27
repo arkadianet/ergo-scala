@@ -9,6 +9,7 @@ import io.circe.syntax.EncoderOps
 import org.ergoplatform.ErgoBox
 import org.ergoplatform.http.api.ApiCodecs
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
+import org.ergoplatform.modifiers.mempool.rentauction.RentAuctionContracts
 import org.ergoplatform.modifiers.mempool.rentauction.RentAuctionFixture
 import org.ergoplatform.modifiers.mempool.rentauction.RentAuctionPlan
 import org.ergoplatform.modifiers.mempool.rentauction.RentAuctionRules
@@ -43,6 +44,24 @@ class RentAuctionCliSpec extends ErgoCorePropertyTest
       "beneficiary" -> Base16.encode(owner.bytes).asJson,
       "collector" -> Base16.encode(owner.bytes).asJson,
       "change" -> Base16.encode(anyone.bytes).asJson)
+  }
+
+  property("inspection distinguishes canonical shapes from imitation trees") {
+    val auction = lot()
+    val deposit = depositBox(RentAuctionContracts.MINIMUM_BID)
+    val imitation = box(10000000L, contracts.auction)
+    val depositImitation = box(10000000L, contracts.deposit)
+    val request = Json.obj("action" -> "inspect".asJson, "height" -> height.asJson,
+      "parameters" -> accountingRequest.hcursor.downField("parameters").focus.get,
+      "boxes" -> Vector(auction, deposit, imitation, depositImitation).asJson)
+    val rows = RentAuctionCli.prepare(request, chain).get.hcursor
+      .get[Vector[Json]]("boxes").toTry.get
+    rows.map(_.hcursor.get[Boolean]("auctionShape").toTry.get) shouldBe
+      Vector(true, false, false, false)
+    rows.map(_.hcursor.get[Boolean]("depositShape").toTry.get) shouldBe
+      Vector(false, true, false, false)
+    rows(2).hcursor.get[Boolean]("auction").toTry.get shouldBe true
+    rows(3).hcursor.get[Boolean]("deposit").toTry.get shouldBe true
   }
 
   property("disabled rule status is required and only distinct disableable ids are accepted") {

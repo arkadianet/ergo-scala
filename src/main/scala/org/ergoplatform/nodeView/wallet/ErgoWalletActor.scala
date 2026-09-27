@@ -7,6 +7,7 @@ import org.ergoplatform.ErgoBox._
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages.{ChangedMempool, ChangedState}
 import org.ergoplatform.nodeView.history.ErgoHistoryReader
 import org.ergoplatform.nodeView.mempool.ErgoMemPoolReader
+import org.ergoplatform.nodeView.state.ErgoStateContext
 import org.ergoplatform.nodeView.state.ErgoStateReader
 import org.ergoplatform.nodeView.wallet.ErgoWalletServiceUtils.DeriveNextKeyResult
 import org.ergoplatform.sdk.wallet.secrets.DerivationPath
@@ -372,11 +373,8 @@ class ErgoWalletActor(settings: ErgoSettings,
       sender() ! GenerateCommitmentsResponse(resultTry)
 
     case SignTransaction(tx, secrets, hints, boxesToSpendOpt, dataBoxesOpt) =>
-      val (signingParameters, signingContext) = if (settings.chainSettings
-        .rentAuctionsActive(state.stateContext.currentHeight + 1)) {
-        val upcoming = state.stateContext.simplifiedUpcoming()
-        upcoming.currentParameters -> upcoming
-      } else state.parameters -> state.stateContext
+      val (signingParameters, signingContext, rentShortcut) = ErgoWalletActor.signingInputs(
+        settings.chainSettings, state.stateContext, state.parameters)
       val txTry =
         ergoWalletService.signTransaction(
           state.walletVars.proverOpt,
@@ -386,7 +384,8 @@ class ErgoWalletActor(settings: ErgoSettings,
           boxesToSpendOpt,
           dataBoxesOpt,
           signingParameters,
-          signingContext
+          signingContext,
+          rentShortcut
         )(state.readBoxFromUtxoWithWalletFallback)
       sender() ! txTry
 
@@ -507,6 +506,15 @@ class ErgoWalletActor(settings: ErgoSettings,
 }
 
 object ErgoWalletActor extends ScorexLogging {
+
+  def signingInputs(chain: ChainSettings,
+                    context: ErgoStateContext,
+                    parameters: Parameters): (Parameters, ErgoStateContext, Boolean) = {
+    if (chain.rentAuctionsActive(context.currentHeight + 1)) {
+      val upcoming = context.simplifiedUpcoming()
+      (upcoming.currentParameters, upcoming, true)
+    } else (parameters, context, false)
+  }
 
   /** Start actor and register its proper closing into coordinated shutdown */
   def apply(settings: ErgoSettings,

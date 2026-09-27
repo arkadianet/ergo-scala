@@ -70,7 +70,7 @@ class RentAuctionBuilderSpec extends ErgoCorePropertyTest with RentAuctionFixtur
       IndexedSeq(box(100000000L, tree)), owner, owner, tree, 1000000L).get
     val prover = org.ergoplatform.wallet.interpreter.ErgoProvingInterpreter(key, params)
     val signed = prover.sign(plan.unsigned, plan.boxes, IndexedSeq.empty,
-      context(height)).get
+      context(height), rentShortcut = true).get
     val tx = org.ergoplatform.modifiers.mempool.ErgoTransaction(
       signed.inputs, signed.dataInputs, signed.outputCandidates)
     tx.inputs.head.spendingProof.proof shouldBe empty

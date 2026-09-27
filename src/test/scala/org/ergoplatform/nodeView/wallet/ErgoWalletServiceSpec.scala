@@ -83,19 +83,28 @@ class ErgoWalletServiceSpec
     )
   }
 
-  property("rent signing uses the supplied upcoming parameters at a voting boundary") {
+  property("actor selects upcoming rent signing inputs at a voting boundary") {
     val epoch = settings.chainSettings.voting.votingLength
     val nextHeight = (Constants.StoragePeriod / epoch + 2) * epoch
     val signingChain = settings.chainSettings.copy(
       rentAuctionActivationHeight = Some(nextHeight))
     val parentParameters = new Parameters(nextHeight - epoch,
-      parameters.parametersTable.updated(Parameters.BlockVersion, 4), emptyVSUpdate)
+      parameters.parametersTable + (Parameters.BlockVersion -> 4), emptyVSUpdate)
     val parent = new ErgoStateContext(
       Seq(defaultHeaderGen.sample.get.copy(height = nextHeight - 1, version = 4)),
       None, genesisStateDigest, parentParameters, validationSettings,
       VotingData(Array(Parameters.StorageFeeFactorIncrease -> epoch)))(signingChain)
-    val upcoming = parent.simplifiedUpcoming()
-    val upcomingParameters = upcoming.currentParameters
+    val (upcomingParameters, upcoming, rentShortcut) =
+      ErgoWalletActor.signingInputs(signingChain, parent, parameters)
+    rentShortcut shouldBe true
+    upcoming.sigmaPreHeader shouldBe parent.simplifiedUpcoming().sigmaPreHeader
+    upcomingParameters shouldBe upcoming.currentParameters
+    val (inactiveParameters, inactiveContext, inactiveShortcut) =
+      ErgoWalletActor.signingInputs(signingChain.copy(rentAuctionActivationHeight = None),
+        parent, parameters)
+    inactiveParameters should be theSameInstanceAs parameters
+    inactiveContext should be theSameInstanceAs parent
+    inactiveShortcut shouldBe false
     upcoming.currentHeight shouldBe nextHeight
     signingChain.rentAuctionsActive(nextHeight) shouldBe true
     upcomingParameters.storageFeeFactor shouldBe
@@ -114,7 +123,7 @@ class ErgoWalletServiceSpec
     val service = new ErgoWalletServiceImpl(settings)
     def sign(p: Parameters): scala.util.Try[ErgoTransaction] =
       service.signTransaction(None, unsigned, Seq.empty, TransactionHintsBag.empty,
-        Some(Seq(source)), Some(Seq.empty), p, upcoming)(_ => None)
+        Some(Seq(source)), Some(Seq.empty), p, upcoming, rentShortcut = true)(_ => None)
 
     sign(parentParameters).isFailure shouldBe true
     val signed = sign(upcomingParameters).get
@@ -123,6 +132,43 @@ class ErgoWalletServiceSpec
     signed.statelessValidity().isSuccess shouldBe true
     signed.statefulValidity(IndexedSeq(source), IndexedSeq.empty, upcoming)(
       ErgoInterpreter(upcomingParameters)).isSuccess shouldBe true
+  }
+
+  property("inactive rent signing proves an owned expired box for the next block") {
+    val signingChain = settings.chainSettings.copy(rentAuctionActivationHeight = None)
+    val height = Constants.StoragePeriod + 100
+    val parent = new ErgoStateContext(
+      Seq(defaultHeaderGen.sample.get.copy(height = height, version = parameters.blockVersion)), None,
+      genesisStateDigest, parameters, validationSettings, VotingData.empty)(signingChain)
+    val tree = sigma.ast.ErgoTree.fromSigmaBoolean(defaultRootSecret.publicKey.key)
+    val source = testBox(1000000000L, tree, height - Constants.StoragePeriod - 1)
+    val fee = parameters.storageFeeFactor * source.bytes.length
+    val recreation = new ErgoBoxCandidate(source.value - fee, tree, height,
+      source.additionalTokens, source.additionalRegisters)
+    val payment = new ErgoBoxCandidate(fee.toLong, TrueTree, height)
+    val extension = ContextExtension(Map(Constants.StorageIndexVarId -> ShortConstant(0)))
+    val unsigned = UnsignedErgoTransaction(
+      IndexedSeq(new UnsignedInput(source.id, extension)), IndexedSeq(recreation, payment))
+    val prover = ErgoProvingInterpreter(defaultRootSecret, parameters)
+    val service = new ErgoWalletServiceImpl(settings)
+    val upcoming = parent.simplifiedUpcoming()
+    signingChain.rentAuctionsActive(upcoming.currentHeight) shouldBe false
+    val signedTransactions = Seq(
+      ErgoTransaction(prover.sign(unsigned, IndexedSeq(source), IndexedSeq.empty, parent).get),
+      service.signTransaction(Some(prover), unsigned, Seq.empty, TransactionHintsBag.empty,
+        Some(Seq(source)), Some(Seq.empty), parameters, parent)(_ => None).get)
+    signedTransactions.foreach { signed =>
+      signed.inputs.head.spendingProof.proof should not be empty
+      signed.inputs.head.spendingProof.extension shouldBe extension
+      signed.statelessValidity().isSuccess shouldBe true
+      signed.statefulValidity(IndexedSeq(source), IndexedSeq.empty, upcoming)(
+        ErgoInterpreter(upcoming.currentParameters)).isSuccess shouldBe true
+    }
+    val shortcut = ErgoTransaction(prover.sign(unsigned, IndexedSeq(source), IndexedSeq.empty,
+      parent, rentShortcut = true).get)
+    shortcut.inputs.head.spendingProof.proof shouldBe empty
+    shortcut.statefulValidity(IndexedSeq(source), IndexedSeq.empty, upcoming)(
+      ErgoInterpreter(upcoming.currentParameters)).isFailure shouldBe true
   }
 
   property("restoring wallet should fail if pruning is enabled") {

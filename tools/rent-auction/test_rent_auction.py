@@ -207,7 +207,9 @@ class WorkerBuilder:
             return self.manifest
         self.requests.append(copy.deepcopy(request))
         if request["action"] == "inspect":
-            return {"schemaVersion": 2, "boxes": [dict(b, deadline=99) for b in request["boxes"]]}
+            return {"schemaVersion": 2, "boxes": [dict(b, deadline=99,
+                auctionShape=b["ergoTree"] == "auction", depositShape=b["ergoTree"] == "deposit")
+                for b in request["boxes"]]}
         members = request.get("auctions", request.get("deposits"))
         count = len(members)
         if request["action"] == "merge" and count == 1 and request["parameters"]["minValuePerByte"] == 10000:
@@ -261,6 +263,89 @@ class BatchTests(unittest.TestCase):
         requests = [r for r in builder.requests if r["action"] == "close"]
         self.assertEqual([b["boxId"] for r in requests for b in r["auctions"]], sorted(node.boxes))
         self.assertTrue(all("closer" not in r and r["schemaVersion"] == 2 for r in requests))
+
+    def test_close_builder_failure_isolates_one_lot_and_closes_the_other_39(self):
+        for error_type in (RuntimeError, ValueError):
+            with self.subTest(error_type=error_type):
+                node, builder = self.lots(40)
+                offender = f"{17:064x}"
+                run = builder.run
+
+                def build(command, request=None):
+                    if request and request["action"] == "close" and any(
+                            b["boxId"] == offender for b in request["auctions"]):
+                        raise error_type("invalid auction")
+                    return run(command, request)
+
+                with patch.object(builder, "run", side_effect=build):
+                    result = ra.settle_due(node, self.index, builder, self.directory.name, execute=True)
+                self.assertEqual([r for r in result if "error" in r],
+                                 [{"auctions": [offender], "error": "invalid auction"}])
+                closed = [i for r in result if r.get("sent") for i in r["auctions"]]
+                self.assertEqual(closed, [f"{i:064x}" for i in range(40) if i != 17])
+
+    def test_merge_builder_failure_isolates_one_deposit_and_merges_the_other_39(self):
+        for error_type in (RuntimeError, ValueError):
+            with self.subTest(error_type=error_type):
+                node, builder = self.deposits(40, price=360)
+                offender = f"{17:064x}"
+                run = builder.run
+
+                def build(command, request=None):
+                    if request and request["action"] == "merge" and any(
+                            b["boxId"] == offender for b in request["deposits"]):
+                        raise error_type("invalid deposit")
+                    return run(command, request)
+
+                with patch.object(builder, "run", side_effect=build):
+                    result = ra.merge_due(node, self.index, builder, self.directory.name, execute=True)
+                self.assertEqual([r for r in result if "error" in r],
+                                 [{"deposits": [offender], "error": "invalid deposit"}])
+                merged = [i for r in result if r.get("sent") for i in r["deposits"]]
+                self.assertEqual(merged, [f"{i:064x}" for i in range(40) if i != 17])
+
+    def test_workers_inspect_in_batches_and_never_admit_false_shapes(self):
+        for action, shape, factory, worker in (
+                ("close", "auctionShape", self.lots, ra.settle_due),
+                ("merge", "depositShape", self.deposits, ra.merge_due)):
+            with self.subTest(action=action):
+                node, builder = factory(201, price=360)
+                offender = f"{100:064x}"
+                run = builder.run
+
+                def build(command, request=None):
+                    result = run(command, request)
+                    if request and request["action"] == "inspect":
+                        for row in result["boxes"]:
+                            if row["boxId"] == offender:
+                                row[shape] = False
+                    return result
+
+                with patch.object(builder, "run", side_effect=build):
+                    result = worker(node, self.index, builder, self.directory.name, execute=True)
+                inspections = [r for r in builder.requests if r["action"] == "inspect"]
+                self.assertEqual([len(r["boxes"]) for r in inspections], [100, 100, 1])
+                field = "auctions" if action == "close" else "deposits"
+                admitted = [b["boxId"] for r in builder.requests if r["action"] == action
+                            for b in r[field]]
+                self.assertEqual(admitted, [f"{i:064x}" for i in range(201) if i != 100])
+                self.assertTrue(all(r.get("sent") for r in result))
+
+    def test_ambiguous_merge_broadcast_failure_is_not_retried(self):
+        node, builder = self.deposits(40, price=360)
+        request = node.request
+        attempts = []
+
+        def uncertain(path, data=None):
+            if path == "/transactions":
+                attempts.append(data)
+                raise RuntimeError("connection lost after submission")
+            return request(path, data)
+
+        with patch.object(node, "request", side_effect=uncertain):
+            result = ra.merge_due(node, self.index, builder, self.directory.name, execute=True)
+        self.assertEqual(len(attempts), 1)
+        self.assertIn("connection lost", result[0]["reason"])
 
     def test_preparation_defers_every_action_at_manifest_voting_boundary(self):
         node, builder = self.lots(1)

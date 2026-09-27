@@ -165,7 +165,9 @@ object ErgoState extends ScorexLogging {
           .validateNoFailure(txDataBoxes, dataBoxesTry, tx.id, tx.modifierTypeId)
           .payload[Long](validCostResult.value)
           .validateTry(boxes, e => ModifierValidator.fatal("Missed data boxes", tx.id, tx.modifierTypeId, e)) { case (_, (dataBoxes, toSpend)) =>
-            resolved += tx -> toSpend
+            if (auctionRules.isDefined) {
+              resolved += tx -> toSpend
+            }
             val extra = auctionRules.map(_.cost(tx, toSpend)).getOrElse(0L)
             val newCost = validCostResult.value + extra
             if (newCost > currentStateContext.currentParameters.maxBlockCost) {

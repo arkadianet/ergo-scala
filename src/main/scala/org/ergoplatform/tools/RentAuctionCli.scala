@@ -84,11 +84,12 @@ object RentAuctionCli extends ApiCodecs {
   private def inspect(request: Json, chain: ChainSettings): Try[Json] = Try {
     val c = request.hcursor
     val height = c.get[Int]("height").toTry.get
-    val fee = c.downField("parameters").get[Int]("storageFeeFactor").toTry.get
+    val (params, validation) = requestParameters(request, chain, height)
+    val rules = new RentAuctionRules(chain.rentAuctionContracts, params, validation)
     val boxes = c.get[Vector[ErgoBox]]("boxes").toTry.get
     val contracts = chain.rentAuctionContracts
     Json.obj("schemaVersion" -> 2.asJson, "height" -> height.asJson, "boxes" -> boxes.map { b =>
-      val charge = fee * b.bytes.length
+      val charge = params.storageFeeFactor * b.bytes.length
       val eligible = height - b.creationHeight >=
         org.ergoplatform.settings.Constants.StoragePeriod
       def longRegister(id: ErgoBox.NonMandatoryRegisterId): Option[Long] =
@@ -103,6 +104,8 @@ object RentAuctionCli extends ApiCodecs {
         "fullyConsumed" -> (eligible && b.value - charge <= 0).asJson,
         "auction" -> (b.ergoTree == contracts.auction).asJson,
         "deposit" -> (b.ergoTree == contracts.deposit).asJson,
+        "auctionShape" -> (b.ergoTree == contracts.auction && rules.auctionShape(b)).asJson,
+        "depositShape" -> (b.ergoTree == contracts.deposit && rules.depositShape(b)).asJson,
         "deadline" -> deadline.asJson,
         "bid" -> longRegister(ErgoBox.R6).asJson,
         "seedPrincipal" -> longRegister(ErgoBox.R8).asJson,
@@ -114,13 +117,12 @@ object RentAuctionCli extends ApiCodecs {
     }.asJson)
   }
 
-  private def prepareTransaction(request: Json, chain: ChainSettings): Try[Json] = Try {
-    val c = request.hcursor
-    val height = c.get[Int]("height").toTry.get
+  private def requestParameters(request: Json, chain: ChainSettings,
+                                height: Int): (Parameters, ErgoValidationSettings) = {
     require(height >= 0, "Height must be non-negative")
     // Require current parameters explicitly: offline defaults must not masquerade
     // as the live chain's voted values.
-    val p = c.downField("parameters")
+    val p = request.hcursor.downField("parameters")
     require(p.downField("disabledRules").succeeded,
       "parameters.disabledRules is required (use [] when no validation rule is disabled)")
     val ids = p.get[Vector[Json]]("disabledRules").toTry.get.map { value =>
@@ -144,6 +146,13 @@ object RentAuctionCli extends ApiCodecs {
       Parameters.MinValuePerByteIncrease -> dust,
       Parameters.BlockVersion -> chain.protocolVersion.toInt),
       ErgoValidationSettingsUpdate.empty)
+    (params, validation)
+  }
+
+  private def prepareTransaction(request: Json, chain: ChainSettings): Try[Json] = Try {
+    val c = request.hcursor
+    val height = c.get[Int]("height").toTry.get
+    val (params, validation) = requestParameters(request, chain, height)
     val builder = new RentAuctionTransactions(chain.rentAuctionContracts, params, height, validation)
     def boxes(name: String): IndexedSeq[ErgoBox] =
       c.get[Option[Vector[ErgoBox]]](name).toTry.get.getOrElse(Vector.empty)

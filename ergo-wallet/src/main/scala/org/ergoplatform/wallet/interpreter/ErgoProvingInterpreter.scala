@@ -103,7 +103,8 @@ class ErgoProvingInterpreter(val secretKeys: IndexedSeq[SecretKey],
                  boxesToSpend: IndexedSeq[ErgoBox],
                  dataBoxes: IndexedSeq[ErgoBox],
                  stateContext: VersionedBlockchainStateContext,
-                 txHints: TransactionHintsBag): Try[(IndexedSeq[Input], Long)] = {
+                 txHints: TransactionHintsBag,
+                 rentShortcut: Boolean = false): Try[(IndexedSeq[Input], Long)] = {
     if (unsignedTx.inputs.length != boxesToSpend.length) {
       Failure(new Exception("Not enough boxes to spend"))
     } else if (unsignedTx.dataInputs.length != dataBoxes.length) {
@@ -154,7 +155,7 @@ class ErgoProvingInterpreter(val secretKeys: IndexedSeq[SecretKey],
                 val rentSpend = context.preHeader.height - inputBox.creationHeight >=
                   rentConstants.StoragePeriod && rentOutput.exists(out =>
                     checkExpiredBox(inputBox, out, context.preHeader.height))
-                val proof = if (rentSpend) {
+                val proof = if (rentShortcut && rentSpend) {
                   Success(CostedProverResult(Array.emptyByteArray,
                     unsignedInput.extension,
                     addExact(totalCost, rentConstants.StorageContractCost)))
@@ -181,10 +182,11 @@ class ErgoProvingInterpreter(val secretKeys: IndexedSeq[SecretKey],
            boxesToSpend: IndexedSeq[ErgoBox],
            dataBoxes: IndexedSeq[ErgoBox],
            stateContext: VersionedBlockchainStateContext,
-           txHints: TransactionHintsBag = TransactionHintsBag.empty): Try[ErgoLikeTransaction] = {
+           txHints: TransactionHintsBag = TransactionHintsBag.empty,
+           rentShortcut: Boolean = false): Try[ErgoLikeTransaction] = {
 
     val signedInputs: Try[(IndexedSeq[Input], Long)] =
-      signInputs(unsignedTx, boxesToSpend, dataBoxes, stateContext, txHints)
+      signInputs(unsignedTx, boxesToSpend, dataBoxes, stateContext, txHints, rentShortcut)
     signedInputs.map { case (inputs, _) =>
       new ErgoLikeTransaction(inputs, unsignedTx.dataInputs, unsignedTx.outputCandidates)
     }

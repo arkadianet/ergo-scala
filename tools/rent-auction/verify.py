@@ -12,7 +12,7 @@ import sys
 import tempfile
 from datetime import datetime, timezone
 
-from package import packaged_files
+from package import packaged_files, reject_untracked
 
 ROOT = Path(__file__).resolve().parents[2]
 LITHOS_BASE = "88bb1822022bf9521c281314c060a8943521d0f6"
@@ -134,6 +134,7 @@ def main():
                         help="Pinned Lithos checkout with this package's patch applied")
     parser.add_argument("--assemble", action="store_true")
     args = parser.parse_args()
+    reject_untracked(ROOT)
     logs = ROOT / "target/rent-auction-verification"
     logs.mkdir(parents=True, exist_ok=True)
     regenerated = REGENERATED_VECTORS if args.assemble else ()

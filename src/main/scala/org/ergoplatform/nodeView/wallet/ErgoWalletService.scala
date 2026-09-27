@@ -230,7 +230,8 @@ trait ErgoWalletService {
                       boxesToSpendOpt: Option[Seq[ErgoBox]],
                       dataBoxesOpt: Option[Seq[ErgoBox]],
                       parameters: Parameters,
-                      stateContext: ErgoStateContext)(extract: BoxId => Option[ErgoBox]): Try[ErgoTransaction]
+                      stateContext: ErgoStateContext,
+                      rentShortcut: Boolean = false)(extract: BoxId => Option[ErgoBox]): Try[ErgoTransaction]
 
   /**
     * Generate signed or unsigned transaction.
@@ -662,7 +663,8 @@ class ErgoWalletServiceImpl(override val ergoSettings: ErgoSettings) extends Erg
                       boxesToSpendOpt: Option[Seq[ErgoBox]],
                       dataBoxesOpt: Option[Seq[ErgoBox]],
                       parameters: Parameters,
-                      stateContext: ErgoStateContext)(extract: BoxId => Option[ErgoBox]): Try[ErgoTransaction] = {
+                      stateContext: ErgoStateContext,
+                      rentShortcut: Boolean = false)(extract: BoxId => Option[ErgoBox]): Try[ErgoTransaction] = {
     val boxesToSpend = boxesToSpendOpt.getOrElse(tx.inputs.flatMap { input =>
       extract(input.boxId)
     })
@@ -674,7 +676,7 @@ class ErgoWalletServiceImpl(override val ergoSettings: ErgoSettings) extends Erg
     val secretsWrapped = secrets.map(_.key).toIndexedSeq
     val secretsProver = ErgoProvingInterpreter(secretsWrapped ++ proverSecrets, parameters)
     secretsProver
-      .sign(tx, boxesToSpend.toIndexedSeq, dataBoxes.toIndexedSeq, stateContext, hints)
+      .sign(tx, boxesToSpend.toIndexedSeq, dataBoxes.toIndexedSeq, stateContext, hints, rentShortcut)
       .map(ErgoTransaction.apply)
   }
 

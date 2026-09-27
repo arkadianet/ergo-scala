@@ -37,7 +37,7 @@ def packaged_files(root):
 
 def reject_untracked(root):
     output = subprocess.check_output(
-        ["git", "ls-files", "--others", "--exclude-standard", "-z", "--", *NEW_ROOTS],
+        ["git", "ls-files", "--others", "--exclude-standard", "-z", "--", ".", ":!dist"],
         cwd=root)
     names = sorted(name for name in output.decode().split("\0") if name)
     if names:

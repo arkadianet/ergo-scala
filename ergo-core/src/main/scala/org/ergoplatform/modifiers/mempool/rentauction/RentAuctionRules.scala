@@ -160,7 +160,7 @@ final class RentAuctionRules(
     MAX_BYTE_PRICE.toLong * returnBytes(bytes(b, ErgoBox.R9).length),
     math.max(1L, params.minValuePerByte.toLong * lotSizeBound(b, successor = false) - CLOSE_ALLOWANCE))
 
-  private def depositShape(b: ErgoBoxCandidate): Boolean =
+  def depositShape(b: ErgoBoxCandidate): Boolean =
     b.additionalRegisters.size == 1 && tagged(b) && b.additionalTokens.isEmpty &&
       b.value >= MIN_DEPOSIT_VALUE
 

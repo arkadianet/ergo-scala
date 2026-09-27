@@ -39,7 +39,8 @@ class RepositoryTests(unittest.TestCase):
 class PackageTests(RepositoryTests):
     def test_package_untracked_inputs_refused_with_paths(self):
         names = ["tools/rent-auction/wallet.json", "docs/rent-auction/credential.txt",
-                 "tools/rent-auction/signed.sqlite"]
+                 "tools/rent-auction/signed.sqlite",
+                 "src/main/scala/org/ergoplatform/Extra.scala"]
         for name in names:
             self.write(name, "local data")
         with patch.object(package, "ROOT", self.root), patch("sys.argv", ["package.py"]):
@@ -52,19 +53,36 @@ class PackageTests(RepositoryTests):
     def test_package_ignored_inputs_excluded_and_explicit_files_included(self):
         self.write(".gitignore", "*.secret\n")
         self.write("tools/rent-auction/tracked.py", "pass\n")
-        self.baseline()
-        self.write("tools/rent-auction/wallet.secret", "private")
         explicit = "src/test/Explicit.scala"
         self.write(explicit, "// explicit\n")
+        self.baseline()
+        self.write("tools/rent-auction/wallet.secret", "private")
         with patch.object(package, "NEW_FILES", [explicit]):
             package.reject_untracked(self.root)
             self.assertEqual(package.packaged_files(self.root),
                              [".gitignore", explicit, "tools/rent-auction/tracked.py"])
 
+    def test_untracked_dist_output_is_allowed(self):
+        self.write("dist/rent-auction-submission.zip", "previous output")
+        package.reject_untracked(self.root)
+
+    def test_verification_refuses_untracked_source_before_fingerprinting(self):
+        name = "src/main/scala/org/ergoplatform/Extra.scala"
+        self.write(name, "object Extra\n")
+        with patch.object(verify, "ROOT", self.root), patch("sys.argv", ["verify.py"]), \
+                patch.object(verify, "source_fingerprint") as fingerprint, \
+                patch.object(verify, "launcher") as launcher:
+            with self.assertRaises(RuntimeError) as error:
+                verify.main()
+        self.assertIn(name, str(error.exception))
+        fingerprint.assert_not_called()
+        launcher.assert_not_called()
+
 
 class FingerprintTests(RepositoryTests):
     def setUp(self):
         super().setUp()
+        self.write(".gitignore", "target/\n")
         self.doc = "docs/rent-auction/README.md"
         self.write(self.doc, "Specification\n")
         self.write("docs/rent-auction/verification.json", "{}\n")
@@ -109,6 +127,10 @@ class FingerprintTests(RepositoryTests):
         self.assertEqual(report["sourceFingerprintSha256"], verify.source_fingerprint())
         for name in verify.REGENERATED_VECTORS:
             self.assertEqual(json.loads((self.root / name).read_text()), {"fresh": True})
+
+    def test_verification_accepts_existing_dist_output(self):
+        self.write("dist/rent-auction-submission.zip", "previous output")
+        self.assertGreater(self.run_verification()["pythonTestsPassed"], 0)
 
     def test_fingerprint_document_changed_during_verification_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "Source changed during verification"):

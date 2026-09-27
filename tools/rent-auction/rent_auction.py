@@ -388,14 +388,17 @@ def settle_due(node, index, builder, output_dir, execute=False, fee=None,
             "parameters": parameters, "boxes": boxes[offset:offset + 100]})
         require_schema2(inspected)
         rows.extend(inspected["boxes"])
-    pending = sorted(r["boxId"] for r in rows if r["deadline"] is not None and r["deadline"] <= height)
+    pending = sorted(r["boxId"] for r in rows if r["auctionShape"]
+                     and r["deadline"] is not None and r["deadline"] <= height)
     results = []
     while pending:
         batch = pending[:min(32, manifest["maxCloseLots"])]
         retries = 0
         while batch:
+            preparing = True
             try:
                 plan = prepare_current(node, builder, "close", {"auctions": batch, "fee": fee})
+                preparing = False
                 batch_fits(node, plan, max_bytes, max_cost)
                 result = publish_plan(node, plan, output_dir, execute)
                 results.append(dict(result, auctions=batch))
@@ -417,8 +420,14 @@ def settle_due(node, index, builder, output_dir, execute=False, fee=None,
                     results.append({"auctions": pending, "error": str(error)})
                     return results
             except (RuntimeError, ValueError) as error:
-                results.append({"auctions": pending, "error": str(error)})
-                return results
+                if not preparing:
+                    results.append({"auctions": pending, "error": str(error)})
+                    return results
+                if len(batch) == 1:
+                    results.append({"auctions": batch, "error": str(error)})
+                    pending.remove(batch[0])
+                    break
+                batch = batch[:len(batch) // 2]
     return results
 
 
@@ -430,19 +439,34 @@ def merge_due(node, index, builder, output_dir, execute=False):
                 and b["assets"][0]["amount"] == 1]
     if len(reserves) != 1:
         raise ValueError("Index must contain exactly one authentic reserve; sync first")
-    pending = sorted(b["boxId"] for b in index.boxes(tree=manifest["deposit"]["ergoTree"]))
+    boxes = index.boxes(tree=manifest["deposit"]["ergoTree"])
+    try:
+        height, parameters = current_parameters(node, manifest["votingLength"])
+    except StalePlan as error:
+        return [{"deferred": sorted(b["boxId"] for b in boxes), "reason": str(error)}]
+    rows = []
+    for offset in range(0, len(boxes), 100):
+        inspected = builder.run("prepare", {"schemaVersion": 2, "action": "inspect", "height": height,
+            "parameters": parameters, "boxes": boxes[offset:offset + 100]})
+        require_schema2(inspected)
+        rows.extend(inspected["boxes"])
+    pending = sorted(r["boxId"] for r in rows if r["depositShape"])
     reserve, results = reserves[0], []
+    batch_limit = manifest["maxMergeDeposits"]
     retries = 0
     while pending:
-        batch = pending[:manifest["maxMergeDeposits"]]
+        batch = pending[:batch_limit]
         # Avoid stranding a singleton when two funded batches can consume the same set.
         if len(pending) == len(batch) + 1 and len(batch) > 2:
             batch = batch[:-1]
+        preparing = True
         try:
             plan = prepare_current(node, builder, "merge", {"reserve": reserve["boxId"], "deposits": batch})
+            preparing = False
             result = publish_plan(node, plan, output_dir, execute)
             results.append(dict(result, deposits=batch, fee=plan["feePaid"]))
             pending = pending[len(batch):]
+            batch_limit = manifest["maxMergeDeposits"]
             retries = 0
             if not execute:
                 if pending:
@@ -472,8 +496,17 @@ def merge_due(node, index, builder, output_dir, execute=False):
             if "dust" in str(error).lower():
                 results.append({"unfunded": batch, "mergeBudget": len(batch) * manifest["mergeBudget"],
                     "reason": "native fee dust; wait for more deposits or prepare merge with a sponsor"})
-            else:
+            elif not preparing:
                 results.append({"deferred": pending, "reason": str(error)})
+            elif len(batch) > 1:
+                batch_limit = len(batch) // 2
+                continue
+            else:
+                results.append({"deposits": batch, "error": str(error)})
+                pending.remove(batch[0])
+                batch_limit = manifest["maxMergeDeposits"]
+                retries = 0
+                continue
             break
     return results
 
