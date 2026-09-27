@@ -45,7 +45,7 @@ object RentAuctionCli extends ApiCodecs {
       "blake2b256" -> Base16.encode(Blake2b256(t.bytes)).asJson,
       "bytes" -> t.bytes.length.asJson)
     Json.obj(
-      "schemaVersion" -> 1.asJson,
+      "schemaVersion" -> 2.asJson,
       "networkPrefix" -> chain.addressPrefix.asJson,
       "activationHeight" -> chain.rentAuctionActivationHeight.asJson,
       "auction" -> entry(contracts.auction),
@@ -58,7 +58,20 @@ object RentAuctionCli extends ApiCodecs {
       "maximumWindow" -> RentAuctionContracts.MAXIMUM_WINDOW.asJson,
       "minimumBid" -> RentAuctionContracts.MINIMUM_BID.asJson,
       "increment" -> RentAuctionContracts.INCREMENT.asJson,
-      "tokensPerLot" -> RentAuctionContracts.TOKENS_PER_LOT.asJson)
+      "tokensPerLot" -> RentAuctionContracts.TOKENS_PER_LOT.asJson,
+      "closeAllowance" -> RentAuctionContracts.CLOSE_ALLOWANCE.asJson,
+      "maxCloseFee" -> RentAuctionContracts.MAX_CLOSE_FEE.asJson,
+      "collectorShareDenominator" -> RentAuctionContracts.COLLECTOR_SHARE_DENOMINATOR.asJson,
+      "mergeBudget" -> RentAuctionContracts.MERGE_BUDGET.asJson,
+      "minimumDepositValue" -> RentAuctionContracts.MIN_DEPOSIT_VALUE.asJson,
+      "maxDepositBytes" -> RentAuctionContracts.MAX_DEPOSIT_BYTES.asJson,
+      "maxPartyBytes" -> RentAuctionContracts.MAX_PARTY_BYTES.asJson,
+      "maxBytePrice" -> RentAuctionContracts.MAX_BYTE_PRICE.asJson,
+      "payoutOverheadBytes" -> RentAuctionContracts.PAYOUT_OVERHEAD_BYTES.asJson,
+      "tokenEntryBytes" -> RentAuctionContracts.TOKEN_ENTRY_BYTES.asJson,
+      "maxCloseLots" -> RentAuctionContracts.MAX_CLOSE_LOTS.asJson,
+      "maxMergeDeposits" -> RentAuctionContracts.MAX_MERGE_DEPOSITS.asJson,
+      "maxMergeFee" -> RentAuctionContracts.MAX_MERGE_FEE.asJson)
   }
 
   def prepare(request: Json, chain: ChainSettings): Try[Json] =
@@ -71,7 +84,7 @@ object RentAuctionCli extends ApiCodecs {
     val fee = c.downField("parameters").get[Int]("storageFeeFactor").toTry.get
     val boxes = c.get[Vector[ErgoBox]]("boxes").toTry.get
     val contracts = chain.rentAuctionContracts
-    Json.obj("height" -> height.asJson, "boxes" -> boxes.map { b =>
+    Json.obj("schemaVersion" -> 2.asJson, "height" -> height.asJson, "boxes" -> boxes.map { b =>
       val charge = fee * b.bytes.length
       val eligible = height - b.creationHeight >=
         org.ergoplatform.settings.Constants.StoragePeriod
@@ -89,6 +102,11 @@ object RentAuctionCli extends ApiCodecs {
         "deposit" -> (b.ergoTree == contracts.deposit).asJson,
         "deadline" -> deadline.asJson,
         "bid" -> longRegister(ErgoBox.R6).asJson,
+        "seedPrincipal" -> longRegister(ErgoBox.R8).asJson,
+        "collector" -> Try(Base16.encode(b.additionalRegisters(ErgoBox.R9)
+          .value.asInstanceOf[sigma.Coll[Byte]].toArray)).toOption.asJson,
+        "collectionCommitment" -> Try(Base16.encode(b.additionalRegisters(ErgoBox.R4)
+          .value.asInstanceOf[sigma.Coll[Byte]].toArray)).toOption.asJson,
         "box" -> b.asJson)
     }.asJson)
   }
@@ -102,7 +120,7 @@ object RentAuctionCli extends ApiCodecs {
     val p = c.downField("parameters")
     val storageFee = p.get[Int]("storageFeeFactor").toTry.get
     val dust = p.get[Int]("minValuePerByte").toTry.get
-    require(storageFee > 0 && dust > 0, "Invalid storage/dust parameters")
+    require(storageFee >= 0 && dust >= 0 && dust <= RentAuctionContracts.MAX_BYTE_PRICE, "Invalid storage/dust parameters")
     val params = new Parameters(height, Parameters.DefaultParameters ++ Map(
       Parameters.StorageFeeFactorIncrease -> storageFee,
       Parameters.MinValuePerByteIncrease -> dust,
@@ -116,23 +134,46 @@ object RentAuctionCli extends ApiCodecs {
     def fee: Long = c.get[Option[Long]]("fee").toTry.get.getOrElse(1000000L)
     val plan: RentAuctionPlan = c.get[String]("action").toTry.get match {
       case "collect" => builder.collect(boxes("sources"), boxes("funding"),
-        script("beneficiary"), script("change"), fee,
-        c.get[Option[Long]]("seed").toTry.get.getOrElse(0L)).get
+        script("beneficiary"), script("collector"), script("change"), fee,
+        partition = c.get[Option[Vector[Vector[Json]]]]("lots").toTry.get.toSeq.flatten.map { lot =>
+          lot.map { entry =>
+            val id = Base16.decode(entry.hcursor.get[String]("tokenId").toTry.get).get
+            require(id.length == 32, "Token id must contain 32 bytes")
+            (sigma.data.Digest32Coll @@ sigma.Colls.fromArray(id)) ->
+              entry.hcursor.get[Long]("amount").toTry.get
+          }
+        },
+        seed = c.get[Option[Long]]("seed").toTry.get.getOrElse(0L)).get
       case "bid" => builder.bid(one("auction"), boxes("funding"),
         c.get[Long]("bid").toTry.get, script("recipient"), script("change"), fee).get
-      case "settle" => builder.settle(one("auction"), boxes("funding"),
-        script("closer"), fee).get
+      case "close" => builder.close(boxes("auctions"), fee).get
       case "merge" => builder.merge(one("reserve"), boxes("deposits"),
         c.get[Option[ErgoBox]]("sponsor").toTry.get).get
       case other => throw new IllegalArgumentException(s"Unknown action: $other")
     }
+    val rules = new RentAuctionRules(chain.rentAuctionContracts, params)
+    val accounting = (plan.boxes ++ plan.transaction.outputs)
+      .filter(_.ergoTree == chain.rentAuctionContracts.auction).map { b =>
+        val bid = b.additionalRegisters(ErgoBox.R6).value.asInstanceOf[Long]
+        val seed = b.additionalRegisters(ErgoBox.R8).value.asInstanceOf[Long]
+        val recipient = b.additionalRegisters(ErgoBox.R7).value.asInstanceOf[sigma.Coll[Byte]]
+        val carrier = if (bid == 0L) 0L else rules.carrier(recipient.length, b.additionalTokens.length)
+        val share = bid / RentAuctionContracts.COLLECTOR_SHARE_DENOMINATOR
+        Json.obj("boxId" -> Base16.encode(b.id).asJson, "seedPrincipal" -> seed.asJson,
+          "closeAllowance" -> RentAuctionContracts.CLOSE_ALLOWANCE.asJson,
+          "bid" -> bid.asJson, "collectorShare" -> share.asJson, "carrier" -> carrier.asJson,
+          "reservePrincipal" -> (if (bid == 0L) 0L else
+            bid - share - carrier - RentAuctionContracts.MERGE_BUDGET).asJson)
+      }
     val signing = Json.obj(
       "tx" -> plan.unsigned.asJson,
       "inputsRaw" -> plan.boxes.map(b => Base16.encode(b.bytes)).asJson,
       "dataInputsRaw" -> Json.arr())
     Json.obj(
-      "schemaVersion" -> 1.asJson,
+      "schemaVersion" -> 2.asJson,
       "height" -> height.asJson,
+      "auctionAccounting" -> accounting.asJson,
+      "feePaid" -> plan.transaction.outputs.last.value.asJson,
       "transactionId" -> plan.transaction.id.asJson,
       "unsignedTransaction" -> plan.unsigned.asJson,
       "signingRequest" -> signing,

@@ -61,7 +61,7 @@ class RentAuctionStateSpec extends ErgoCorePropertyTest with RentAuctionFixture 
       Seq(token -> 100L))
     val funding = box(30000000L)
     val plan = new RentAuctionTransactions(contracts, params, height)
-      .collect(IndexedSeq(source), IndexedSeq(funding), owner, anyone, 1000000L).get
+      .collect(IndexedSeq(source), IndexedSeq(funding), owner, owner, anyone, 1000000L).get
     val s = settings()
     val us = state(plan.boxes, s)
     val digestDirectory = Files.createTempDirectory("rent-digest-").toFile
@@ -100,7 +100,7 @@ class RentAuctionStateSpec extends ErgoCorePropertyTest with RentAuctionFixture 
     val source = box(1000000L, nobody, height - Constants.StoragePeriod,
       Seq(token -> 100L))
     val plan = new RentAuctionTransactions(contracts, params, height)
-      .collect(IndexedSeq(source), IndexedSeq(box(30000000L)), owner,
+      .collect(IndexedSeq(source), IndexedSeq(box(30000000L)), owner, owner,
         anyone, 1000000L).get
     val base = state(plan.boxes, settings())
     val us = new UtxoState(base.persistentProver, base.version, base.store, settings()) {

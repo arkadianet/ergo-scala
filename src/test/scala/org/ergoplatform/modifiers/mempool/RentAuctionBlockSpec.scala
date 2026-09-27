@@ -52,13 +52,10 @@ class RentAuctionBlockSpec extends ErgoCorePropertyTest with RentAuctionFixture 
   property("collection and consecutive bids share a block at arbitrary positions") {
     val source = box(1000000L, nobody, height - Constants.StoragePeriod,
       Seq(token -> 100L))
-    val sponsor = box(RentAuctionContracts.SEED)
-    val initialLot = output(RentAuctionContracts.SEED, contracts.auction,
-      tokens = Seq(token -> 100L), registers = lotRegisters(source.id,
-        height + RentAuctionContracts.WINDOW,
-        height + RentAuctionContracts.MAXIMUM_WINDOW))
-    val collect = transaction(IndexedSeq(source, sponsor),
-      IndexedSeq(initialLot, output(source.value, owner)), Map(0 -> 0.toShort))
+    val sponsor = box(100000000L)
+    val collection = new RentAuctionTransactions(contracts, params, height)
+      .collect(IndexedSeq(source), IndexedSeq(sponsor), owner, owner, anyone, 1000000L).get
+    val collect = collection.transaction
     val first = bidSpend(collect.outputs.head, RentAuctionContracts.MINIMUM_BID)
     val second = bidSpend(first.tx.outputs.head,
       RentAuctionContracts.MINIMUM_BID + RentAuctionContracts.INCREMENT)
@@ -88,7 +85,7 @@ class RentAuctionBlockSpec extends ErgoCorePropertyTest with RentAuctionFixture 
   property("settlement and reserve merge execute in one block with net state changes") {
     val b = lot(100000000L)
     val settlement = settleSpend(b, height + RentAuctionContracts.WINDOW)
-    val merge = mergeSpend(IndexedSeq(settlement.tx.outputs(1)), settlement.at)
+    val merge = mergeSpend(IndexedSeq(settlement.tx.outputs(2)), settlement.at)
     val txs = Seq(settlement.tx, merge.tx)
     val initial = IndexedSeq(b, merge.boxes.head)
     val cost = executeBlockTransactions(

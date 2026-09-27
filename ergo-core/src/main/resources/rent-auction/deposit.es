@@ -20,7 +20,7 @@
     SELF.id != reserve.id &&
     deposits.forall { (b: Box) =>
       b.propositionBytes == SELF.propositionBytes && b.tokens.size == 0 &&
-        b.R4[Coll[Byte]].get.size == 32 && b.value >= __MIN_BID__L + budget
+        b.R4[Coll[Byte]].get.size == 32 && b.value >= __MIN_DEPOSIT_VALUE__L
     } &&
     reserve.propositionBytes == reserveTree && reserve.tokens.size >= 1 &&
     reserve.tokens(0) == (nft, 1L) &&

@@ -21,9 +21,15 @@ import scorex.util.ModifierId
 import sigma.ast.ByteArrayConstant
 import sigma.ast.ErgoTree
 import sigma.ast.EvaluatedValue
+import sigma.ast.IntConstant
 import sigma.ast.IntArrayConstant
 import sigma.ast.LongConstant
 import sigma.ast.ShortConstant
+import sigma.ast.SigmaPropConstant
+import sigma.ast.SigmaAnd
+import sigma.ast.BoolToSigmaProp
+import sigma.ast.GE
+import sigma.ast.SizeOf
 import sigma.ast.SType
 import sigma.Coll
 import sigma.Colls
@@ -72,6 +78,39 @@ trait RentAuctionFixture {
     Digest32Coll @@ chain.reemission.reemissionNftIdBytes
   private var sequence: Int = 0
 
+  protected lazy val recipient256: ErgoTree = {
+    val pk = SigmaPropConstant(defaults.defaultMinerPk)
+    val trees = for {
+      n <- (1 to 250).iterator
+      k <- Iterator(0, 64, 8192, 1048576, 134217728)
+    } yield ErgoTree.fromProposition(ErgoTree.defaultHeaderWithVersion(0),
+      SigmaAnd(pk, BoolToSigmaProp(
+        GE(SizeOf(ByteArrayConstant(Array.fill(n)(1.toByte))), IntConstant(k)))))
+    trees.find(_.bytes.length == 256).get
+  }
+
+  protected def priced(price: Int): Parameters = new Parameters(0,
+    params.parametersTable.updated(Parameters.MinValuePerByteIncrease, price), defaults.emptyVSUpdate)
+
+  protected def tokens(count: Int, amount: Long = 1000000000L): Seq[(Digest32Coll, Long)] =
+    (1 to count).map(i => (Digest32Coll @@ Colls.fromArray(Blake2b256(s"v2-token-$i"))) -> amount)
+
+  protected def collectPlan(count: Int = 1, p: Parameters = params,
+    collector: ErgoTree = owner, at: Int = height): RentAuctionPlan = {
+    val sources = tokens(count).map { t =>
+      box(1000000L, nobody, at - Constants.StoragePeriod, Seq(t))
+    }.toIndexedSeq
+    new RentAuctionTransactions(contracts, p, at).collect(sources,
+      IndexedSeq(box(1000000000L, created = at)), owner, collector, anyone,
+      if (p.minValuePerByte > 360) 2000000L else 1000000L).get
+  }
+
+  protected def native(plan: RentAuctionPlan, p: Parameters = params): Try[Int] =
+    plan.transaction.statelessValidity().flatMap { _ =>
+      plan.transaction.statefulValidity(plan.boxes, IndexedSeq.empty,
+        context(plan.height).copy(currentParameters = p)(chain))(ErgoInterpreter(p))
+    }
+
   protected def context(h: Int): UpcomingStateContext = {
     val pre = CPreHeader(
       Header.Interpreter60Version, Header.GenesisParentId,
@@ -116,13 +155,14 @@ trait RentAuctionFixture {
     cap: Int,
     bid: Long = 0L,
     recipient: Array[Byte] = Array.emptyByteArray,
-    seed: Long = RentAuctionContracts.SEED
+    seed: Long = 5000000L
   ): Map[ErgoBox.NonMandatoryRegisterId, EvaluatedValue[_ <: SType]] = Map(
     ErgoBox.R4 -> ByteArrayConstant(id),
     ErgoBox.R5 -> IntArrayConstant(Array(end, cap)),
     ErgoBox.R6 -> LongConstant(bid),
     ErgoBox.R7 -> ByteArrayConstant(recipient),
-    ErgoBox.R8 -> LongConstant(seed)
+    ErgoBox.R8 -> LongConstant(seed),
+    ErgoBox.R9 -> ByteArrayConstant(owner.bytes)
   )
 
   protected def lot(
@@ -131,9 +171,9 @@ trait RentAuctionFixture {
     cap: Int = height + RentAuctionContracts.MAXIMUM_WINDOW,
     recipient: ErgoTree = Constants.TrueTree,
     created: Int = height,
-    seed: Long = RentAuctionContracts.SEED
+    seed: Long = 5000000L
   ): ErgoBox = box(
-    seed + bid, contracts.auction, created,
+    seed + RentAuctionContracts.CLOSE_ALLOWANCE + bid, contracts.auction, created,
     Seq(token -> 100L),
     lotRegisters(
       Array.fill(32)(9.toByte), end, cap, bid,
@@ -227,30 +267,35 @@ trait RentAuctionFixture {
 
   protected def settleSpend(b: ErgoBox, at: Int): Spend = {
     val bid = b.additionalRegisters(ErgoBox.R6).value.asInstanceOf[Long]
-    val recipientBytes =
-      b.additionalRegisters(ErgoBox.R7).value.asInstanceOf[Coll[Byte]].toArray
-    val recipient =
-      ErgoTreeSerializer.DefaultSerializer.deserializeErgoTree(recipientBytes)
-    val winner = output(
-      RentAuctionContracts.CARRIER, recipient, at,
-      b.additionalTokens.toArray.toSeq, tag(b.id)
-    )
-    val deposit = output(
-      bid + RentAuctionContracts.MERGE_BUDGET, contracts.deposit, at,
-      registers = tag(b.id)
-    )
-    val fee = output(
-      b.value - bid - RentAuctionContracts.CARRIER -
-        RentAuctionContracts.MERGE_BUDGET,
-      contracts.fee, at
-    )
-    val inputs = IndexedSeq(b)
-    Spend(transaction(inputs, IndexedSeq(winner, deposit, fee)), inputs, at)
+    val seed = b.additionalRegisters(ErgoBox.R8).value.asInstanceOf[Long]
+    val collector = ErgoTreeSerializer.DefaultSerializer.deserializeErgoTree(
+      b.additionalRegisters(ErgoBox.R9).value.asInstanceOf[Coll[Byte]].toArray)
+    val fee = 1000000L
+    val share = bid / RentAuctionContracts.COLLECTOR_SHARE_DENOMINATOR
+    val returned = output(seed + RentAuctionContracts.CLOSE_ALLOWANCE - fee + share,
+      collector, at, registers = tag(b.id))
+    val sale = if (bid == 0L) IndexedSeq.empty else {
+      val recipient = ErgoTreeSerializer.DefaultSerializer.deserializeErgoTree(
+        b.additionalRegisters(ErgoBox.R7).value.asInstanceOf[Coll[Byte]].toArray)
+      val carrier = new RentAuctionRules(contracts, params)
+        .carrier(recipient.bytes.length, b.additionalTokens.length)
+      IndexedSeq(output(carrier, recipient, at, b.additionalTokens.toArray.toSeq, tag(b.id)),
+        output(bid - share - carrier, contracts.deposit, at, registers = tag(b.id)))
+    }
+    val extension = ContextExtension(Map(0.toByte -> IntConstant(0),
+      1.toByte -> LongConstant(fee), 2.toByte -> IntConstant(params.minValuePerByte)))
+    val tx = ErgoTransaction(IndexedSeq(Input(b.id,
+      ProverResult(Array.emptyByteArray, extension))),
+      IndexedSeq(returned) ++ sale :+ output(fee, contracts.fee, at))
+    Spend(tx, IndexedSeq(b), at)
   }
 
-  protected def burnSpend(b: ErgoBox, at: Int): Spend = {
-    val inputs = IndexedSeq(b)
-    Spend(transaction(inputs, IndexedSeq(output(b.value, contracts.fee, at))), inputs, at)
+  protected def burnSpend(b: ErgoBox, at: Int): Spend = settleSpend(b, at)
+
+  protected def nativeRejected(spend: Spend, reason: String): Unit = {
+    val result = spend.result
+    require(result.isFailure, "Expected native validation failure")
+    require(result.failed.get.getMessage.contains(reason), result.failed.get.getMessage)
   }
 
   protected def depositBox(principal: Long, at: Int = height): ErgoBox = box(

@@ -14,6 +14,7 @@ import sigma.Coll
 import sigma.Colls
 import sigma.ast.ByteArrayConstant
 import sigma.ast.ErgoTree
+import sigma.ast.IntConstant
 import sigma.ast.IntArrayConstant
 import sigma.ast.LongConstant
 import sigma.ast.ShortConstant
@@ -41,13 +42,16 @@ final class RentAuctionTransactions(
   parameters: Parameters,
   height: Int
 ) {
-  import RentAuctionContracts.CARRIER
+  import RentAuctionContracts.CLOSE_ALLOWANCE
+  import RentAuctionContracts.COLLECTOR_SHARE_DENOMINATOR
+  import RentAuctionContracts.MAX_CLOSE_FEE
+  import RentAuctionContracts.MAX_CLOSE_LOTS
+  import RentAuctionContracts.MIN_DEPOSIT_VALUE
   import RentAuctionContracts.EXTENSION
   import RentAuctionContracts.INCREMENT
   import RentAuctionContracts.MAXIMUM_WINDOW
   import RentAuctionContracts.MERGE_BUDGET
   import RentAuctionContracts.MINIMUM_BID
-  import RentAuctionContracts.SEED
   import RentAuctionContracts.TOKENS_PER_LOT
   import RentAuctionContracts.WINDOW
 
@@ -83,14 +87,15 @@ final class RentAuctionTransactions(
     inputs: IndexedSeq[ErgoBox],
     outputs: IndexedSeq[ErgoBoxCandidate],
     rent: Map[Int, Short] = Map.empty,
-    beneficiary: Option[ErgoTree] = None
+    beneficiary: Option[ErgoTree] = None,
+    extensions: Map[Int, ContextExtension] = Map.empty
   ): RentAuctionPlan = {
     require(inputs.nonEmpty, "At least one input is required")
     require(inputs.forall(_.creationHeight <= height), "Input is newer than height")
     val tx = ErgoTransaction(inputs.zipWithIndex.map { case (b, i) =>
-      val extension = rent.get(i).map { index =>
+      val extension = extensions.getOrElse(i, rent.get(i).map { index =>
         ContextExtension(Map(Constants.StorageIndexVarId -> ShortConstant(index)))
-      }.getOrElse(ContextExtension.empty)
+      }.getOrElse(ContextExtension.empty))
       Input(b.id, ProverResult(Array.emptyByteArray, extension))
     }, outputs)
     tx.statelessValidity().get
@@ -114,7 +119,10 @@ final class RentAuctionTransactions(
     beneficiary: Option[ErgoTree] = None
   ): RentAuctionPlan = {
     require(fee > 0, "Fee must be positive")
-    val feeBox = funded(out(fee, contracts.fee))
+    val feeBox = out(fee, contracts.fee)
+    require(fee >= BoxUtils.minimalErgoAmount(
+      feeBox.toBox(ErgoBox.allZerosModifierId, Short.MaxValue), parameters),
+      "Requested fee is below native fee-box dust")
     val remainder = amount(inputs.map(b => BigInt(b.value)).sum -
       outputs.map(b => BigInt(b.value)).sum - feeBox.value)
     val changeBox = out(remainder, change)
@@ -125,51 +133,64 @@ final class RentAuctionTransactions(
     checked(inputs, finalOutputs, rent, beneficiary)
   }
 
-  def suggestedSeed: Long = math.max(SEED,
-    3L * BoxUtils.sufficientAmount(parameters))
-
   def collect(
     sources: IndexedSeq[ErgoBox],
     funding: IndexedSeq[ErgoBox],
     beneficiary: ErgoTree,
+    collector: ErgoTree,
     change: ErgoTree,
     fee: Long,
+    partition: Seq[Seq[(Digest32Coll, Long)]] = Seq.empty,
     seed: Long = 0L
   ): Try[RentAuctionPlan] = Try {
     require(sources.nonEmpty, "No rent sources selected")
     require(height <= Int.MaxValue - MAXIMUM_WINDOW, "Deadline would overflow")
+    require(rules.validRecipient(Colls.fromArray(collector.bytes)), "Invalid collector script")
     tokenFree(funding)
-    val initialValue = if (seed == 0) suggestedSeed else seed
-    require(initialValue >= SEED, "Auction seed is too small")
     val outputs = ArrayBuffer.empty[ErgoBoxCandidate]
     val rent = scala.collection.mutable.Map.empty[Int, Short]
+    val consumed = ArrayBuffer.empty[ErgoBox]
+    val tokens = scala.collection.mutable.Map.empty[Digest32Coll, BigInt]
     var rentAmount = BigInt(0)
     sources.zipWithIndex.foreach { case (b, index) =>
       require(height - b.creationHeight >= Constants.StoragePeriod,
         "Source has not reached storage-rent age")
       val charge = parameters.storageFeeFactor * b.bytes.length
       require(charge > 0, "Legacy wrapping rent charge is non-positive; skip this box")
-      require(outputs.size <= Short.MaxValue, "Too many auction outputs")
-      rent(index) = outputs.size.toShort
+      require(outputs.size <= Short.MaxValue, "Too many recreation outputs")
       if (b.value > charge) {
+        rent(index) = outputs.size.toShort
         outputs += out(b.value - charge, b.ergoTree,
           b.additionalTokens.toArray.toSeq, b.additionalRegisters)
         rentAmount += charge
       } else {
+        rent(index) = 0.toShort
         rentAmount += b.value
-        rules.auctionTokens(b, height).grouped(TOKENS_PER_LOT).foreach { tokens =>
-          val registers: ErgoBox.AdditionalRegisters = Map(
-            ErgoBox.R4 -> ByteArrayConstant(b.id),
-            ErgoBox.R5 -> IntArrayConstant(Array(height + WINDOW,
-              height + MAXIMUM_WINDOW)),
-            ErgoBox.R6 -> LongConstant(0L),
-            ErgoBox.R7 -> ByteArrayConstant(Array.emptyByteArray),
-            ErgoBox.R8 -> LongConstant(initialValue))
-          outputs += out(initialValue, contracts.auction, tokens, registers)
+        val auctionable = rules.auctionTokens(b, height)
+        if (auctionable.nonEmpty) consumed += b
+        auctionable.foreach { case (id, quantity) =>
+          tokens.update(id, tokens.getOrElse(id, BigInt(0)) + quantity)
         }
       }
     }
-    // An empty token-free source may point at the producer output below.
+    val packed = if (partition.nonEmpty) partition else tokens.toSeq
+      .sortBy(t => scorex.util.encode.Base16.encode(t._1.toArray))
+      .map { case (id, quantity) => id -> amount(quantity) }.grouped(TOKENS_PER_LOT).toSeq
+    val origin = rules.commitment(consumed.toSeq)
+    packed.foreach { lotTokens =>
+      val registers: ErgoBox.AdditionalRegisters = Map(
+        ErgoBox.R4 -> ByteArrayConstant(origin),
+        ErgoBox.R5 -> IntArrayConstant(Array(height + WINDOW, height + MAXIMUM_WINDOW)),
+        ErgoBox.R6 -> LongConstant(0L),
+        ErgoBox.R7 -> ByteArrayConstant(Array.emptyByteArray),
+        ErgoBox.R8 -> LongConstant(1L),
+        ErgoBox.R9 -> ByteArrayConstant(collector.bytes))
+      val template = out(CLOSE_ALLOWANCE + 1L, contracts.auction, lotTokens, registers)
+      val principal = if (seed == 0L) rules.openingSeed(template) else seed
+      require(principal >= rules.openingSeed(template), "Auction seed is too small")
+      outputs += out(amount(BigInt(principal) + CLOSE_ALLOWANCE), contracts.auction,
+        lotTokens, registers.updated(ErgoBox.R8, LongConstant(principal)))
+    }
     outputs += funded(out(amount(rentAmount), beneficiary))
     if (contracts.chain.reemission.checkReemissionRules &&
       height > contracts.chain.reemission.activationHeight) {
@@ -203,7 +224,7 @@ final class RentAuctionTransactions(
       ErgoBox.R5 -> IntArrayConstant(Array(nextEnd, limits(1))),
       ErgoBox.R6 -> LongConstant(bid),
       ErgoBox.R7 -> ByteArrayConstant(recipient.bytes))
-    val successor = out(amount(BigInt(seed) + bid), contracts.auction,
+    val successor = out(amount(BigInt(seed) + CLOSE_ALLOWANCE + bid), contracts.auction,
       auction.additionalTokens.toArray.toSeq, registers)
     val refund = if (previous == 0L) IndexedSeq.empty else {
       val bytes = auction.additionalRegisters(ErgoBox.R7)
@@ -214,28 +235,37 @@ final class RentAuctionTransactions(
     finish(auction +: funding, IndexedSeq(successor) ++ refund, change, fee)
   }
 
-  def settle(
-    auction: ErgoBox,
-    funding: IndexedSeq[ErgoBox],
-    closer: ErgoTree,
-    fee: Long
-  ): Try[RentAuctionPlan] = Try {
-    require(auction.ergoTree == contracts.auction, "Not an auction box")
-    tokenFree(funding)
-    val limits = auction.additionalRegisters(ErgoBox.R5).value.asInstanceOf[Coll[Int]]
-    val bid = auction.additionalRegisters(ErgoBox.R6).value.asInstanceOf[Long]
-    require(height >= limits(0), "Auction is still open")
-    val outputs = if (bid == 0L) IndexedSeq.empty else {
-      val bytes = auction.additionalRegisters(ErgoBox.R7)
-        .value.asInstanceOf[Coll[Byte]].toArray
-      val recipient = ErgoTreeSerializer.DefaultSerializer.deserializeErgoTree(bytes)
-      IndexedSeq(
-        funded(out(CARRIER, recipient, auction.additionalTokens.toArray.toSeq,
-          tag(auction))),
-        funded(out(amount(BigInt(bid) + MERGE_BUDGET), contracts.deposit,
-          registers = tag(auction))))
+  def close(auctions: IndexedSeq[ErgoBox], fee: Long): Try[RentAuctionPlan] = Try {
+    require(auctions.nonEmpty && auctions.size <= MAX_CLOSE_LOTS, "Close requires 1 to 32 lots")
+    require(fee > 0L && fee <= MAX_CLOSE_FEE, "Invalid close fee")
+    val outputs = ArrayBuffer.empty[ErgoBoxCandidate]
+    val extensions = scala.collection.mutable.Map.empty[Int, ContextExtension]
+    auctions.zipWithIndex.foreach { case (auction, i) =>
+      require(auction.ergoTree == contracts.auction, "Not an auction box")
+      val limits = auction.additionalRegisters(ErgoBox.R5).value.asInstanceOf[Coll[Int]]
+      require(height >= limits(0), "Auction is still open")
+      val bid = auction.additionalRegisters(ErgoBox.R6).value.asInstanceOf[Long]
+      val seed = auction.additionalRegisters(ErgoBox.R8).value.asInstanceOf[Long]
+      val f = fee / auctions.size + (if (i < fee % auctions.size) 1L else 0L)
+      extensions(i) = ContextExtension(Map(
+        0.toByte -> IntConstant(outputs.size), 1.toByte -> LongConstant(f),
+        2.toByte -> IntConstant(parameters.minValuePerByte)))
+      val collector = ErgoTreeSerializer.DefaultSerializer.deserializeErgoTree(
+        auction.additionalRegisters(ErgoBox.R9).value.asInstanceOf[Coll[Byte]].toArray)
+      val share = bid / COLLECTOR_SHARE_DENOMINATOR
+      outputs += out(amount(BigInt(seed) + CLOSE_ALLOWANCE - f + share), collector,
+        registers = tag(auction))
+      if (bid > 0L) {
+        val recipient = ErgoTreeSerializer.DefaultSerializer.deserializeErgoTree(
+          auction.additionalRegisters(ErgoBox.R7).value.asInstanceOf[Coll[Byte]].toArray)
+        val carrier = rules.carrier(recipient.bytes.length, auction.additionalTokens.length)
+        outputs += out(carrier, recipient, auction.additionalTokens.toArray.toSeq, tag(auction))
+        outputs += out(amount(BigInt(bid) - share - carrier), contracts.deposit,
+          registers = tag(auction))
+      }
     }
-    finish(auction +: funding, outputs, closer, fee)
+    outputs += out(fee, contracts.fee)
+    checked(auctions, outputs.toIndexedSeq, extensions = extensions.toMap)
   }
 
   def merge(
@@ -249,7 +279,7 @@ final class RentAuctionTransactions(
     require(reserve.additionalTokens.nonEmpty &&
       reserve.additionalTokens(0) == (nft -> 1L), "Incorrect reserve NFT")
     require(deposits.forall(b => b.ergoTree == contracts.deposit &&
-      b.additionalTokens.isEmpty && b.value >= MINIMUM_BID + MERGE_BUDGET),
+      b.additionalTokens.isEmpty && b.value >= MIN_DEPOSIT_VALUE),
       "Malformed proceeds deposit")
     tokenFree(sponsor.toIndexedSeq)
     val principal = deposits.map(b => BigInt(b.value) - MERGE_BUDGET).sum

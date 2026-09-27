@@ -10,7 +10,6 @@ import sigma.ast.IntArrayConstant
 import sigma.ast.IntConstant
 
 class RentAuctionContractSpec extends ErgoCorePropertyTest with RentAuctionFixture {
-  import RentAuctionContracts.CARRIER
   import RentAuctionContracts.INCREMENT
   import RentAuctionContracts.MAXIMUM_WINDOW
   import RentAuctionContracts.MERGE_BUDGET
@@ -19,18 +18,20 @@ class RentAuctionContractSpec extends ErgoCorePropertyTest with RentAuctionFixtu
 
   private def rejects(spend: Spend): Unit = {
     spend.tx.statelessValidity().isSuccess shouldBe true
-    spend.result.isFailure shouldBe true
+    nativeRejected(spend, "Scripts of all transaction inputs should pass verification")
   }
 
   property("compile both contracts with the Scala Sigma compiler") {
     contracts.auction.bytes.length should be < 4096
     contracts.deposit.bytes.length should be < 4096
+    Seq("auction" -> contracts.auction, "deposit" -> contracts.deposit).foreach { case (name, tree) =>
+      (tree.header & 7) shouldBe 0
+      info(s"TREE $name bytes=${tree.bytes.length} blake2b256=${Base16.encode(Blake2b256(tree.bytes))}")
+    }
     Base16.encode(Blake2b256(contracts.auction.bytes)) shouldBe
-      "2d8fa0b8de876e355140f9e1869ef896fa1c7f97004e54a5998eb711b4d61d3d"
+      "3643df8a7e682486e5ffa7b3a113a65b18c3f65320856c3e32616afaf2c8ce09"
     Base16.encode(Blake2b256(contracts.deposit.bytes)) shouldBe
-      "11291b4314346bd6891da123de61bd61c7cdd5e078d34a884a888918cc5570cc"
-    info(s"Auction tree: ${contracts.auction.bytes.length} bytes")
-    info(s"Deposit tree: ${contracts.deposit.bytes.length} bytes")
+      "1cb94a993884ef836418ee714efa8169d23adc2bdca8a2dcd8c71c57f91ba845"
     chain.isMainnet shouldBe true
     chain.reemission.checkReemissionRules shouldBe true
     params.blockVersion shouldBe 4
@@ -115,33 +116,34 @@ class RentAuctionContractSpec extends ErgoCorePropertyTest with RentAuctionFixtu
     rejects(bidSpend(lot(), MINIMUM_BID, at = end))
   }
 
-  property("settlement is permissionless at the deadline and pays the complete bid") {
+  property("settlement returns backing and deducts only designed costs from the bid") {
     val end = height + WINDOW
     val b = lot(100000000L, recipient = owner)
     rejects(settleSpend(b, end - 1))
     val spend = settleSpend(b, end)
     spend.result.get should be > 0
-    spend.tx.outputCandidates(1).value - MERGE_BUDGET shouldBe 100000000L
+    spend.tx.outputCandidates(2).value - MERGE_BUDGET shouldBe
+      100000000L - 10000000L - spend.tx.outputCandidates(1).value - MERGE_BUDGET
     info(s"Settlement transaction cost: ${spend.result.get}")
   }
 
   property("settlement rejects a stolen winner output or legacy proceeds destination") {
     val spend = settleSpend(lot(100000000L, recipient = owner), height + WINDOW)
     val outs = spend.tx.outputCandidates
-    rejects(spend.withOutputs(outs.updated(0, change(outs(0), CARRIER, anyone))))
-    rejects(spend.withOutputs(outs.updated(1,
-      change(outs(1), outs(1).value, contracts.legacyDeposit))))
+    rejects(spend.withOutputs(outs.updated(1, change(outs(1), outs(1).value, anyone))))
+    rejects(spend.withOutputs(outs.updated(2,
+      change(outs(2), outs(2).value, contracts.legacyDeposit))))
   }
 
   property("settlement cannot deduct proceeds or substitute another lot's payment") {
     val spend = settleSpend(lot(100000000L), height + WINDOW)
     val outs = spend.tx.outputCandidates
     rejects(spend.withOutputs(outs
-      .updated(1, change(outs(1), outs(1).value - 1L, contracts.deposit))
-      .updated(2, change(outs(2), outs(2).value + 1L, contracts.fee))))
-    val wrong = output(outs(1).value, contracts.deposit, spend.at,
+      .updated(2, change(outs(2), outs(2).value - 1L, contracts.deposit))
+      .updated(3, change(outs(3), outs(3).value + 1L, contracts.fee))))
+    val wrong = output(outs(2).value, contracts.deposit, spend.at,
       registers = tag(Array.fill(32)(1.toByte)))
-    rejects(spend.withOutputs(outs.updated(1, wrong)))
+    rejects(spend.withOutputs(outs.updated(2, wrong)))
   }
 
   property("unsold lots burn at the deadline and cannot be recreated or sold early") {
@@ -154,7 +156,8 @@ class RentAuctionContractSpec extends ErgoCorePropertyTest with RentAuctionFixtu
       Seq(token -> 100L)))))
     rejects(burn.withOutputs(IndexedSeq(output(b.value, contracts.auction, burn.at,
       registers = b.additionalRegisters))))
-    rejects(burnSpend(lot(MINIMUM_BID), height + WINDOW))
+    val sold = settleSpend(lot(MINIMUM_BID), height + WINDOW)
+    rejects(sold.withOutputs(IndexedSeq(output(sold.boxes.head.value, contracts.fee, sold.at))))
   }
 
   property("two auction inputs cannot share a single refund or settlement") {
@@ -163,8 +166,8 @@ class RentAuctionContractSpec extends ErgoCorePropertyTest with RentAuctionFixtu
     val spend = settleSpend(b, height + WINDOW)
     val outs = spend.tx.outputCandidates
     val inputs = IndexedSeq(b, other)
-    val tx = transaction(inputs, outs.updated(2,
-      change(outs(2), outs(2).value + other.value, contracts.fee)))
+    val tx = transaction(inputs, outs.updated(3,
+      change(outs(3), outs(3).value + other.value, contracts.fee)))
     rejects(Spend(tx, inputs, spend.at))
   }
 

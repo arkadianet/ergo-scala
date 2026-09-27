@@ -47,7 +47,8 @@ class RentAuctionDepositSpec extends ErgoCorePropertyTest with RentAuctionFixtur
     spend.tx.outputCandidates.head.value - spend.boxes.head.value shouldBe
       deposits.map(_.value - MERGE_BUDGET).sum
     info(s"Ten-deposit merge cost: ${spend.result.get}")
-    mergeSpend(deposits :+ depositBox(MINIMUM_BID)).result.isFailure shouldBe true
+    nativeRejected(mergeSpend(deposits :+ depositBox(MINIMUM_BID)),
+      "Scripts of all transaction inputs should pass verification")
   }
 
   property("two equal deposits cannot count the same reserve increase twice") {
@@ -56,7 +57,7 @@ class RentAuctionDepositSpec extends ErgoCorePropertyTest with RentAuctionFixtur
     val attack = spend.withOutputs(outs
       .updated(0, change(outs.head, outs.head.value - MINIMUM_BID, contracts.reserve))
       .updated(1, change(outs(1), outs(1).value + MINIMUM_BID, contracts.fee)))
-    attack.result.isFailure shouldBe true
+    nativeRejected(attack, "Scripts of all transaction inputs should pass verification")
   }
 
   property("the reward-withdrawal path cannot sweep a new deposit") {
@@ -71,7 +72,7 @@ class RentAuctionDepositSpec extends ErgoCorePropertyTest with RentAuctionFixtur
       output(reserve.value - reward, contracts.reserve, tokens = Seq(nft -> 1L)),
       output(reward + deposit.value, miner)
     ))
-    attack.result.isFailure shouldBe true
+    nativeRejected(attack, "Scripts of all transaction inputs should pass verification")
   }
 
   property("fees cannot be increased by subtracting from the bid principal") {
@@ -80,7 +81,7 @@ class RentAuctionDepositSpec extends ErgoCorePropertyTest with RentAuctionFixtur
     spend.withOutputs(outs
       .updated(0, change(outs.head, outs.head.value - 1L, contracts.reserve))
       .updated(1, change(outs(1), outs(1).value + 1L, contracts.fee)))
-      .result.isFailure shouldBe true
+      .result.failed.get.getMessage should include("Scripts of all transaction inputs should pass verification")
   }
 
   property("a counterfeited reserve script cannot receive auction proceeds") {
@@ -88,10 +89,10 @@ class RentAuctionDepositSpec extends ErgoCorePropertyTest with RentAuctionFixtur
     val counterfeit = box(spend.boxes.head.value, anyone, height - 1, Seq(nft -> 1L))
     val inputs = IndexedSeq(counterfeit, spend.boxes(1))
     validate(transaction(inputs, spend.tx.outputCandidates), inputs)
-      .isFailure shouldBe true
+      .failed.get.getMessage should include("Scripts of all transaction inputs should pass verification")
     val outs = spend.tx.outputCandidates
     spend.withOutputs(outs.updated(0, change(outs.head, outs.head.value, anyone)))
-      .result.isFailure shouldBe true
+      .result.failed.get.getMessage should include("Scripts of all transaction inputs should pass verification")
   }
 
   property("settlement and deposit merge execute as a connected transaction chain") {
@@ -99,9 +100,10 @@ class RentAuctionDepositSpec extends ErgoCorePropertyTest with RentAuctionFixtur
     bid.result.get should be > 0
     val settle = settleSpend(bid.tx.outputs.head, height + WINDOW)
     settle.result.get should be > 0
-    val merge = mergeSpend(IndexedSeq(settle.tx.outputs(1)), settle.at)
+    val merge = mergeSpend(IndexedSeq(settle.tx.outputs(2)), settle.at)
     merge.result.get should be > 0
-    merge.tx.outputCandidates.head.value - merge.boxes.head.value shouldBe 100000000L
+    merge.tx.outputCandidates.head.value - merge.boxes.head.value shouldBe
+      settle.tx.outputs(2).value - MERGE_BUDGET
   }
 
   property("unrelated tokens in the authentic reserve do not prevent merging") {
