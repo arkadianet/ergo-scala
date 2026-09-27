@@ -3,21 +3,26 @@ package org.ergoplatform.network
 import akka.actor.{ActorRef, Cancellable, Props}
 import akka.testkit.{TestActor, TestActorRef, TestProbe}
 import org.ergoplatform.consensus.Equal
+import org.ergoplatform.mining.InputBlockFields
+import org.ergoplatform.modifiers.history.extension.ExtensionCandidate
 import org.ergoplatform.modifiers.history.header.Header
 import org.ergoplatform.network.ErgoNodeViewSynchronizerMessages._
 import org.ergoplatform.network.message.{Message, ModifiersData, ModifiersSpec}
-import org.ergoplatform.network.message.inputblocks.{OrderingBlockAnnouncement, OrderingBlockAnnouncementMessageSpec}
+import org.ergoplatform.network.message.inputblocks.{InputBlockMessageSpec, OrderingBlockAnnouncement, OrderingBlockAnnouncementMessageSpec}
 import org.ergoplatform.network.peer.PeerInfo
 import org.ergoplatform.nodeView.ErgoNodeViewHolder.ReceivableMessages.ModifiersFromRemote
 import org.ergoplatform.nodeView.history.{ErgoHistory, ErgoSyncInfo, ErgoSyncInfoMessageSpec, ErgoSyncInfoV2}
 import org.ergoplatform.nodeView.mempool.ErgoMemPool
 import org.ergoplatform.nodeView.state.StateType
+import org.ergoplatform.nodeView.state.wrapped.WrappedUtxoState
 import org.ergoplatform.settings.ErgoSettings
+import org.ergoplatform.subblocks.InputBlockAnnouncement
 import org.ergoplatform.wallet.utils.FileUtils
 import org.scalatest.matchers.should.Matchers
 import org.scalatest.propspec.AnyPropSpec
 import scorex.core.network.{ConnectedPeer, DeliveryTracker, SendToPeer, SendToPeers}
 import scorex.core.network.NetworkController.ReceivableMessages.SendToNetwork
+import scorex.crypto.hash.Digest32
 import scorex.testkit.utils.AkkaFixture
 
 import scala.concurrent.{Await, ExecutionContext}
@@ -41,7 +46,7 @@ class PostProgressSyncSpecification extends AnyPropSpec with Matchers with FileU
     implicit val ec: ExecutionContext = system.dispatcher
     val config = settings.copy(directory = createTempDir.getAbsolutePath)
     val history = ErgoHistory.readOrGenerate(config)(null)
-    val blocks = genChain(8, history).toVector
+    val blocks = genChain(8, history, nBits = config.chainSettings.initialNBits).toVector
     applyChain(history, blocks.take(3))
     val nc = TestProbe()
     val vh = TestProbe()
@@ -63,6 +68,37 @@ class PostProgressSyncSpecification extends AnyPropSpec with Matchers with FileU
         Some(PeerInfo(spec, System.currentTimeMillis())))
       tracker.updateStatus(p, Equal, Some(height))
       p
+    }
+
+    var inputState: Option[WrappedUtxoState] = None
+
+    def input(height: Int): InputBlockAnnouncement = {
+      import org.ergoplatform.utils.ErgoCoreTestConstants.{defaultExtension, parameters}
+      import org.ergoplatform.utils.generators.ErgoNodeTransactionGenerators.boxesHolderGen
+      if (inputState.isEmpty) {
+        inputState = Some(WrappedUtxoState(boxesHolderGen.sample.get, createTempDir, parameters, config))
+        actor ! ChangedState(inputState.get)
+      }
+      val digest = Digest32 @@ Array.fill(32)(0.toByte)
+      val extension = defaultExtension ++ InputBlockFields.toExtensionFields(None, digest, digest)
+      val block = nextBlock(Some(blocks(height - 2)), blocks.head.blockTransactions.txs, extension,
+        nBits = config.chainSettings.initialNBits)
+      val proof = ExtensionCandidate(block.extension.fields).proofForInputBlockData.get
+      val frame = InputBlockAnnouncement(InputBlockAnnouncement.initialMessageVersion,
+        block.header, new InputBlockFields(None, digest, digest, proof), None)
+      frame.valid(config.chainSettings.powScheme, inputState.get.stateContext.currentParameters,
+        Some(block.header.nBits)) shouldBe true
+      frame
+    }
+
+    def supply(frame: InputBlockAnnouncement, p: ConnectedPeer): Unit = {
+      actor ! Message(InputBlockMessageSpec, Left(InputBlockMessageSpec.toBytes(frame)), Some(p))
+    }
+
+    def completeThrough(height: Int): Unit = {
+      applyChain(history, blocks.slice(history.fullBlockHeight, height))
+      actor ! ChangedHistory(history)
+      history.fullBlockHeight shouldBe height
     }
 
     def request(headers: Seq[Header], p: ConnectedPeer): Unit = {
@@ -98,6 +134,167 @@ class PostProgressSyncSpecification extends AnyPropSpec with Matchers with FileU
     try test(f) finally {
       Await.result(f.system.terminate(), Duration.Inf)
       f.history.closeStorage()
+      f.inputState.foreach(_.closeStorage())
+    }
+  }
+
+  property("relevant input supplier with stale tracked height gets the tip learned from another peer") {
+    fixture { f =>
+      import f._
+      val supplier = peer(height = 1)
+      val source = peer(height = 100)
+      supply(input(4), supplier)
+      vh.expectMsgType[ProcessInputBlock]
+      request(Seq(blocks(3).header), source)
+      syncs(100.millis)
+      applyHeaders(Seq(blocks(3).header))
+      syncs().flatMap(_._1) should not contain supplier
+      completeThrough(4)
+      tracker.statuses(supplier).height shouldBe history.fullBlockHeight - 3
+      actor ! RemoteBlockApplied(blocks(3).header, Seq.empty)
+      val sent = syncs()
+      sent.map(_._1) shouldBe Seq(Set(supplier))
+      sent.head._2.lastHeaders.head.id shouldBe blocks(3).header.id
+    }
+  }
+
+  property("relevant input suppliers include plus-two receipts") {
+    fixture { f =>
+      import f._
+      applyHeaders(blocks.slice(3, 6).map(_.header))
+      val plusTwo = peer(height = 0)
+      supply(input(5), plusTwo)
+      vh.receiveWhile(100.millis) { case m => m }.collect {
+        case p: ProcessInputBlock => p
+      } shouldBe empty
+      completeThrough(6)
+      actor ! RemoteBlockApplied(blocks(5).header, Seq.empty)
+      val sent = syncs()
+      sent.flatMap(_._1).toSet shouldBe Set(plusTwo)
+      sent.foreach(_._2.lastHeaders.head.id shouldBe blocks(5).header.id)
+    }
+  }
+
+  property("relevant ordering supplier is recorded within the window after the header is known") {
+    fixture { f =>
+      import f._
+      applyHeaders(blocks.slice(3, 5).map(_.header))
+      val supplier = peer(height = 0)
+      val block = blocks(4)
+      val announcement = OrderingBlockAnnouncement(OrderingBlockAnnouncement.CurrentVersion,
+        block.header, Seq.empty, Seq.empty, block.extension.fields)
+      actor ! Message(OrderingBlockAnnouncementMessageSpec,
+        Left(OrderingBlockAnnouncementMessageSpec.toBytes(announcement)), Some(supplier))
+      syncs() shouldBe empty
+      completeThrough(5)
+      actor ! LocalBlockApplied(block.header, Seq.empty)
+      val sent = syncs()
+      sent.map(_._1) shouldBe Seq(Set(supplier))
+      sent.head._2.lastHeaders.head.id shouldBe block.header.id
+    }
+  }
+
+  property("relevant suppliers age out below full height minus two") {
+    fixture { f =>
+      import f._
+      val old = peer(height = 0)
+      val boundary = peer(height = 0)
+      supply(input(3), old)
+      supply(input(4), boundary)
+      completeThrough(6)
+      actor ! RemoteBlockApplied(blocks(5).header, Seq.empty)
+      val sent = syncs()
+      sent.flatMap(_._1).toSet shouldBe Set(boundary)
+    }
+  }
+
+  property("relevant supplier records use the most recent delivery rather than the maximum height") {
+    fixture { f =>
+      import f._
+      val supplier = peer(height = 0)
+      supply(input(4), supplier)
+      supply(input(3), supplier)
+      completeThrough(6)
+      actor ! RemoteBlockApplied(blocks(5).header, Seq.empty)
+      syncs() shouldBe empty
+    }
+  }
+
+  property("out-of-window input frames make no supplier record or overwrite") {
+    fixture { f =>
+      import f._
+      completeThrough(5)
+      val upper = peer(height = 0)
+      val lower = peer(height = 0)
+      val retained = peer(height = 0)
+      val frame = input(6)
+      supply(frame, retained)
+      Seq(2, 1).foreach { height =>
+        val outside = frame.copy(header = frame.header.copy(height = height))
+        supply(outside, lower)
+        supply(outside, retained)
+      }
+      Seq(8, 9).foreach { height =>
+        supply(frame.copy(header = frame.header.copy(height = height)), upper)
+      }
+      completeThrough(6)
+      actor ! RemoteBlockApplied(blocks(5).header, Seq.empty)
+      syncs().flatMap(_._1).toSet shouldBe Set(retained)
+    }
+  }
+
+  property("out-of-window ordering frames make no supplier record or overwrite") {
+    fixture { f =>
+      import f._
+      completeThrough(5)
+      val upper = peer(height = 0)
+      val lower = peer(height = 0)
+      val retained = peer(height = 0)
+      val block = blocks(4)
+      val frame = OrderingBlockAnnouncement(OrderingBlockAnnouncement.CurrentVersion,
+        block.header, Seq.empty, Seq.empty, block.extension.fields)
+      def supplyOrdering(height: Int, supplier: ConnectedPeer): Unit = {
+        val announcement = frame.copy(header = frame.header.copy(height = height))
+        actor ! Message(OrderingBlockAnnouncementMessageSpec,
+          Left(OrderingBlockAnnouncementMessageSpec.toBytes(announcement)), Some(supplier))
+      }
+      supplyOrdering(5, retained)
+      Seq(2, 1).foreach { height =>
+        supplyOrdering(height, lower)
+        supplyOrdering(height, retained)
+      }
+      Seq(8, 9).foreach(supplyOrdering(_, upper))
+      completeThrough(6)
+      actor ! LocalBlockApplied(blocks(5).header, Seq.empty)
+      syncs().flatMap(_._1).toSet shouldBe Set(retained)
+    }
+  }
+
+  property("disconnect clears relevant supplier records even when the peer reconnects") {
+    fixture { f =>
+      import f._
+      val supplier = peer(height = 0)
+      supply(input(4), supplier)
+      actor ! DisconnectedPeer(supplier)
+      actor ! HandshakedPeer(supplier)
+      tracker.updateStatus(supplier, Equal, Some(0))
+      completeThrough(4)
+      actor ! RemoteBlockApplied(blocks(3).header, Seq.empty)
+      syncs() shouldBe empty
+    }
+  }
+
+  property("relevant suppliers still require sub-block support and UTXO mode") {
+    fixture { f =>
+      import f._
+      val legacy = peer(height = 0, subBlocks = false)
+      val digest = peer(height = 0, stateType = StateType.Digest)
+      val eligible = peer(height = 0)
+      val frame = input(4)
+      Seq(legacy, digest, eligible).foreach(supply(frame, _))
+      completeThrough(4)
+      actor ! RemoteBlockApplied(blocks(3).header, Seq.empty)
+      syncs().flatMap(_._1).toSet shouldBe Set(eligible)
     }
   }
 

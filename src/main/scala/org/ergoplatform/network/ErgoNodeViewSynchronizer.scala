@@ -107,6 +107,19 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
   private val lastRefreshedTip = mutable.Map.empty[ConnectedPeer, ModifierId]
   private val announcedBy = mutable.LinkedHashMap.empty[ModifierId, ConnectedPeer]
   private var lastRefreshedScore: BigInt = 0
+  private val lastSuppliedHeight = mutable.Map.empty[ConnectedPeer, Int]
+
+  private def recordSupplier(peer: ConnectedPeer, height: Int): Unit = {
+    if (syncTracker.statuses.contains(peer)) lastSuppliedHeight.update(peer, height)
+  }
+
+  private def meshRefreshRecipients(hr: ErgoHistoryReader): Set[ConnectedPeer] = {
+    val suppliers = lastSuppliedHeight.collect {
+      case (peer, height) if height >= hr.fullBlockHeight - 2 &&
+        SubBlocksFilter.condition(peer) && peer.mode.exists(_.stateType == StateType.Utxo) => peer
+    }
+    (inputBlockRecipients(hr).toSet ++ suppliers).filter(syncV2Supported)
+  }
 
   private def onHeaderApplied(id: ModifierId, hr: ErgoHistory): Unit = {
     val suppliers = deliveryTracker.receivedFrom(id, Header.modifierTypeId).toSet ++ announcedBy.remove(id)
@@ -1536,6 +1549,9 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
       return
     }
 
+    // Supplier refreshes are bounded to one SyncInfo per full block and one pending refresh per peer.
+    recordSupplier(remote, inputBlockInfo.header.height)
+
     // Input blocks should only be processed by UTXO mode nodes
     // Digest mode nodes cannot validate input blocks properly (validation is skipped when usrOpt is empty)
     if (usrOpt.isEmpty) {
@@ -1896,6 +1912,9 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
       return
     }
 
+    // Supplier refreshes are bounded to one SyncInfo per full block and one pending refresh per peer.
+    recordSupplier(remote, oba.header.height)
+
     //todo : make debug
     log.info(s"Processing ordering block announcement for ${oba.header.id}")
 
@@ -2128,6 +2147,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
       syncTracker.clearStatus(connectedPeer)
       pendingRefresh.remove(connectedPeer).foreach(_._2.cancel())
       lastRefreshedTip.remove(connectedPeer)
+      lastSuppliedHeight.remove(connectedPeer)
       announcedBy.retain((_, peer) => peer != connectedPeer)
   }
 
@@ -2276,7 +2296,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
     case LocalBlockApplied(header, _) =>
       // Local ordering blocks also emit this event after an unsuccessful apply attempt.
       if (historyReader.getFullBlock(header).isDefined) {
-        inputBlockRecipients(historyReader).filter(syncV2Supported)
+        meshRefreshRecipients(historyReader)
           .foreach(scheduleRefresh(_, meshRefreshDelay))
       }
       log.debug(
@@ -2290,7 +2310,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
     // Peer-received block applied - broadcast to our peers
     case RemoteBlockApplied(header, _) =>
-      inputBlockRecipients(historyReader).filter(syncV2Supported)
+      meshRefreshRecipients(historyReader)
         .foreach(scheduleRefresh(_, meshRefreshDelay))
       if (header.isNew(2.hours)) {
         broadcastModifierInv(Header.modifierTypeId, header.id)
