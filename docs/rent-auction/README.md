@@ -8,6 +8,7 @@ Start with [EIP-XXXX.md](EIP-XXXX.md). It describes the proposed consensus rules
 [OPERATIONS.md](OPERATIONS.md) explains how to build and operate the tooling;
 [VERIFICATION.md](VERIFICATION.md) records exactly what was tested;
 [REVIEW.md](REVIEW.md) lists protocol decisions that reviewers must resolve.
+[ECONOMICS.md](ECONOMICS.md) explains the collection incentives and measured costs.
 
 ## What is included
 
@@ -27,20 +28,35 @@ Start with [EIP-XXXX.md](EIP-XXXX.md). It describes the proposed consensus rules
 
 ## Plain-language money flow
 
-1. A miner collects eligible rent. Ordinary rent ERG pays its committed beneficiary.
-   Fully consumed transferable tokens enter auction lots; the miner separately
-   supplies the ERG needed to support those lots.
-2. Buyers bid. Replacing a bid refunds the former bidder in full.
-3. A closer sends the tokens to the winning recipient and places the winning ERG
-   in a dedicated deposit. An unsold lot instead burns its tokens.
-4. A merger consumes that deposit and increases the existing re-emission reserve.
+1. A producer collects eligible rent. Ordinary rent ERG pays its committed beneficiary.
+   Tokens from fully consumed sources are pooled into lots of at most 32 token entries.
+   The collector funds a refundable seed plus a separate 0.002 ERG close allowance
+   per lot and records a return script. Seed sizing follows the active byte price,
+   with a floor protecting the return box at the byte-price ceiling.
+2. Buyers bid at least 0.05 ERG. Replacing a bid refunds the former bidder in full.
+3. Anyone can close up to 32 expired lots together. The collector receives its seed
+   and unused allowance, whoever closes. A bounded native transaction fee is shared
+   across the lots; the closer gets no private reward. Unsold tokens burn.
+4. On sale, the bid pays the collector 10%, funds the winner's token-carrying ERG,
+   and funds a proceeds deposit. The seed principal is not spent on these sale costs.
+5. A merge moves each deposit, less its 0.001 ERG native fee budget, into the existing
+   EIP-27 reserve. The budget pays the including miner; it is not a merger bounty.
 
-The last two steps can be separate transactions in one block. The existing deposit
+These amounts and limits are defined in `RentAuctionContracts.scala`. A close must
+actually occur before the seed is returned. Bundling and batch closing reduce fees
+per source but do not make every collection profitable. Collector results depend on
+whether that collector also receives the producer's beneficiary payment.
+
+Close and merge are separate transactions and may share a block. The existing deposit
 contract is already a two-step arrangement: deposit, then a transaction involving
 the reserve. Its rules also allow a deposit to accompany a scheduled reward payout
 without increasing the reserve. The new covenant removes that alternative **for
 these auction proceeds** by requiring an exact increase of the reserve principal.
 It leaves ordinary legacy deposits and the existing reserve contract in place.
+
+After mainnet re-emission starts at height 2,080,800, producers must merge into
+the reserve successor from that block's scheduled reward withdrawal. A public merge
+against the previous reserve conflicts with that withdrawal.
 
 The extra reserve balance follows the native emission rules. It does not raise the
 scheduled reward rate; it can support additional rewards later while the reserve
