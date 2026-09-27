@@ -1,7 +1,7 @@
 package org.ergoplatform.network
 
 import akka.actor.SupervisorStrategy.{Restart, Stop}
-import akka.actor.{Actor, ActorInitializationException, ActorKilledException, ActorRef, ActorRefFactory, DeathPactException, OneForOneStrategy, Props}
+import akka.actor.{Actor, ActorInitializationException, ActorKilledException, ActorRef, ActorRefFactory, Cancellable, DeathPactException, OneForOneStrategy, Props}
 import org.ergoplatform.modifiers.history.header.{Header, HeaderSerializer}
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, ErgoTransactionSerializer, UnconfirmedTransaction}
 import org.ergoplatform.modifiers.{BlockSection, ErgoNodeViewModifier, InputBlockTransactionIdsTypeId, InputBlockTypeId, ManifestTypeId, NetworkObjectTypeId, OrderingBlockAnnouncementTypeId, SnapshotsInfoTypeId, UtxoSnapshotChunkTypeId}
@@ -97,6 +97,41 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
   // resource exhaustion. To prevent it, we do not provide an answer for sync message, if previous one was sent
   // no more than `PerPeerSyncLockTime` milliseconds ago.
   private val PerPeerSyncLockTime = 100
+
+  // Leave a margin over the receive-side sync lock without delaying protocol replies.
+  protected def refreshSpacing: FiniteDuration = 250.millis
+  protected def meshRefreshDelay: FiniteDuration = 1.second
+
+  private val pendingRefresh = mutable.Map.empty[ConnectedPeer, (Long, Cancellable)]
+  private var refreshGeneration = 0L
+  private val lastRefreshedTip = mutable.Map.empty[ConnectedPeer, ModifierId]
+  private val announcedBy = mutable.LinkedHashMap.empty[ModifierId, ConnectedPeer]
+  private var lastRefreshedScore: BigInt = 0
+
+  private def onHeaderApplied(id: ModifierId, hr: ErgoHistory): Unit = {
+    val suppliers = deliveryTracker.receivedFrom(id, Header.modifierTypeId).toSet ++ announcedBy.remove(id)
+    val score = hr.scoreOf(id).getOrElse(BigInt(0))
+    // Track progress during IBD too, so a later lighter fork cannot look like an advance.
+    if (score > lastRefreshedScore) {
+      lastRefreshedScore = score
+      if (hr.isHeadersChainSynced) {
+        suppliers.filter(syncV2Supported).foreach(scheduleRefresh(_, Duration.Zero))
+      }
+    }
+  }
+
+  private def sinceLastSync(peer: ConnectedPeer): FiniteDuration =
+    syncTracker.statuses.get(peer).flatMap(_.lastSyncSentTime)
+      .map(t => (System.currentTimeMillis() - t).millis).getOrElse(refreshSpacing)
+
+  private def scheduleRefresh(peer: ConnectedPeer, extraDelay: FiniteDuration): Unit = {
+    if (!pendingRefresh.contains(peer)) {
+      val delay = (refreshSpacing - sinceLastSync(peer)).max(Duration.Zero).max(extraDelay)
+      refreshGeneration += 1
+      val timer = context.system.scheduler.scheduleOnce(delay, self, RefreshSync(peer, refreshGeneration))
+      pendingRefresh.put(peer, refreshGeneration -> timer)
+    }
+  }
 
   // when we got last modifier, both unconfirmed transactions and block sections count
   private var lastModifierGotTime: Long = 0
@@ -1415,6 +1450,21 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
   }
 
   /**
+    * Peers an input block (or its id) is sent to: those supporting sub-blocks, in UTXO mode, and within two blocks
+    * of this node's full-block height.
+    */
+  private def inputBlockRecipients(historyReader: ErgoHistoryReader): Seq[ConnectedPeer] = {
+    syncTracker.statuses.filter { s =>
+      val peer = s._1
+      val peerHeight = s._2.height
+      SubBlocksFilter.condition(peer) &&
+        peer.mode.exists(_.stateType == StateType.Utxo) &&
+        peerHeight <= historyReader.fullBlockHeight + 2 &&
+        peerHeight >= historyReader.fullBlockHeight - 2
+    }.keys.toSeq
+  }
+
+  /**
    * Request an input block from a peer by its ID.
    *
    * This method sends a request to the specified peer to download an input block with the given ID.
@@ -1885,6 +1935,8 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
         return
       }
 
+      announcedBy.update(oba.header.id, remote)
+      if (announcedBy.size > 64) announcedBy.remove(announcedBy.head._1)
       hr.storeOrderingBlockAnnouncement(oba)
 
       setReceivedIfRequested(oba.header.id, OrderingBlockAnnouncementTypeId.value, remote)
@@ -2074,9 +2126,22 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
     case DisconnectedPeer(connectedPeer) =>
       syncTracker.clearStatus(connectedPeer)
+      pendingRefresh.remove(connectedPeer).foreach(_._2.cancel())
+      lastRefreshedTip.remove(connectedPeer)
+      announcedBy.retain((_, peer) => peer != connectedPeer)
   }
 
   protected def sendLocalSyncInfo(historyReader: ErgoHistory): Receive = {
+    case RefreshSync(peer, generation) if pendingRefresh.get(peer).exists(_._1 == generation) =>
+      pendingRefresh.remove(peer)
+      if (sinceLastSync(peer) < refreshSpacing) {
+        scheduleRefresh(peer, Duration.Zero)
+      } else if (!historyReader.bestHeaderIdOpt.exists(lastRefreshedTip.get(peer).contains)) {
+        historyReader.bestHeaderIdOpt.foreach(lastRefreshedTip.update(peer, _))
+        sendSyncToPeer(peer, historyReader.syncInfoV2(full = true))
+      }
+    case RefreshSync(_, _) => ()
+
     case SendLocalSyncInfo =>
       sendSync(historyReader)
   }
@@ -2209,6 +2274,11 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
     // Locally mined block applied - skip broadcast (already done via NewBlockMined)
     case LocalBlockApplied(header, _) =>
+      // Local ordering blocks also emit this event after an unsuccessful apply attempt.
+      if (historyReader.getFullBlock(header).isDefined) {
+        inputBlockRecipients(historyReader).filter(syncV2Supported)
+          .foreach(scheduleRefresh(_, meshRefreshDelay))
+      }
       log.debug(
         s"Local block applied at height ${header.height}, " +
         s"header id: ${header.encodedId}, skipping broadcast"
@@ -2220,6 +2290,8 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 
     // Peer-received block applied - broadcast to our peers
     case RemoteBlockApplied(header, _) =>
+      inputBlockRecipients(historyReader).filter(syncV2Supported)
+        .foreach(scheduleRefresh(_, meshRefreshDelay))
       if (header.isNew(2.hours)) {
         broadcastModifierInv(Header.modifierTypeId, header.id)
         header.sectionIds.foreach { case (mtId, id) =>
@@ -2261,6 +2333,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
       declined.put(id, System.currentTimeMillis())
 
     case SyntacticallySuccessfulModifier(modTypeId, modId) =>
+      if (modTypeId == Header.modifierTypeId) onHeaderApplied(modId, historyReader)
       deliveryTracker.setHeld(modId, modTypeId)
 
     case RecoverableFailedModification(modTypeId, modId, e) =>
@@ -2460,6 +2533,7 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
                    usr: Option[UtxoStateReader],
                    blockAppliedTxsCache: FixedSizeApproximateCacheQueue): PartialFunction[Any, Unit] = {
     case ChangedHistory(historyReader: ErgoHistory) =>
+      lastRefreshedScore = historyReader.bestHeaderOpt.flatMap(h => historyReader.scoreOf(h.id)).getOrElse(BigInt(0))
       mp match {
         case Some(mempoolReader) =>
           context.become(initialized(historyReader, mempoolReader, usr, blockAppliedTxsCache))
@@ -2490,6 +2564,8 @@ class ErgoNodeViewSynchronizer(networkControllerRef: ActorRef,
 }
 
 object ErgoNodeViewSynchronizer {
+
+  private case class RefreshSync(peer: ConnectedPeer, generation: Long)
 
   private def props(networkControllerRef: ActorRef,
             viewHolderRef: ActorRef,
