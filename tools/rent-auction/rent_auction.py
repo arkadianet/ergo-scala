@@ -47,8 +47,22 @@ class BatchLimit(ValueError):
     pass
 
 
+def disabled_rules(value):
+    if value == "none":
+        return []
+    if not re.fullmatch(r"[0-9]+(?:,[0-9]+)*", value):
+        raise argparse.ArgumentTypeError("Expected none or comma-separated rule ids")
+    ids = [int(entry) for entry in value.split(",")]
+    for rule_id in ids:
+        if rule_id > 32767:
+            raise argparse.ArgumentTypeError(f"Rule id exceeds Short range: {rule_id}")
+        if ids.count(rule_id) > 1:
+            raise argparse.ArgumentTypeError(f"Duplicate disabled rule id: {rule_id}")
+    return sorted(ids)
+
+
 class Node:
-    def __init__(self, url, api_key=None):
+    def __init__(self, url, disabled_rules, api_key=None):
         parsed = urlparse(url)
         if parsed.scheme not in ("http", "https") or not parsed.hostname:
             raise ValueError("Node must be an HTTP(S) URL")
@@ -58,6 +72,7 @@ class Node:
                 "localhost", "127.0.0.1", "::1") and api_key:
             raise ValueError("Use HTTPS when sending an API key to a remote node")
         self.url, self.api_key = url.rstrip("/"), api_key
+        self.disabled_rules = list(disabled_rules)
 
     def request(self, path, data=None):
         headers = {"Accept": "application/json"}
@@ -235,6 +250,7 @@ def current_parameters(node):
     return info["fullHeight"] + 1, {
         "storageFeeFactor": parameters["storageFeeFactor"],
         "minValuePerByte": parameters["minValuePerByte"],
+        "disabledRules": sorted(node.disabled_rules),
     }
 
 
@@ -457,6 +473,8 @@ def merge_due(node, index, builder, output_dir, execute=False):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--node", default="http://127.0.0.1:9053")
+    parser.add_argument("--disabled-rules", required=True, type=disabled_rules,
+                        help="Operator-supplied rule status: none or comma-separated rule ids")
     parser.add_argument("--db", default="rent-auction.sqlite")
     parser.add_argument("--jar", help="Assembled node JAR including the Scala builders")
     parser.add_argument("--network", default="mainnet",
@@ -494,7 +512,7 @@ def main(argv=None):
     merger.add_argument("--output-dir", default="merges")
     merger.add_argument("--execute", action="store_true", help="Sign/check/broadcast plans")
     args = parser.parse_args(argv)
-    node = Node(args.node, os.environ.get("ERGO_API_KEY"))
+    node = Node(args.node, args.disabled_rules, os.environ.get("ERGO_API_KEY"))
     builder = Builder(args.jar, args.network) if args.jar else None
     result = None
     if args.command in ("sync", "list", "rent-candidates", "settle-due", "merge-due"):

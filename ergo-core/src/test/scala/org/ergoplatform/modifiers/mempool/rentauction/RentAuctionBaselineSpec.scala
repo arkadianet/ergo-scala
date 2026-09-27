@@ -11,7 +11,7 @@ import sigma.interpreter.ContextExtension
 import sigma.interpreter.ProverResult
 
 class RentAuctionBaselineSpec extends ErgoCorePropertyTest with RentAuctionFixture {
-  private lazy val rules = new RentAuctionRules(contracts, params)
+  private lazy val rules = new RentAuctionRules(contracts, params, validation)
 
   property("the unmodified node accepts two funded rent inputs sharing one recreation") {
     val created = height - Constants.StoragePeriod

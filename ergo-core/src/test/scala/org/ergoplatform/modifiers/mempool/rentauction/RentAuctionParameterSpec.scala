@@ -13,7 +13,7 @@ class RentAuctionParameterSpec extends ErgoCorePropertyTest with RentAuctionFixt
   import RentAuctionContracts.WINDOW
 
   property("serializer envelopes cover maximum values, heights, indices, scripts and token amounts") {
-    val rules = new RentAuctionRules(contracts, priced(10000))
+    val rules = new RentAuctionRules(contracts, priced(10000), validation)
     Seq(owner, recipient256).foreach { tree =>
       Seq(0, 1, 32).foreach { n =>
         val candidate = output(Long.MaxValue, tree, Int.MaxValue, tokens(n, Long.MaxValue),
@@ -40,20 +40,20 @@ class RentAuctionParameterSpec extends ErgoCorePropertyTest with RentAuctionFixt
       Seq(1, 32).foreach { n =>
         val collected = collectPlan(n, p)
         native(collected, p).get should be > 0
-        val rules = new RentAuctionRules(contracts, p)
+        val rules = new RentAuctionRules(contracts, p, validation)
         val fresh = collected.transaction.outputs.head
-        val builder = new RentAuctionTransactions(contracts, p, height)
+        val builder = new RentAuctionTransactions(contracts, p, height, validation)
         val bid = builder.bid(fresh, IndexedSeq(box(1000000000L)), MINIMUM_BID,
           recipient256, anyone, fee).get
         native(bid, p).get should be > 0
         val successor = bid.transaction.outputs.head
-        val close = new RentAuctionTransactions(contracts, p, height + WINDOW)
+        val close = new RentAuctionTransactions(contracts, p, height + WINDOW, validation)
           .close(IndexedSeq(successor), fee).get
         native(close, p).get should be > 0
         val outs = close.transaction.outputs
         val reserve = box(1000000000000L, contracts.reserve, height + WINDOW - 1, Seq(nft -> 1L))
         val sponsor = if (price == 360) None else Some(box(1000000L, created = height + WINDOW))
-        val merged = new RentAuctionTransactions(contracts, p, height + WINDOW)
+        val merged = new RentAuctionTransactions(contracts, p, height + WINDOW, validation)
           .merge(reserve, IndexedSeq(outs(2)), sponsor).get
         native(merged, p).get should be > 0
         info(s"SIZE price=$price tokens=$n fresh=${fresh.bytes.length} successor256=${successor.bytes.length} " +
@@ -70,11 +70,11 @@ class RentAuctionParameterSpec extends ErgoCorePropertyTest with RentAuctionFixt
     val collected = collectPlan()
     native(collected).get should be > 0
     val fresh = collected.transaction.outputs.head
-    val bid = new RentAuctionTransactions(contracts, params, height)
+    val bid = new RentAuctionTransactions(contracts, params, height, validation)
       .bid(fresh, IndexedSeq(box(1000000000L)), MINIMUM_BID, recipient256, anyone, 1000000L).get
     native(bid).get should be > 0
     Seq(fresh, bid.transaction.outputs.head).foreach { lot =>
-      val closed = new RentAuctionTransactions(contracts, priced(10000), height + WINDOW)
+      val closed = new RentAuctionTransactions(contracts, priced(10000), height + WINDOW, validation)
         .close(IndexedSeq(lot), 2000000L).get
       native(closed, priced(10000)).get should be > 0
     }

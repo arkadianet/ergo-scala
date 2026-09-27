@@ -114,7 +114,7 @@ object ErgoState extends ScorexLogging {
     val auctionRules = if (currentStateContext.chainSettings
       .rentAuctionsActive(currentStateContext.currentHeight)) {
       Some(new RentAuctionRules(currentStateContext.chainSettings.rentAuctionContracts,
-        currentStateContext.currentParameters))
+        currentStateContext.currentParameters, currentStateContext.validationSettings))
     } else None
     val extension = rentExtension.orElse(currentStateContext.lastExtensionOpt)
       .getOrElse(ExtensionCandidate(Seq.empty))

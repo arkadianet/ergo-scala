@@ -57,7 +57,7 @@ class OperatorHttpTests(unittest.TestCase):
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
         self.url = f"http://127.0.0.1:{self.server.server_port}"
-        self.node = ra.Node(self.url, "test-api-key")
+        self.node = ra.Node(self.url, [], "test-api-key")
 
     def tearDown(self):
         self.server.shutdown()
@@ -76,6 +76,7 @@ class OperatorHttpTests(unittest.TestCase):
             "collector": "00", "height": 1, "parameters": {}, "sources": [dict(self.live, value=1)]})
         self.assertEqual(request["height"], 101)
         self.assertEqual(request["parameters"]["storageFeeFactor"], 1250000)
+        self.assertEqual(request["parameters"]["disabledRules"], [])
         self.assertEqual(request["sources"][0]["value"], 9007199254740993)
 
     def test_wallet_receives_extensions_and_raw_inputs_unchanged(self):
@@ -89,7 +90,7 @@ class OperatorHttpTests(unittest.TestCase):
             path = Path(directory) / "signed.json"
             ra.write_json(path, self.signed)
             with redirect_stdout(io.StringIO()), patch.dict("os.environ", {}, clear=True):
-                ra.main(["--node", self.url, "candidate", str(path),
+                ra.main(["--node", self.url, "--disabled-rules", "none", "candidate", str(path),
                          "--miner-pk", "lender-key"])
         self.assertEqual(self.calls[-1][:2], ("/mining/candidateWithTxsAndPk",
             {"txs": [self.signed], "pk": "lender-key"}))
@@ -98,14 +99,20 @@ class OperatorHttpTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             plan_path, signed_path = Path(directory) / "plan.json", Path(directory) / "tx.json"
             plan = self.plan()
+            plan["operatorParameters"] = ra.current_parameters(self.node)[1]
             ra.write_json(plan_path, dict(plan, height=100))
             ra.write_json(signed_path, self.signed)
-            argv = ["--node", self.url, "lithos-queue", str(plan_path),
+            argv = ["--node", self.url, "--disabled-rules", "none", "lithos-queue", str(plan_path),
                     str(signed_path), directory]
             with self.assertRaises(ValueError):
                 ra.main(argv)
             self.assertFalse((Path(directory) / "101.json").exists())
             ra.write_json(plan_path, plan)
+            changed_rules = list(argv)
+            changed_rules[3] = "123"
+            with self.assertRaisesRegex(ra.StalePlan, "parameters changed"):
+                ra.main(changed_rules)
+            self.assertFalse((Path(directory) / "101.json").exists())
             with redirect_stdout(io.StringIO()):
                 ra.main(argv)
             self.assertEqual(ra.read_json(Path(directory) / "101.json"),
@@ -116,7 +123,7 @@ class OperatorHttpTests(unittest.TestCase):
             path = Path(directory) / "tx.json"
             ra.write_json(path, self.signed)
             with redirect_stdout(io.StringIO()):
-                ra.main(["--node", self.url, "broadcast", str(path)])
+                ra.main(["--node", self.url, "--disabled-rules", "none", "broadcast", str(path)])
         self.assertEqual([c[0] for c in self.calls], ["/transactions/check", "/transactions"])
 
 

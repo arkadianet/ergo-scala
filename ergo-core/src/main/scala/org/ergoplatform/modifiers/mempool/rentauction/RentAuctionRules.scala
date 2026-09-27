@@ -3,10 +3,13 @@ package org.ergoplatform.modifiers.mempool.rentauction
 import org.ergoplatform.ErgoBox
 import org.ergoplatform.ErgoBoxCandidate
 import org.ergoplatform.Input
+import org.ergoplatform.mining.emission.EmissionRules
 import org.ergoplatform.modifiers.history.extension.ExtensionCandidate
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.settings.Constants
+import org.ergoplatform.settings.ErgoValidationSettings
 import org.ergoplatform.settings.Parameters
+import org.ergoplatform.settings.ValidationRules
 import scorex.crypto.hash.Blake2b256
 import scorex.util.encode.Base16
 import sigma.ast.ByteArrayConstant
@@ -27,7 +30,11 @@ import scala.util.Success
 import scala.util.Try
 
 /** Additional restrictions; baseline transaction validation is always required. */
-final class RentAuctionRules(contracts: RentAuctionContracts, params: Parameters) {
+final class RentAuctionRules(
+  contracts: RentAuctionContracts,
+  params: Parameters,
+  validationSettings: ErgoValidationSettings
+) {
   import RentAuctionContracts.CLOSE_ALLOWANCE
   import RentAuctionContracts.COLLECTOR_SHARE_DENOMINATOR
   import RentAuctionContracts.MAXIMUM_WINDOW
@@ -47,11 +54,29 @@ final class RentAuctionRules(contracts: RentAuctionContracts, params: Parameters
   import RentAuctionRules.Rent
   import RentAuctionRules.toEither
 
+  /** Native EIP-27 debt redemption (validation rule 123) applies to ordinary inputs. */
+  def reemissionRedemptionActive(h: Int): Boolean = {
+    val r = contracts.chain.reemission
+    r.checkReemissionRules && h > r.activationHeight &&
+      validationSettings.isActive(ValidationRules.txReemission)
+  }
+
+  def redemptionTriggered(inputs: Seq[ErgoBox], h: Int): Boolean =
+    reemissionRedemptionActive(h) && inputs.exists { b =>
+      // ErgoTransaction.verifyReemissionSpending routes inputs above 100,000 ERG
+      // through the emission-box branch; they never trigger ordinary redemption.
+      b.value <= 100000L * EmissionRules.CoinsInOneErgo &&
+        b.tokens.contains(contracts.chain.reemission.reemissionTokenId)
+    }
+
+  def isRedemptionPayment(out: ErgoBoxCandidate): Boolean =
+    if (contracts.chain.isMainnet) out.ergoTree == contracts.legacyDeposit
+    else out.ergoTree.toProposition(true) == contracts.legacyDeposit.toProposition(true)
+
   def auctionTokens(b: ErgoBox, h: Int): Seq[(Digest32Coll, Long)] = {
-    val reemission = contracts.chain.reemission
     b.additionalTokens.toArray.toSeq.filterNot { case (id, _) =>
-      reemission.checkReemissionRules && h > reemission.activationHeight &&
-        id == reemission.reemissionTokenIdBytes
+      reemissionRedemptionActive(h) &&
+        id == contracts.chain.reemission.reemissionTokenIdBytes
     }
   }
 
@@ -241,10 +266,15 @@ final class RentAuctionRules(contracts: RentAuctionContracts, params: Parameters
         else (BigInt(b.value) - outputs(r.outputIndex).value).max(0)
       }.sum
       val paid = outputs.indices.filterNot(excluded).filter { i =>
-        beneficiaryHash.exists(hash => Blake2b256(outputs(i).ergoTree.bytes).sameElements(hash))
+        outputs(i).creationHeight == h &&
+          beneficiaryHash.exists(hash => Blake2b256(outputs(i).ergoTree.bytes).sameElements(hash))
       }.map(i => BigInt(outputs(i).value)).sum
       check(beneficiaryHash.exists(_.length == 32), "rent requires a producer-designated beneficiary")
       check(paid >= credited, "rent ERG must pay the designated beneficiary separately")
+      if (redemptionTriggered(inputs, h)) {
+        check(outputs.filter(isRedemptionPayment).forall(_.creationHeight == h),
+          "EIP-27 redemption payments must be freshly dated")
+      }
     } else if (auctionInputs.nonEmpty) {
       check(auctionInputs.forall(i => auctionShape(inputs(i))), "malformed auction input")
       val closing = auctionInputs.forall { i =>

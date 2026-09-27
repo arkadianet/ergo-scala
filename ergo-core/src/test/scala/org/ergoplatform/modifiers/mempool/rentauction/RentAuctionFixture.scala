@@ -11,6 +11,7 @@ import org.ergoplatform.nodeView.state.UpcomingStateContext
 import org.ergoplatform.nodeView.state.VotingData
 import org.ergoplatform.settings.ChainSettings
 import org.ergoplatform.settings.Constants
+import org.ergoplatform.settings.ErgoValidationSettings
 import org.ergoplatform.settings.MonetarySettings
 import org.ergoplatform.settings.Parameters
 import org.ergoplatform.utils.ErgoCoreTestConstants
@@ -46,6 +47,7 @@ trait RentAuctionFixture {
     scala.collection.Map[ErgoBox.NonMandatoryRegisterId, EvaluatedValue[_ <: SType]]
 
   protected val defaults: ErgoCoreTestConstants.type = ErgoCoreTestConstants
+  protected val validation: ErgoValidationSettings = ErgoValidationSettings.initial
   protected val chain: ChainSettings = defaults.chainSettings.copy(
     addressPrefix = 0,
     monetary = MonetarySettings(),
@@ -100,15 +102,16 @@ trait RentAuctionFixture {
     val sources = tokens(count).map { t =>
       box(1000000L, nobody, at - Constants.StoragePeriod, Seq(t))
     }.toIndexedSeq
-    new RentAuctionTransactions(contracts, p, at).collect(sources,
+    new RentAuctionTransactions(contracts, p, at, validation).collect(sources,
       IndexedSeq(box(1000000000L, created = at)), owner, collector, anyone,
       if (p.minValuePerByte > 360) 2000000L else 1000000L).get
   }
 
-  protected def native(plan: RentAuctionPlan, p: Parameters = params): Try[Int] =
+  protected def native(plan: RentAuctionPlan, p: Parameters = params,
+    vs: ErgoValidationSettings = validation): Try[Int] =
     plan.transaction.statelessValidity().flatMap { _ =>
       plan.transaction.statefulValidity(plan.boxes, IndexedSeq.empty,
-        context(plan.height).copy(currentParameters = p)(chain))(ErgoInterpreter(p))
+        context(plan.height).copy(currentParameters = p, validationSettings = vs)(chain))(ErgoInterpreter(p))
     }
 
   protected def context(h: Int): UpcomingStateContext = {
@@ -119,7 +122,7 @@ trait RentAuctionFixture {
     )
     UpcomingStateContext(
       Seq.empty, None, pre, defaults.genesisStateDigest, params,
-      defaults.validationSettings, VotingData.empty
+      validation, VotingData.empty
     )(chain)
   }
 
@@ -277,7 +280,7 @@ trait RentAuctionFixture {
     val sale = if (bid == 0L) IndexedSeq.empty else {
       val recipient = ErgoTreeSerializer.DefaultSerializer.deserializeErgoTree(
         b.additionalRegisters(ErgoBox.R7).value.asInstanceOf[Coll[Byte]].toArray)
-      val carrier = new RentAuctionRules(contracts, params)
+      val carrier = new RentAuctionRules(contracts, params, validation)
         .carrier(recipient.bytes.length, b.additionalTokens.length)
       IndexedSeq(output(carrier, recipient, at, b.additionalTokens.toArray.toSeq, tag(b.id)),
         output(bid - share - carrier, contracts.deposit, at, registers = tag(b.id)))

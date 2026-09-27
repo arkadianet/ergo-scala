@@ -1,4 +1,5 @@
 import copy
+import argparse
 from pathlib import Path
 import tempfile
 import unittest
@@ -20,6 +21,7 @@ def block(height, block_id, parent, spent=(), outputs=()):
 
 class FakeNode:
     def __init__(self, blocks, genesis=()):
+        self.disabled_rules = []
         self.blocks = blocks
         self.genesis = list(genesis)
 
@@ -117,14 +119,24 @@ class IndexTests(unittest.TestCase):
 
 
 class OperatorTests(unittest.TestCase):
+    def test_disabled_rules_are_explicit_and_sorted(self):
+        self.assertEqual(ra.disabled_rules("none"), [])
+        self.assertEqual(ra.disabled_rules("124,123"), [123, 124])
+        for value in ("", "123,", "123,123", "32768", "abc", "none,123"):
+            with self.subTest(value=value), self.assertRaises(argparse.ArgumentTypeError):
+                ra.disabled_rules(value)
+        with patch("sys.stderr"), self.assertRaises(SystemExit) as error:
+            ra.main(["manifest"])
+        self.assertEqual(error.exception.code, 2)
+
     def test_api_key_requires_tls_for_remote_node(self):
         with self.assertRaises(ValueError):
-            ra.Node("http://remote.example", "secret")
-        ra.Node("http://127.0.0.1:9053", "secret")
-        ra.Node("https://remote.example", "secret")
+            ra.Node("http://remote.example", [], "secret")
+        ra.Node("http://127.0.0.1:9053", [], "secret")
+        ra.Node("https://remote.example", [], "secret")
 
     def test_wallet_cannot_change_transaction_id(self):
-        node = ra.Node("http://127.0.0.1")
+        node = ra.Node("http://127.0.0.1", [])
         plan = {"schemaVersion": 2, "height": 101, "inputBoxes": [box("a")],
                 "transactionId": "expected", "signingRequest": {"tx": {"inputs": []}}}
         with patch.object(node, "box", return_value=box("a")), \
@@ -135,7 +147,7 @@ class OperatorTests(unittest.TestCase):
                 ra.sign_plan(node, plan)
 
     def test_changed_input_stops_before_wallet_signing(self):
-        node = ra.Node("http://127.0.0.1")
+        node = ra.Node("http://127.0.0.1", [])
         plan = {"schemaVersion": 2, "height": 101, "inputBoxes": [box("a")],
                 "transactionId": "expected", "signingRequest": {"tx": {"inputs": []}}}
         with patch.object(node, "box", return_value=box("a", value=99)), \
@@ -157,6 +169,7 @@ class OperatorTests(unittest.TestCase):
 class WorkerNode:
     """HTTP-free boundary double; no protocol-validity claims."""
     def __init__(self, boxes=(), price=360):
+        self.disabled_rules = []
         self.boxes = {b["boxId"]: b for b in boxes}
         self.height = 100
         self.parameters = {"storageFeeFactor": 1250000, "minValuePerByte": price,
@@ -276,6 +289,20 @@ class BatchTests(unittest.TestCase):
         self.assertEqual([r["fee"] for r in requests], [1000000, 2000000])
         self.assertEqual(len([c for c in node.calls if c[0] == "/transactions"]), 1)
         self.assertEqual(len(list(Path(self.directory.name).glob("*.json"))), 1)
+
+    def test_changed_disabled_rules_makes_existing_plan_stale(self):
+        node, builder = self.lots(1)
+        node.disabled_rules = ra.disabled_rules("none")
+        plan = ra.prepare_current(node, builder, "close", {"auctions": sorted(node.boxes)})
+        self.assertEqual(builder.requests[-1]["parameters"]["disabledRules"], [])
+        ra.ensure_current(node, plan)
+        node.disabled_rules = ra.disabled_rules("123")
+        with self.assertRaisesRegex(ra.StalePlan, "parameters changed"):
+            ra.sign_plan(node, plan)
+        self.assertFalse(any(path == "/wallet/transaction/sign" for path, _ in node.calls))
+        rebuilt = ra.prepare_current(node, builder, "close", {"auctions": sorted(node.boxes)})
+        self.assertEqual(rebuilt["operatorParameters"]["disabledRules"], [123])
+        ra.ensure_current(node, rebuilt)
 
     def test_spent_member_is_removed_and_remaining_lots_rebuilt(self):
         node, builder = self.lots(3)

@@ -60,14 +60,14 @@ class RentAuctionStateSpec extends ErgoCorePropertyTest with RentAuctionFixture 
     val source = box(1000000L, nobody, height - Constants.StoragePeriod,
       Seq(token -> 100L))
     val funding = box(30000000L)
-    val plan = new RentAuctionTransactions(contracts, params, height)
+    val plan = new RentAuctionTransactions(contracts, params, height, validation)
       .collect(IndexedSeq(source), IndexedSeq(funding), owner, owner, anyone, 1000000L).get
     val s = settings()
     val us = state(plan.boxes, s)
     val digestDirectory = Files.createTempDirectory("rent-digest-").toFile
     val ds = DigestState.recover(us.version, us.rootDigest, us.stateContext,
       digestDirectory, s).get
-    val rules = new RentAuctionRules(contracts, params)
+    val rules = new RentAuctionRules(contracts, params, validation)
     val ext = rules.extension(Seq(plan.transaction -> plan.boxes), height,
       Blake2b256(owner.bytes))
     val valid = block(us, Seq(plan.transaction), ext)
@@ -99,7 +99,7 @@ class RentAuctionStateSpec extends ErgoCorePropertyTest with RentAuctionFixture 
   property("mempool policy rejects rent; candidate path pays a separate beneficiary") {
     val source = box(1000000L, nobody, height - Constants.StoragePeriod,
       Seq(token -> 100L))
-    val plan = new RentAuctionTransactions(contracts, params, height)
+    val plan = new RentAuctionTransactions(contracts, params, height, validation)
       .collect(IndexedSeq(source), IndexedSeq(box(30000000L)), owner, owner,
         anyone, 1000000L).get
     val base = state(plan.boxes, settings())

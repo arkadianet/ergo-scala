@@ -5,7 +5,7 @@ import org.ergoplatform.utils.ErgoCorePropertyTest
 
 class RentAuctionBuilderSpec extends ErgoCorePropertyTest with RentAuctionFixture {
   private def builder(at: Int = height): RentAuctionTransactions =
-    new RentAuctionTransactions(contracts, params, at)
+    new RentAuctionTransactions(contracts, params, at, validation)
 
   private def verify(plan: RentAuctionPlan): Unit =
     validate(plan.transaction, plan.boxes, plan.height).get should be > 0

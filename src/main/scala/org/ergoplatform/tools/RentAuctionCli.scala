@@ -17,9 +17,11 @@ import org.ergoplatform.modifiers.mempool.rentauction.RentAuctionTransactions
 import org.ergoplatform.settings.Args
 import org.ergoplatform.settings.ChainSettings
 import org.ergoplatform.settings.ErgoSettingsReader
+import org.ergoplatform.settings.ErgoValidationSettings
 import org.ergoplatform.settings.ErgoValidationSettingsUpdate
 import org.ergoplatform.settings.NetworkType
 import org.ergoplatform.settings.Parameters
+import org.ergoplatform.settings.ValidationRules
 import scorex.crypto.hash.Blake2b256
 import scorex.util.encode.Base16
 import sigma.ast.ErgoTree
@@ -48,6 +50,7 @@ object RentAuctionCli extends ApiCodecs {
       "schemaVersion" -> 2.asJson,
       "networkPrefix" -> chain.addressPrefix.asJson,
       "activationHeight" -> chain.rentAuctionActivationHeight.asJson,
+      "votingLength" -> chain.voting.votingLength.asJson,
       "auction" -> entry(contracts.auction),
       "deposit" -> entry(contracts.deposit),
       "reserve" -> entry(contracts.reserve),
@@ -118,6 +121,21 @@ object RentAuctionCli extends ApiCodecs {
     // Require current parameters explicitly: offline defaults must not masquerade
     // as the live chain's voted values.
     val p = c.downField("parameters")
+    require(p.downField("disabledRules").succeeded,
+      "parameters.disabledRules is required (use [] when no validation rule is disabled)")
+    val ids = p.get[Vector[Json]]("disabledRules").toTry.get.map { value =>
+      val id = value.asNumber.flatMap(_.toInt)
+      require(id.exists(_.isValidShort), s"Invalid disabled rule id: $value")
+      val ruleId = id.get.toShort
+      require(ValidationRules.rulesSpec.get(ruleId).exists(_.mayBeDisabled),
+        s"Unknown or non-disableable rule id: $ruleId")
+      ruleId
+    }
+    ids.groupBy(identity).foreach { case (id, occurrences) =>
+      require(occurrences.size == 1, s"Duplicate disabled rule id: $id")
+    }
+    val validation = ErgoValidationSettings.initial.updated(
+      ErgoValidationSettingsUpdate(ids, Seq()))
     val storageFee = p.get[Int]("storageFeeFactor").toTry.get
     val dust = p.get[Int]("minValuePerByte").toTry.get
     require(storageFee >= 0 && dust >= 0 && dust <= RentAuctionContracts.MAX_BYTE_PRICE, "Invalid storage/dust parameters")
@@ -126,7 +144,7 @@ object RentAuctionCli extends ApiCodecs {
       Parameters.MinValuePerByteIncrease -> dust,
       Parameters.BlockVersion -> chain.protocolVersion.toInt),
       ErgoValidationSettingsUpdate.empty)
-    val builder = new RentAuctionTransactions(chain.rentAuctionContracts, params, height)
+    val builder = new RentAuctionTransactions(chain.rentAuctionContracts, params, height, validation)
     def boxes(name: String): IndexedSeq[ErgoBox] =
       c.get[Option[Vector[ErgoBox]]](name).toTry.get.getOrElse(Vector.empty)
     def one(name: String): ErgoBox = c.get[ErgoBox](name).toTry.get
@@ -151,7 +169,7 @@ object RentAuctionCli extends ApiCodecs {
         c.get[Option[ErgoBox]]("sponsor").toTry.get).get
       case other => throw new IllegalArgumentException(s"Unknown action: $other")
     }
-    val rules = new RentAuctionRules(chain.rentAuctionContracts, params)
+    val rules = new RentAuctionRules(chain.rentAuctionContracts, params, validation)
     val accounting = (plan.boxes ++ plan.transaction.outputs)
       .filter(b => b.ergoTree == chain.rentAuctionContracts.auction && rules.auctionShape(b)).map { b =>
         val bid = b.additionalRegisters(ErgoBox.R6).value.asInstanceOf[Long]
@@ -181,7 +199,7 @@ object RentAuctionCli extends ApiCodecs {
       "inputBoxes" -> plan.boxes.asJson,
       "outputBoxes" -> plan.transaction.outputs.asJson,
       "additionalValidationCost" -> new RentAuctionRules(
-        chain.rentAuctionContracts, params)
+        chain.rentAuctionContracts, params, validation)
         .cost(plan.transaction, plan.boxes).asJson)
   }
 

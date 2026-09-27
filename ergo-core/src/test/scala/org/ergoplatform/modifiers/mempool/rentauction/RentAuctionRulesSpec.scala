@@ -7,12 +7,12 @@ import scorex.crypto.hash.Blake2b256
 
 /** Supporting rule-level diagnostics; activated executor evidence lives in the root suite. */
 class RentAuctionRulesSpec extends ErgoCorePropertyTest with RentAuctionFixture {
-  private lazy val rules = new RentAuctionRules(contracts, params)
+  private lazy val rules = new RentAuctionRules(contracts, params, validation)
 
   property("bundling same-id sources preserves their aggregate and baseline rent witnesses") {
     val sources = (1 to 20).map(_ => box(1000000L, nobody,
       height - Constants.StoragePeriod, Seq(token -> 100L))).toIndexedSeq
-    val plan = new RentAuctionTransactions(contracts, params, height)
+    val plan = new RentAuctionTransactions(contracts, params, height, validation)
       .collect(sources, IndexedSeq(box(100000000L)), owner, owner, anyone, 1000000L).get
     validate(plan.transaction, plan.boxes).get should be > 0
     plan.transaction.outputs.count(_.ergoTree == contracts.auction) shouldBe 1
@@ -24,7 +24,7 @@ class RentAuctionRulesSpec extends ErgoCorePropertyTest with RentAuctionFixture 
   property("attestation still rejects missing, duplicate, reordered and extraneous fields") {
     def collection(): RentAuctionPlan = {
       val source = box(1000000L, nobody, height - Constants.StoragePeriod, Seq(token -> 1L))
-      new RentAuctionTransactions(contracts, params, height)
+      new RentAuctionTransactions(contracts, params, height, validation)
         .collect(IndexedSeq(source), IndexedSeq(box(100000000L)), owner, owner, anyone, 1000000L).get
     }
     val a = collection()

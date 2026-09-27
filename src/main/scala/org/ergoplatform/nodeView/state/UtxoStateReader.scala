@@ -58,7 +58,7 @@ trait UtxoStateReader extends ErgoStateReader with UtxoSetSnapshotPersistence {
       val boxesToSpend = tx.inputs.flatMap(i => boxById(i.boxId))
       val rules = if (context.chainSettings.rentAuctionsActive(context.currentHeight)) {
         Some(new RentAuctionRules(context.chainSettings.rentAuctionContracts,
-          context.currentParameters))
+          context.currentParameters, context.validationSettings))
       } else None
       val extra = rules.map(_.cost(tx, boxesToSpend)).getOrElse(0L)
       lazy val proposal = rules.map { r =>

@@ -8,21 +8,76 @@ import io.circe.Json
 import io.circe.syntax.EncoderOps
 import org.ergoplatform.ErgoBox
 import org.ergoplatform.http.api.ApiCodecs
+import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.modifiers.mempool.rentauction.RentAuctionFixture
 import org.ergoplatform.modifiers.mempool.rentauction.RentAuctionPlan
 import org.ergoplatform.modifiers.mempool.rentauction.RentAuctionRules
-import org.ergoplatform.modifiers.mempool.ErgoTransaction
+import org.ergoplatform.modifiers.mempool.rentauction.RentAuctionTransactions
 import org.ergoplatform.nodeView.state.ErgoState
+import org.ergoplatform.settings.Constants
+import org.ergoplatform.settings.ErgoValidationSettings
+import org.ergoplatform.settings.ErgoValidationSettingsUpdate
+import org.ergoplatform.settings.ValidationRules
+import org.ergoplatform.utils.ErgoCorePropertyTest
 import org.ergoplatform.utils.ErgoNodeTestConstants
 import scorex.crypto.hash.Blake2b256
-import scala.util.Try
-import org.ergoplatform.modifiers.mempool.rentauction.RentAuctionTransactions
-import org.ergoplatform.settings.Constants
-import org.ergoplatform.utils.ErgoCorePropertyTest
 import scorex.util.encode.Base16
+
+import scala.util.Try
 
 class RentAuctionCliSpec extends ErgoCorePropertyTest
   with RentAuctionFixture with ApiCodecs {
+
+  private def accountingRequest: Json = {
+    val debt = sigma.data.Digest32Coll @@ chain.reemission.reemissionTokenIdBytes
+    Json.obj(
+      "schemaVersion" -> 2.asJson,
+      "action" -> "collect".asJson,
+      "height" -> height.asJson,
+      "parameters" -> Json.obj("disabledRules" -> Json.arr(),
+        "storageFeeFactor" -> params.storageFeeFactor.asJson,
+        "minValuePerByte" -> params.minValuePerByte.asJson),
+      "sources" -> Vector(box(1000000L, nobody, height - Constants.StoragePeriod,
+        Seq(debt -> 1000000L, token -> 100L))).asJson,
+      "funding" -> Vector(box(100000000L)).asJson,
+      "beneficiary" -> Base16.encode(owner.bytes).asJson,
+      "collector" -> Base16.encode(owner.bytes).asJson,
+      "change" -> Base16.encode(anyone.bytes).asJson)
+  }
+
+  property("disabled rule status is required and only distinct disableable ids are accepted") {
+    val request = accountingRequest
+    checkedJson(RentAuctionCli.prepare(request, chain).get)
+    val parameters = request.hcursor.downField("parameters").focus.get
+    val missing = request.mapObject(_.add("parameters",
+      parameters.mapObject(_.remove("disabledRules"))))
+    RentAuctionCli.prepare(missing, chain).failed.get.getMessage should include(
+      "parameters.disabledRules is required (use [] when no validation rule is disabled)")
+    val fixed = ValidationRules.rulesSpec.toSeq.find { case (_, status) => !status.mayBeDisabled }.get._1
+    Seq(
+      Json.arr(32767.asJson) -> "Unknown or non-disableable rule id: 32767",
+      Json.arr(fixed.asJson) -> s"Unknown or non-disableable rule id: $fixed",
+      Json.arr(123.asJson, 123.asJson) -> "Duplicate disabled rule id: 123",
+      Json.arr(32768.asJson) -> "Invalid disabled rule id: 32768"
+    ).foreach { case (ids, reason) =>
+      val invalid = request.mapObject(_.add("parameters",
+        parameters.mapObject(_.add("disabledRules", ids))))
+      RentAuctionCli.prepare(invalid, chain).failed.get.getMessage should include(reason)
+    }
+  }
+
+  property("rule 123 disabled auctions the accounting token without a legacy payment") {
+    val vs = validation.updated(ErgoValidationSettingsUpdate(Seq(ValidationRules.txReemission), Seq()))
+    val request = accountingRequest.mapObject { fields =>
+      fields.add("parameters", fields("parameters").get.mapObject(
+        _.add("disabledRules", Json.arr(123.asJson))))
+    }
+    val plan = checkedJson(RentAuctionCli.prepare(request, chain).get, vs)
+    val debt = sigma.data.Digest32Coll @@ chain.reemission.reemissionTokenIdBytes
+    plan.transaction.outputs.filter(_.ergoTree == contracts.auction)
+      .flatMap(_.additionalTokens.toArray) should contain(debt -> 1000000L)
+    plan.transaction.outputs.exists(_.ergoTree == contracts.legacyDeposit) shouldBe false
+  }
 
   property("schema two collection vectors bundle fixed sources into two lots with collector returns") {
     // Explicit transaction ids/indices avoid dependence on the fixture's mutable box sequence.
@@ -42,7 +97,8 @@ class RentAuctionCliSpec extends ErgoCorePropertyTest
       "schemaVersion" -> 2.asJson,
       "action" -> "collect".asJson,
       "height" -> 2100001.asJson,
-      "parameters" -> Json.obj("storageFeeFactor" -> 1250000.asJson, "minValuePerByte" -> 360.asJson),
+      "parameters" -> Json.obj("disabledRules" -> Json.arr(),
+        "storageFeeFactor" -> 1250000.asJson, "minValuePerByte" -> 360.asJson),
       "sources" -> sources.asJson,
       "funding" -> Vector(funding).asJson,
       "beneficiary" -> Base16.encode(owner.bytes).asJson,
@@ -57,7 +113,7 @@ class RentAuctionCliSpec extends ErgoCorePropertyTest
     auctions.foreach { lot =>
       lot.additionalRegisters(ErgoBox.R9).value.asInstanceOf[sigma.Coll[Byte]].toArray shouldBe owner.bytes
     }
-    val rules = new RentAuctionRules(contracts, params)
+    val rules = new RentAuctionRules(contracts, params, validation)
     val claims = rules.claims(plan.transaction, plan.boxes, plan.height)
     claims.size shouldBe 4
     claims.foreach { case (_, rent) => rent.fullyConsumed shouldBe true }
@@ -68,18 +124,18 @@ class RentAuctionCliSpec extends ErgoCorePropertyTest
     }
   }
 
-  private def checkedJson(json: Json): RentAuctionPlan = {
+  private def checkedJson(json: Json, vs: ErgoValidationSettings = validation): RentAuctionPlan = {
     json.hcursor.get[Int]("schemaVersion").toTry.get shouldBe 2
     val tx = json.hcursor.get[ErgoTransaction]("emptyProofTransaction").toTry.get
     val boxes = json.hcursor.get[Vector[org.ergoplatform.ErgoBox]]("inputBoxes").toTry.get
     val at = json.hcursor.get[Int]("height").toTry.get
     val plan = RentAuctionPlan(tx, boxes, at)
-    native(plan).get should be > 0
+    native(plan, vs = vs).get should be > 0
     val active = chain.copy(rentAuctionActivationHeight = Some(1))
-    val ext = new RentAuctionRules(contracts, params)
+    val ext = new RentAuctionRules(contracts, params, vs)
       .extension(Seq(tx -> boxes), at, Blake2b256(owner.bytes))
     val lookup = boxes.map(b => Base16.encode(b.id) -> b).toMap
-    ErgoState.execTransactions(Seq(tx), context(at).copy()(active),
+    ErgoState.execTransactions(Seq(tx), context(at).copy(validationSettings = vs)(active),
       ErgoNodeTestConstants.settings.nodeSettings.copy(checkpoint = None), Some(ext)) { id =>
       Try(lookup(Base16.encode(id)))
     }.toTry.get should be > 0L
@@ -93,7 +149,7 @@ class RentAuctionCliSpec extends ErgoCorePropertyTest
     val request = Json.obj(
       "action" -> "collect".asJson,
       "height" -> height.asJson,
-      "parameters" -> Json.obj(
+      "parameters" -> Json.obj("disabledRules" -> Json.arr(),
         "storageFeeFactor" -> params.storageFeeFactor.asJson,
         "minValuePerByte" -> params.minValuePerByte.asJson),
       "sources" -> Vector(source).asJson,
@@ -103,7 +159,7 @@ class RentAuctionCliSpec extends ErgoCorePropertyTest
       "change" -> Base16.encode(anyone.bytes).asJson)
     val json = RentAuctionCli.prepare(request, chain).get
     checkedJson(json)
-    val expected = new RentAuctionTransactions(contracts, params, height)
+    val expected = new RentAuctionTransactions(contracts, params, height, validation)
       .collect(IndexedSeq(source), IndexedSeq(funding), owner, owner, anyone, 1000000L).get
     json.hcursor.get[String]("transactionId").toOption.get shouldBe
       expected.transaction.id
@@ -122,7 +178,8 @@ class RentAuctionCliSpec extends ErgoCorePropertyTest
       "schemaVersion" -> 2.asJson,
       "action" -> "collect".asJson,
       "height" -> height.asJson,
-      "parameters" -> Json.obj("storageFeeFactor" -> params.storageFeeFactor.asJson,
+      "parameters" -> Json.obj("disabledRules" -> Json.arr(),
+        "storageFeeFactor" -> params.storageFeeFactor.asJson,
         "minValuePerByte" -> params.minValuePerByte.asJson),
       "sources" -> Vector(imitation, source).asJson,
       "funding" -> Vector(box(30000000L)).asJson,
@@ -136,7 +193,7 @@ class RentAuctionCliSpec extends ErgoCorePropertyTest
     val accounting = json.hcursor.get[Vector[Json]]("auctionAccounting").toTry.get
     accounting.map(_.hcursor.get[String]("boxId").toTry.get) shouldBe
       auctions.map(b => Base16.encode(b.id))
-    new RentAuctionRules(contracts, params).claims(plan.transaction, plan.boxes, plan.height)
+    new RentAuctionRules(contracts, params, validation).claims(plan.transaction, plan.boxes, plan.height)
       .map(_._1) should contain(imitation)
   }
 
@@ -145,7 +202,8 @@ class RentAuctionCliSpec extends ErgoCorePropertyTest
       .failed.get.getMessage should include("height")
     val invalid = Json.obj("action" -> "bid".asJson,
       "height" -> height.asJson,
-      "parameters" -> Json.obj("storageFeeFactor" -> 1250000.asJson,
+      "parameters" -> Json.obj("disabledRules" -> Json.arr(),
+        "storageFeeFactor" -> 1250000.asJson,
         "minValuePerByte" -> 360.asJson),
       "auction" -> lot().asJson, "funding" -> Vector(box(30000000L)).asJson,
       "recipient" -> (Base16.encode(owner.bytes) + "00").asJson, "change" -> Base16.encode(anyone.bytes).asJson,
@@ -158,7 +216,8 @@ class RentAuctionCliSpec extends ErgoCorePropertyTest
     val lots = sourceTokens.map { case (id, amount) => Json.arr(Json.obj(
       "tokenId" -> Base16.encode(id.toArray).asJson, "amount" -> amount.asJson)) }
     val request = Json.obj("action" -> "collect".asJson, "height" -> height.asJson,
-      "parameters" -> Json.obj("storageFeeFactor" -> params.storageFeeFactor.asJson,
+      "parameters" -> Json.obj("disabledRules" -> Json.arr(),
+        "storageFeeFactor" -> params.storageFeeFactor.asJson,
         "minValuePerByte" -> params.minValuePerByte.asJson),
       "sources" -> collection.boxes.take(2).asJson, "funding" -> collection.boxes.drop(2).asJson,
       "beneficiary" -> Base16.encode(owner.bytes).asJson, "collector" -> Base16.encode(owner.bytes).asJson,
@@ -180,5 +239,6 @@ class RentAuctionCliSpec extends ErgoCorePropertyTest
       in.spendingProof.extension.values.keySet shouldBe Set(0.toByte, 1.toByte, 2.toByte)
     }
     RentAuctionCli.manifest(chain).hcursor.get[Int]("schemaVersion").toTry.get shouldBe 2
+    RentAuctionCli.manifest(chain).hcursor.get[Int]("votingLength").toTry.get shouldBe chain.voting.votingLength
   }
 }

@@ -7,6 +7,7 @@ import org.ergoplatform.UnsignedInput
 import org.ergoplatform.modifiers.mempool.ErgoTransaction
 import org.ergoplatform.modifiers.mempool.UnsignedErgoTransaction
 import org.ergoplatform.settings.Constants
+import org.ergoplatform.settings.ErgoValidationSettings
 import org.ergoplatform.settings.Parameters
 import org.ergoplatform.utils.BoxUtils
 import scorex.crypto.hash.Blake2b256
@@ -40,7 +41,8 @@ final case class RentAuctionPlan(
 final class RentAuctionTransactions(
   contracts: RentAuctionContracts,
   parameters: Parameters,
-  height: Int
+  height: Int,
+  validationSettings: ErgoValidationSettings
 ) {
   import RentAuctionContracts.CLOSE_ALLOWANCE
   import RentAuctionContracts.COLLECTOR_SHARE_DENOMINATOR
@@ -55,7 +57,7 @@ final class RentAuctionTransactions(
   import RentAuctionContracts.TOKENS_PER_LOT
   import RentAuctionContracts.WINDOW
 
-  private val rules = new RentAuctionRules(contracts, parameters)
+  private val rules = new RentAuctionRules(contracts, parameters, validationSettings)
   private type Tokens = Seq[(Digest32Coll, Long)]
 
   private def amount(n: BigInt): Long = {
@@ -147,6 +149,7 @@ final class RentAuctionTransactions(
     require(height <= Int.MaxValue - MAXIMUM_WINDOW, "Deadline would overflow")
     require(rules.validRecipient(Colls.fromArray(collector.bytes)), "Invalid collector script")
     tokenFree(funding)
+    val triggered = rules.redemptionTriggered(sources ++ funding, height)
     val outputs = ArrayBuffer.empty[ErgoBoxCandidate]
     val rent = scala.collection.mutable.Map.empty[Int, Short]
     val consumed = ArrayBuffer.empty[ErgoBox]
@@ -159,6 +162,9 @@ final class RentAuctionTransactions(
       require(charge > 0, "Legacy wrapping rent charge is non-positive; skip this box")
       require(outputs.size <= Short.MaxValue, "Too many recreation outputs")
       if (b.value > charge) {
+        require(!triggered || !b.tokens.contains(contracts.chain.reemission.reemissionTokenId),
+          "Funded source holds the EIP-27 accounting token while native redemption applies; " +
+            "its recreation must keep the token and redemption forbids it; skip this box")
         rent(index) = outputs.size.toShort
         outputs += out(b.value - charge, b.ergoTree,
           b.additionalTokens.toArray.toSeq, b.additionalRegisters)
@@ -192,10 +198,9 @@ final class RentAuctionTransactions(
         lotTokens, registers ++ Map(ErgoBox.R8 -> LongConstant(principal)))
     }
     outputs += funded(out(amount(rentAmount), beneficiary))
-    if (contracts.chain.reemission.checkReemissionRules &&
-      height > contracts.chain.reemission.activationHeight) {
+    if (triggered) {
       val debtId = contracts.chain.reemission.reemissionTokenId
-      val debt = sources.map(b => BigInt(b.tokens.getOrElse(debtId, 0L))).sum
+      val debt = (sources ++ funding).map(b => BigInt(b.tokens.getOrElse(debtId, 0L))).sum
       if (debt > 0) outputs += out(amount(debt), contracts.legacyDeposit)
     }
     finish(sources ++ funding, outputs.toIndexedSeq, change, fee,

@@ -722,7 +722,7 @@ object CandidateGenerator extends ScorexLogging {
           extensionCandidate
         } else {
           val rules = new RentAuctionRules(ergoSettings.chainSettings.rentAuctionContracts,
-            upcomingContext.currentParameters)
+            upcomingContext.currentParameters, upcomingContext.validationSettings)
           val withTransactions = state.withTransactions(transactions)
           val resolved = transactions.map(tx =>
             tx -> tx.inputs.flatMap(i => withTransactions.boxById(i.boxId)))
@@ -1034,7 +1034,7 @@ object CandidateGenerator extends ScorexLogging {
                     val extraCost = if (upcomingContext.chainSettings
                       .rentAuctionsActive(nextHeight)) {
                       new RentAuctionRules(upcomingContext.chainSettings.rentAuctionContracts,
-                        upcomingContext.currentParameters).cost(feeTx, boxesToSpend)
+                        upcomingContext.currentParameters, upcomingContext.validationSettings).cost(feeTx, boxesToSpend)
                     } else 0L
                     feeTx.statefulValidity(boxesToSpend, IndexedSeq(),
                       upcomingContext, extraCost)(verifier) match {

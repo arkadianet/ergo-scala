@@ -176,7 +176,7 @@ class RentAuctionContractSpec extends ErgoCorePropertyTest with RentAuctionFixtu
   }
 
   property("two sold auction inputs cannot share settlement slots tagged for the first input") {
-    val plan = new RentAuctionTransactions(contracts, params, height + WINDOW)
+    val plan = new RentAuctionTransactions(contracts, params, height + WINDOW, validation)
       .close(IndexedSeq(lot(MINIMUM_BID), lot(MINIMUM_BID)), 1000000L).get
     val spend = Spend(plan.transaction, plan.boxes, plan.height)
     spend.result.get should be > 0

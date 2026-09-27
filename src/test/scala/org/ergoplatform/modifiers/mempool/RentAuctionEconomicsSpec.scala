@@ -30,7 +30,7 @@ class RentAuctionEconomicsSpec extends ErgoCorePropertyTest with RentAuctionFixt
 
   private def activated(plan: RentAuctionPlan, p: Parameters): Try[Long] = Try {
     val active = chain.copy(rentAuctionActivationHeight = Some(1))
-    val rules = new RentAuctionRules(contracts, p)
+    val rules = new RentAuctionRules(contracts, p, validation)
     val extension = rules.extension(Seq(plan.transaction -> plan.boxes), plan.height, Blake2b256(owner.bytes))
     val lookup = plan.boxes.map(b => Base16.encode(b.id) -> b).toMap
     ErgoState.execTransactions(Seq(plan.transaction), context(plan.height).copy(currentParameters = p)(active),
@@ -41,7 +41,7 @@ class RentAuctionEconomicsSpec extends ErgoCorePropertyTest with RentAuctionFixt
 
   private def accepted(plan: RentAuctionPlan, p: Parameters): (Int, Long) = {
     val cost = native(plan, p).get
-    val extra = new RentAuctionRules(contracts, p).cost(plan.transaction, plan.boxes)
+    val extra = new RentAuctionRules(contracts, p, validation).cost(plan.transaction, plan.boxes)
     activated(plan, p).get shouldBe cost.toLong + extra
     (cost, extra)
   }
@@ -49,7 +49,7 @@ class RentAuctionEconomicsSpec extends ErgoCorePropertyTest with RentAuctionFixt
   private def collection(count: Int, p: Parameters): RentAuctionPlan = {
     val sources = tokens(count).map(t => box(1000000L, owner,
       height - Constants.StoragePeriod, Seq(t))).toIndexedSeq
-    new RentAuctionTransactions(contracts, p, height).collect(sources,
+    new RentAuctionTransactions(contracts, p, height, validation).collect(sources,
       IndexedSeq(box(100000000000L)), owner, owner, anyone, fee(p)).get
   }
 
@@ -62,12 +62,12 @@ class RentAuctionEconomicsSpec extends ErgoCorePropertyTest with RentAuctionFixt
         val opening = collection(count, p)
         val openingCost = accepted(opening, p)
         val fresh = opening.transaction.outputs.head
-        val first = new RentAuctionTransactions(contracts, p, height).bid(fresh,
+        val first = new RentAuctionTransactions(contracts, p, height, validation).bid(fresh,
           IndexedSeq(box(1000000000L)), RentAuctionContracts.MINIMUM_BID, recipient256, anyone, fee(p)).get
         val bidCost = accepted(first, p)
         Seq(false, true).foreach { sold =>
           val lot = if (sold) first.transaction.outputs.head else fresh
-          val closing = new RentAuctionTransactions(contracts, p, height + RentAuctionContracts.WINDOW)
+          val closing = new RentAuctionTransactions(contracts, p, height + RentAuctionContracts.WINDOW, validation)
             .close(IndexedSeq(lot), fee(p)).get
           val closeCost = accepted(closing, p)
           val returned = closing.transaction.outputs.head
@@ -101,7 +101,7 @@ class RentAuctionEconomicsSpec extends ErgoCorePropertyTest with RentAuctionFixt
 
   private def benchmark(label: String, plan: RentAuctionPlan, p: Parameters): Unit = {
     val costs = accepted(plan, p)
-    val rules = new RentAuctionRules(contracts, p)
+    val rules = new RentAuctionRules(contracts, p, validation)
     def run(): Unit = {
       // Decode anew so transaction-local lazy values cannot hide repeated validation work.
       val tx = ErgoTransactionSerializer.parseBytes(plan.transaction.bytes)
@@ -124,7 +124,7 @@ class RentAuctionEconomicsSpec extends ErgoCorePropertyTest with RentAuctionFixt
 
   property("measure a block-cost-filling collection, 32-lot sale close, and comparable plain transfer") {
     val p = priced(360)
-    val rules = new RentAuctionRules(contracts, p)
+    val rules = new RentAuctionRules(contracts, p, validation)
     def total(plan: RentAuctionPlan): Long = native(plan, p).fold({ error =>
       val reason = "Accumulated cost of block transactions should not exceed <maxBlockCost>"
       error.getMessage should include(reason)
@@ -154,12 +154,12 @@ class RentAuctionEconomicsSpec extends ErgoCorePropertyTest with RentAuctionFixt
     val sales = (1 to 32).map { _ =>
       val opened = collection(1, p)
       accepted(opened, p)
-      val bid = new RentAuctionTransactions(contracts, p, height).bid(opened.transaction.outputs.head,
+      val bid = new RentAuctionTransactions(contracts, p, height, validation).bid(opened.transaction.outputs.head,
         IndexedSeq(box(1000000000L)), RentAuctionContracts.MINIMUM_BID, recipient256, anyone, fee(p)).get
       accepted(bid, p)
       bid.transaction.outputs.head
     }.toIndexedSeq
-    val closed = new RentAuctionTransactions(contracts, p, height + RentAuctionContracts.WINDOW).close(sales, fee(p)).get
+    val closed = new RentAuctionTransactions(contracts, p, height + RentAuctionContracts.WINDOW, validation).close(sales, fee(p)).get
     benchmark("close32", closed, p)
 
     Seq("collection" -> largest, "close32" -> closed).foreach { case (label, plan) =>

@@ -22,7 +22,7 @@ import scala.util.Try
   * Does not exercise PoW, history, mempool or persistent state application.
   */
 class RentAuctionBlockSpec extends ErgoCorePropertyTest with RentAuctionFixture {
-  private lazy val rules = new RentAuctionRules(contracts, params)
+  private lazy val rules = new RentAuctionRules(contracts, params, validation)
 
   private def executeBlockTransactions(
     txs: Seq[ErgoTransaction],
@@ -53,7 +53,7 @@ class RentAuctionBlockSpec extends ErgoCorePropertyTest with RentAuctionFixture 
     val source = box(1000000L, nobody, height - Constants.StoragePeriod,
       Seq(token -> 100L))
     val sponsor = box(100000000L)
-    val collection = new RentAuctionTransactions(contracts, params, height)
+    val collection = new RentAuctionTransactions(contracts, params, height, validation)
       .collect(IndexedSeq(source), IndexedSeq(sponsor), owner, owner, anyone, 1000000L).get
     val collect = collection.transaction
     val first = bidSpend(collect.outputs.head, RentAuctionContracts.MINIMUM_BID)
@@ -119,7 +119,7 @@ class RentAuctionBlockSpec extends ErgoCorePropertyTest with RentAuctionFixture 
     def withdraw(b: ErgoBox): ErgoTransaction = transaction(IndexedSeq(b),
       IndexedSeq(output(b.value - reward, contracts.reserve, tokens = Seq(nft -> 1L)),
         output(reward, miner)))
-    val builder = new RentAuctionTransactions(contracts, params, height)
+    val builder = new RentAuctionTransactions(contracts, params, height, validation)
     val rewardTx = withdraw(reserve)
     val merge = builder.merge(rewardTx.outputs.head, IndexedSeq(deposit)).get
     executeBlockTransactions(Seq(rewardTx, merge.transaction),
