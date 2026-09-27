@@ -19,7 +19,9 @@ class OperatorHttpTests(unittest.TestCase):
         self.live = {"boxId": self.box_id, "value": 9007199254740993,
                      "ergoTree": "00", "creationHeight": 1, "assets": [],
                      "additionalRegisters": {}}
-        self.signed = {"id": "cd" * 32, "inputs": [{"boxId": self.box_id}],
+        self.extensions = {"127": "0300", "0": "0400", "1": "0580897a", "2": "04d005"}
+        self.signed = {"id": "cd" * 32, "inputs": [{"boxId": self.box_id,
+                       "spendingProof": {"proofBytes": "", "extension": self.extensions}}],
                        "outputs": []}
         owner = self
 
@@ -63,15 +65,15 @@ class OperatorHttpTests(unittest.TestCase):
         self.server.server_close()
 
     def plan(self):
-        return {"height": 101, "inputBoxes": [self.live],
+        return {"schemaVersion": 2, "height": 101, "inputBoxes": [self.live],
                 "transactionId": self.signed["id"],
                 "signingRequest": {"tx": {"inputs": [{"boxId": self.box_id,
-                    "extension": {"127": "0400"}}]}, "inputsRaw": ["00"],
+                    "extension": self.extensions}]}, "inputsRaw": ["00"],
                     "dataInputsRaw": []}}
 
     def test_live_parameters_and_boxes_replace_stale_offline_values(self):
         request = ra.make_request(self.node, "collect", {
-            "height": 1, "parameters": {}, "sources": [dict(self.live, value=1)]})
+            "collector": "00", "height": 1, "parameters": {}, "sources": [dict(self.live, value=1)]})
         self.assertEqual(request["height"], 101)
         self.assertEqual(request["parameters"]["storageFeeFactor"], 1250000)
         self.assertEqual(request["sources"][0]["value"], 9007199254740993)
@@ -79,7 +81,7 @@ class OperatorHttpTests(unittest.TestCase):
     def test_wallet_receives_extensions_and_raw_inputs_unchanged(self):
         plan = self.plan()
         self.assertEqual(ra.sign_plan(self.node, plan), self.signed)
-        self.assertEqual(self.calls[-1], (
+        self.assertEqual(next(c for c in self.calls if c[0] == "/wallet/transaction/sign"), (
             "/wallet/transaction/sign", plan["signingRequest"], "test-api-key"))
 
     def test_lithos_header_key_and_transaction_array_are_preserved(self):
@@ -107,7 +109,7 @@ class OperatorHttpTests(unittest.TestCase):
             with redirect_stdout(io.StringIO()):
                 ra.main(argv)
             self.assertEqual(ra.read_json(Path(directory) / "101.json"),
-                             {"height": 101, "transaction": self.signed})
+                             {"schemaVersion": 2, "height": 101, "transaction": self.signed})
 
     def test_broadcast_checks_before_submission(self):
         with tempfile.TemporaryDirectory() as directory:

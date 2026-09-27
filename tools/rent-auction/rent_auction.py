@@ -27,6 +27,26 @@ def write_json(path, value):
     temporary.replace(destination)
 
 
+class StalePlan(ValueError):
+    """Retry with a newly built transaction, never patch a signed transaction."""
+
+
+class SpentInput(StalePlan):
+    def __init__(self, box_id):
+        super().__init__(f"Input {box_id} unavailable; rebuild the batch")
+        self.box_id = box_id
+
+
+class NodeError(RuntimeError):
+    def __init__(self, path, status, detail):
+        super().__init__(f"Node {path}: HTTP {status}: {detail}")
+        self.status = status
+
+
+class BatchLimit(ValueError):
+    pass
+
+
 class Node:
     def __init__(self, url, api_key=None):
         parsed = urlparse(url)
@@ -56,7 +76,7 @@ class Node:
                 return json.loads(raw) if raw else None
         except HTTPError as error:
             detail = error.read(4096).decode(errors="replace")
-            raise RuntimeError(f"Node {path}: HTTP {error.code}: {detail}") from error
+            raise NodeError(path, error.code, detail) from error
 
     def canonical_id(self, height):
         # Ergo's HeadersProcessor puts the best-header-chain id first.
@@ -68,7 +88,12 @@ class Node:
     def box(self, box_id):
         if not isinstance(box_id, str) or not re.fullmatch(r"[0-9a-fA-F]{64}", box_id):
             raise ValueError("Box id must contain exactly 32 hexadecimal bytes")
-        return self.request(f"/utxo/withPool/byId/{box_id}")
+        try:
+            return self.request(f"/utxo/withPool/byId/{box_id}")
+        except NodeError as error:
+            if error.status == 404:
+                raise SpentInput(box_id) from error
+            raise
 
 
 class Index:
@@ -213,87 +238,211 @@ def current_parameters(node):
     }
 
 
+def require_schema2(value):
+    if value.get("schemaVersion") != 2:
+        raise ValueError("Expected schemaVersion 2; rebuild with the current Scala CLI")
+
+
+def ensure_current(node, plan):
+    require_schema2(plan)
+    height, parameters = current_parameters(node)
+    if height != plan["height"] or parameters != plan.get("operatorParameters", parameters):
+        raise StalePlan("Height or parameters changed; rebuild the batch")
+
+
+def verify_signed(plan, signed):
+    if signed["id"] != plan["transactionId"]:
+        raise ValueError("Wallet changed the transaction being signed")
+    expected = plan["signingRequest"]["tx"]["inputs"]
+    actual = signed["inputs"]
+    if len(actual) != len(expected) or any(
+            a["boxId"] != e["boxId"] or
+            a["spendingProof"]["extension"] != e["extension"]
+            for a, e in zip(actual, expected)):
+        raise ValueError("Wallet changed input order or context extensions")
+
+
 def sign_plan(node, plan):
     # Resolve again immediately before signing; never trust a stale index alone.
+    require_schema2(plan)
     for box in plan["inputBoxes"]:
         live = node.box(box["boxId"])
         if any(live.get(key) != box.get(key) for key in (
                 "boxId", "value", "ergoTree", "creationHeight", "assets",
                 "additionalRegisters", "transactionId", "index")):
-            raise ValueError("Input changed or was spent; rebuild the transaction")
+            raise StalePlan("Input changed or was spent; rebuild the transaction")
+    ensure_current(node, plan)
     signed = node.request("/wallet/transaction/sign", plan["signingRequest"])
-    if signed["id"] != plan["transactionId"]:
-        raise ValueError("Wallet changed the transaction being signed")
+    verify_signed(plan, signed)
+    ensure_current(node, plan)
     return signed
 
 
 def make_request(node, action, fields):
+    if fields.get("schemaVersion", 2) != 2:
+        raise ValueError("Only schemaVersion 2 requests are supported")
+    if action not in ("collect", "bid", "close", "merge", "inspect"):
+        raise ValueError("Expected collect, bid, close, merge, or inspect")
+    if action == "collect" and not fields.get("collector"):
+        raise ValueError("Collection requires the collector return ErgoTree")
     height, parameters = current_parameters(node)
-    request = dict(fields, action=action, height=height, parameters=parameters)
+    request = dict(fields, schemaVersion=2, action=action, height=height, parameters=parameters)
     for name in ("auction", "reserve", "sponsor"):
         if request.get(name) is not None:
             value = request[name]
             request[name] = node.box(value if isinstance(value, str) else value["boxId"])
-    for name in ("sources", "funding", "deposits"):
+    for name in ("sources", "funding", "deposits", "auctions"):
         if name in request:
             request[name] = [node.box(b if isinstance(b, str) else b["boxId"])
                              for b in request[name]]
     return request
 
 
-def settle_due(node, index, builder, closer, output_dir, execute=False):
+def prepare_current(node, builder, action, fields):
+    request = make_request(node, action, fields)
+    if action == "close" and request.get("fee") is None:
+        # Use the same parameter snapshot as the builder, including during a vote transition.
+        request["fee"] = 1000000 if request["parameters"]["minValuePerByte"] <= 360 else 2000000
+    try:
+        plan = builder.run("prepare", request)
+    except (RuntimeError, ValueError) as error:
+        height, parameters = current_parameters(node)
+        if height != request["height"] or parameters != request["parameters"]:
+            raise StalePlan("Height or parameters changed during preparation; rebuild the batch") from error
+        raise
+    require_schema2(plan)
+    plan["operatorParameters"] = request["parameters"]
+    ensure_current(node, plan)
+    return plan
+
+
+def batch_fits(node, plan, max_bytes=None, max_cost=None):
+    parameters = node.request("/info")["parameters"]
+    byte_limit = min(parameters["maxBlockSize"], max_bytes or parameters["maxBlockSize"])
+    cost_limit = min(parameters["maxBlockCost"], max_cost or parameters["maxBlockCost"])
+    # Conservative operator admission, not a second protocol serializer/cost interpreter.
+    # JSON bounds wire size; reserve a quarter of the cost budget for native script validation.
+    size = len(json.dumps(plan["emptyProofTransaction"], separators=(",", ":")).encode())
+    if size > byte_limit or 4 * plan["additionalValidationCost"] > 3 * cost_limit:
+        raise BatchLimit("Batch exceeds JSON byte budget or additional-cost budget with native headroom")
+
+
+def publish_plan(node, plan, output_dir, execute):
+    ensure_current(node, plan)
+    if execute:
+        signed = sign_plan(node, plan)
+        try:
+            node.request("/transactions/check", signed)
+        except NodeError as error:
+            detail = str(error).lower()
+            if error.status == 400 and ("cost" in detail or "size" in detail) and (
+                    "exceed" in detail or "too large" in detail):
+                raise BatchLimit(str(error)) from error
+            if error.status == 400 and any(word in detail for word in (
+                    "not enough boxes", "missing boxes", "spent", "not found")):
+                raise StalePlan(str(error)) from error
+            raise
+        ensure_current(node, plan)
+    path = Path(output_dir) / (plan["transactionId"] + ".json")
+    write_json(path, plan)
+    if execute:
+        # Keep the plan/id on disk before submission; a timeout has an ambiguous outcome.
+        # Never retry submission automatically, even if the node may have accepted it.
+        node.request("/transactions", signed)
+    return {"plan": str(path), "transactionId": plan["transactionId"], "sent": execute}
+
+
+def settle_due(node, index, builder, output_dir, execute=False, fee=None,
+               max_bytes=None, max_cost=None):
     manifest = builder.run("manifest")
+    require_schema2(manifest)
     height, parameters = current_parameters(node)
     boxes = index.boxes(tree=manifest["auction"]["ergoTree"])
     rows = []
     for offset in range(0, len(boxes), 100):
-        rows.extend(builder.run("prepare", {"action": "inspect", "height": height,
-            "parameters": parameters, "boxes": boxes[offset:offset + 100]})["boxes"])
+        inspected = builder.run("prepare", {"schemaVersion": 2, "action": "inspect", "height": height,
+            "parameters": parameters, "boxes": boxes[offset:offset + 100]})
+        require_schema2(inspected)
+        rows.extend(inspected["boxes"])
+    pending = sorted(r["boxId"] for r in rows if r["deadline"] is not None and r["deadline"] <= height)
     results = []
-    for row in rows:
-        if row["deadline"] is None or row["deadline"] > height:
-            continue
-        try:
-            request = make_request(node, "settle", {
-                "auction": row["boxId"], "closer": closer, "funding": []})
-            plan = builder.run("prepare", request)
-            path = Path(output_dir) / (row["boxId"] + ".json")
-            write_json(path, plan)
-            if execute:
-                signed = sign_plan(node, plan)
-                node.request("/transactions/check", signed)
-                node.request("/transactions", signed)
-            results.append({"boxId": row["boxId"], "plan": str(path), "sent": execute})
-        except (RuntimeError, ValueError) as error:
-            results.append({"boxId": row["boxId"], "error": str(error)})
+    while pending:
+        batch = pending[:min(32, manifest["maxCloseLots"])]
+        retries = 0
+        while batch:
+            try:
+                plan = prepare_current(node, builder, "close", {"auctions": batch, "fee": fee})
+                batch_fits(node, plan, max_bytes, max_cost)
+                result = publish_plan(node, plan, output_dir, execute)
+                results.append(dict(result, auctions=batch))
+                pending = [i for i in pending if i not in batch]
+                break
+            except BatchLimit as error:
+                if len(batch) == 1:
+                    results.append({"auctions": batch, "error": str(error)})
+                    pending.remove(batch[0])
+                    break
+                batch = batch[:len(batch) // 2]
+            except SpentInput as error:
+                results.append({"boxId": error.box_id, "skipped": "spent; rebuilding remaining batch"})
+                pending.remove(error.box_id)
+                batch = [i for i in batch if i != error.box_id]
+            except StalePlan as error:
+                retries += 1
+                if retries >= 3:
+                    results.append({"auctions": pending, "error": str(error)})
+                    return results
+            except (RuntimeError, ValueError) as error:
+                results.append({"auctions": pending, "error": str(error)})
+                return results
     return results
 
 
 def merge_due(node, index, builder, output_dir, execute=False):
     manifest = builder.run("manifest")
+    require_schema2(manifest)
     reserves = [b for b in index.boxes(tree=manifest["reserve"]["ergoTree"])
                 if b.get("assets") and b["assets"][0]["tokenId"] == manifest["reserveNft"]
                 and b["assets"][0]["amount"] == 1]
     if len(reserves) != 1:
         raise ValueError("Index must contain exactly one authentic reserve; sync first")
-    deposits = index.boxes(tree=manifest["deposit"]["ergoTree"])
-    reserve = reserves[0]
-    results = []
-    for offset in range(0, len(deposits), 10):
-        batch = deposits[offset:offset + 10]
-        request = make_request(node, "merge", {
-            "reserve": reserve["boxId"], "deposits": [b["boxId"] for b in batch]})
-        plan = builder.run("prepare", request)
-        path = Path(output_dir) / (plan["transactionId"] + ".json")
-        write_json(path, plan)
-        if execute:
-            signed = sign_plan(node, plan)
-            node.request("/transactions/check", signed)
-            node.request("/transactions", signed)
+    pending = sorted(b["boxId"] for b in index.boxes(tree=manifest["deposit"]["ergoTree"]))
+    reserve, results = reserves[0], []
+    retries = 0
+    while pending:
+        batch = pending[:manifest["maxMergeDeposits"]]
+        # Avoid stranding a singleton when two funded batches can consume the same set.
+        if len(pending) == len(batch) + 1 and len(batch) > 2:
+            batch = batch[:-1]
+        try:
+            plan = prepare_current(node, builder, "merge", {"reserve": reserve["boxId"], "deposits": batch})
+            result = publish_plan(node, plan, output_dir, execute)
+            results.append(dict(result, deposits=batch, fee=plan["feePaid"]))
+            pending = pending[len(batch):]
             reserve = plan["outputBoxes"][0]
-        results.append({"plan": str(path), "deposits": len(batch), "sent": execute})
-        if not execute:
-            # Subsequent batches depend on the first reserve successor existing.
+            retries = 0
+            if not execute:
+                if pending:
+                    results.append({"deferred": pending, "reason": "awaiting reserve successor"})
+                break
+        except SpentInput as error:
+            if error.box_id == reserve["boxId"]:
+                results.append({"deferred": pending, "reason": "reserve spent; sync and rebuild with the producer"})
+                break
+            pending.remove(error.box_id)
+            results.append({"boxId": error.box_id, "skipped": "spent; rebuilding remaining batch"})
+        except StalePlan as error:
+            retries += 1
+            if retries >= 3:
+                results.append({"deferred": pending, "reason": str(error)})
+                break
+        except (RuntimeError, ValueError) as error:
+            # The Scala builder calculates fee dust from the real serializer. Never guess it here.
+            if "dust" in str(error).lower():
+                results.append({"unfunded": batch, "mergeBudget": len(batch) * manifest["mergeBudget"],
+                    "reason": "native fee dust; wait for more deposits or prepare merge with a sponsor"})
+            else:
+                results.append({"deferred": pending, "reason": str(error)})
             break
     return results
 
@@ -329,7 +478,9 @@ def main(argv=None):
     queue.add_argument("signed")
     queue.add_argument("directory")
     worker = sub.add_parser("settle-due", help="Build due settlements and no-bid burns")
-    worker.add_argument("--closer", required=True, help="Closer's ErgoTree hex")
+    worker.add_argument("--fee", type=int, help="Total close fee; default 1m or 2m according to byte price")
+    worker.add_argument("--max-bytes", type=int, help="Operator JSON byte budget, capped by active block limit")
+    worker.add_argument("--max-cost", type=int, help="Operator cost budget including native headroom")
     worker.add_argument("--output-dir", default="settlements")
     worker.add_argument("--execute", action="store_true", help="Sign/check/broadcast plans")
     merger = sub.add_parser("merge-due", help="Merge confirmed auction proceeds in batches")
@@ -364,8 +515,8 @@ def main(argv=None):
                 elif args.command == "merge-due":
                     result = merge_due(node, index, builder, args.output_dir, args.execute)
                 else:
-                    result = settle_due(node, index, builder, args.closer,
-                                        args.output_dir, args.execute)
+                    result = settle_due(node, index, builder, args.output_dir, args.execute,
+                                        args.fee, args.max_bytes, args.max_cost)
         finally:
             index.close()
     elif args.command == "manifest":
@@ -376,8 +527,7 @@ def main(argv=None):
         if builder is None:
             raise ValueError("--jar is required")
         fields = read_json(args.request)
-        request = make_request(node, fields.pop("action"), fields)
-        result = builder.run("prepare", request)
+        result = prepare_current(node, builder, fields.pop("action"), fields)
         write_json(args.output, result)
         result = {"plan": args.output, "transactionId": result["transactionId"]}
     elif args.command == "sign":
@@ -390,13 +540,16 @@ def main(argv=None):
         result = node.request("/transactions", signed)
     elif args.command == "lithos-queue":
         plan, signed = read_json(args.plan), read_json(args.signed)
-        height, _ = current_parameters(node)
-        if plan["height"] != height or signed["id"] != plan["transactionId"]:
-            raise ValueError("Stale height or different signed transaction; rebuild")
+        ensure_current(node, plan)
+        verify_signed(plan, signed)
+        height = plan["height"]
+        if not any("127" in i["spendingProof"]["extension"] for i in signed["inputs"]):
+            raise ValueError("Lithos queue requires a rent collection")
         for box in plan["inputBoxes"]:
             node.box(box["boxId"])
+        ensure_current(node, plan)
         destination = Path(args.directory) / f"{height}.json"
-        write_json(destination, {"height": height, "transaction": signed})
+        write_json(destination, {"schemaVersion": 2, "height": height, "transaction": signed})
         result = {"queueFile": str(destination), "height": height}
     elif args.command == "candidate":
         txs = [read_json(path) for path in args.signed]

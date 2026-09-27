@@ -125,15 +125,19 @@ class OperatorTests(unittest.TestCase):
 
     def test_wallet_cannot_change_transaction_id(self):
         node = ra.Node("http://127.0.0.1")
-        plan = {"inputBoxes": [box("a")], "transactionId": "expected", "signingRequest": {}}
+        plan = {"schemaVersion": 2, "height": 101, "inputBoxes": [box("a")],
+                "transactionId": "expected", "signingRequest": {"tx": {"inputs": []}}}
         with patch.object(node, "box", return_value=box("a")), \
-                patch.object(node, "request", return_value={"id": "unexpected"}):
+                patch.object(node, "request", side_effect=[
+                    {"fullHeight": 100, "parameters": {"storageFeeFactor": 1250000, "minValuePerByte": 360}},
+                    {"id": "unexpected"}]):
             with self.assertRaises(ValueError):
                 ra.sign_plan(node, plan)
 
     def test_changed_input_stops_before_wallet_signing(self):
         node = ra.Node("http://127.0.0.1")
-        plan = {"inputBoxes": [box("a")], "transactionId": "expected", "signingRequest": {}}
+        plan = {"schemaVersion": 2, "height": 101, "inputBoxes": [box("a")],
+                "transactionId": "expected", "signingRequest": {"tx": {"inputs": []}}}
         with patch.object(node, "box", return_value=box("a", value=99)), \
                 patch.object(node, "request") as request:
             with self.assertRaises(ValueError):
@@ -147,6 +151,224 @@ class OperatorTests(unittest.TestCase):
             ra.write_json(target, expected)
             self.assertEqual(ra.read_json(target), expected)
             self.assertFalse(target.with_suffix(".json.tmp").exists())
+
+
+
+class WorkerNode:
+    """HTTP-free boundary double; no protocol-validity claims."""
+    def __init__(self, boxes=(), price=360):
+        self.boxes = {b["boxId"]: b for b in boxes}
+        self.height = 100
+        self.parameters = {"storageFeeFactor": 1250000, "minValuePerByte": price,
+                           "maxBlockSize": 524288, "maxBlockCost": 1000000}
+        self.calls = []
+
+    def box(self, box_id):
+        if box_id not in self.boxes:
+            raise ra.SpentInput(box_id)
+        return copy.deepcopy(self.boxes[box_id])
+
+    def request(self, path, data=None):
+        self.calls.append((path, data))
+        if path == "/info":
+            return {"fullHeight": self.height, "parameters": dict(self.parameters)}
+        if path == "/wallet/transaction/sign":
+            return self.signed
+        if path == "/transactions":
+            for b in data["outputs"]:
+                self.boxes[b["boxId"]] = b
+        return "accepted"
+
+
+class WorkerBuilder:
+    def __init__(self, node):
+        self.node, self.requests = node, []
+        self.manifest = {"schemaVersion": 2, "auction": {"ergoTree": "auction"},
+                         "deposit": {"ergoTree": "deposit"}, "reserve": {"ergoTree": "reserve"},
+                         "reserveNft": "nft", "maxCloseLots": 32, "maxMergeDeposits": 10,
+                         "mergeBudget": 1000000}
+        self.after_build = lambda: None
+
+    def run(self, command, request=None):
+        if command == "manifest":
+            return self.manifest
+        self.requests.append(copy.deepcopy(request))
+        if request["action"] == "inspect":
+            return {"schemaVersion": 2, "boxes": [dict(b, deadline=99) for b in request["boxes"]]}
+        members = request.get("auctions", request.get("deposits"))
+        count = len(members)
+        if request["action"] == "merge" and count == 1 and request["parameters"]["minValuePerByte"] == 10000:
+            raise RuntimeError("Scala builder failed: Output is dust")
+        inputs = ([request["reserve"]] if "reserve" in request else []) + members
+        ins = [{"boxId": b["boxId"], "extension": {"0": "0400", "1": "0580897a", "2": "04d005"}}
+               for b in inputs]
+        out = box("successor-" + members[0]["boxId"], tree="reserve", created=request["height"])
+        signed = {"id": members[0]["boxId"] + str(request["height"]),
+                  "inputs": [{"boxId": i["boxId"], "spendingProof": {
+                      "proofBytes": "", "extension": i["extension"]}} for i in ins], "outputs": [out]}
+        self.node.signed = signed
+        plan = {"schemaVersion": 2, "height": request["height"], "inputBoxes": inputs,
+                "transactionId": signed["id"], "emptyProofTransaction": signed,
+                "additionalValidationCost": 1000 * count, "feePaid": 1000000 * count,
+                "outputBoxes": [out], "signingRequest": {"tx": {"inputs": ins},
+                    "inputsRaw": ["00"] * len(ins), "dataInputsRaw": []}}
+        self.after_build()
+        return plan
+
+
+class BatchTests(unittest.TestCase):
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.index = ra.Index(":memory:")
+
+    def tearDown(self):
+        self.index.close()
+        self.directory.cleanup()
+
+    def lots(self, count, price=360):
+        boxes = [box(f"{i:064x}", tree="auction") for i in range(count)]
+        for b in reversed(boxes):
+            self.index._put(b)
+        node = WorkerNode(boxes, price)
+        return node, WorkerBuilder(node)
+
+    def deposits(self, count, price=10000):
+        boxes = [box(f"{i:064x}", tree="deposit") for i in range(count)]
+        reserve = dict(box("ff" * 32, tree="reserve"), assets=[{"tokenId": "nft", "amount": 1}])
+        for b in boxes + [reserve]:
+            self.index._put(b)
+        node = WorkerNode(boxes + [reserve], price)
+        return node, WorkerBuilder(node)
+
+    def test_close_batches_are_sorted_and_at_most_32_without_a_closer(self):
+        node, builder = self.lots(40)
+        result = ra.settle_due(node, self.index, builder, self.directory.name)
+        self.assertEqual([len(r["auctions"]) for r in result], [32, 8])
+        requests = [r for r in builder.requests if r["action"] == "close"]
+        self.assertEqual([b["boxId"] for r in requests for b in r["auctions"]], sorted(node.boxes))
+        self.assertTrue(all("closer" not in r and r["schemaVersion"] == 2 for r in requests))
+
+    def test_additional_cost_headroom_reduces_batches_deterministically(self):
+        node, builder = self.lots(20)
+        result = ra.settle_due(node, self.index, builder, self.directory.name, max_cost=20000)
+        self.assertEqual([len(r["auctions"]) for r in result], [10, 10])
+
+    def test_json_size_limit_reduces_batches_and_reports_unfit_singletons(self):
+        node, builder = self.lots(2)
+        result = ra.settle_due(node, self.index, builder, self.directory.name, max_bytes=1)
+        self.assertEqual(len(result), 2)
+        self.assertTrue(all("byte budget" in r["error"] for r in result))
+        attempted = [len(r["auctions"]) for r in builder.requests if r["action"] == "close"]
+        self.assertEqual(attempted, [2, 1, 1])
+
+    def test_stale_height_and_price_rebuild_the_whole_batch_before_signing(self):
+        node, builder = self.lots(2)
+        def advance_once():
+            node.height += 1
+            node.parameters["minValuePerByte"] = 10000
+            builder.after_build = lambda: None
+        builder.after_build = advance_once
+        result = ra.settle_due(node, self.index, builder, self.directory.name, execute=True)
+        self.assertEqual(result[0]["sent"], True)
+        requests = [r for r in builder.requests if r["action"] == "close"]
+        self.assertEqual([r["height"] for r in requests], [101, 102])
+        self.assertEqual([r["fee"] for r in requests], [1000000, 2000000])
+        self.assertEqual(len([c for c in node.calls if c[0] == "/transactions"]), 1)
+        self.assertEqual(len(list(Path(self.directory.name).glob("*.json"))), 1)
+
+    def test_spent_member_is_removed_and_remaining_lots_rebuilt(self):
+        node, builder = self.lots(3)
+        spent = sorted(node.boxes)[1]
+        del node.boxes[spent]
+        result = ra.settle_due(node, self.index, builder, self.directory.name)
+        self.assertEqual(result[0]["boxId"], spent)
+        self.assertEqual(result[1]["auctions"], sorted(node.boxes))
+
+    def test_native_cost_check_reduces_batch_before_broadcast(self):
+        node, builder = self.lots(4)
+        request = node.request
+        def check(path, data=None):
+            if path == "/transactions/check" and len(data["inputs"]) > 2:
+                raise ra.NodeError(path, 400, "Accumulated cost should not exceed maxBlockCost")
+            return request(path, data)
+        with patch.object(node, "request", side_effect=check):
+            result = ra.settle_due(node, self.index, builder, self.directory.name, execute=True)
+        self.assertEqual([len(r["auctions"]) for r in result], [2, 2])
+        self.assertEqual(len([c for c in node.calls if c[0] == "/transactions"]), 2)
+
+    def test_ambiguous_broadcast_failure_is_not_retried(self):
+        node, builder = self.lots(2)
+        request = node.request
+        attempts = []
+        def uncertain(path, data=None):
+            if path == "/transactions":
+                attempts.append(data)
+                raise RuntimeError("connection lost after submission")
+            return request(path, data)
+        with patch.object(node, "request", side_effect=uncertain):
+            result = ra.settle_due(node, self.index, builder, self.directory.name, execute=True)
+        self.assertEqual(len(attempts), 1)
+        self.assertIn("connection lost", result[0]["error"])
+
+    def test_serialized_short_and_all_close_variables_survive_wallet_signing(self):
+        node, builder = self.lots(1)
+        plan = ra.prepare_current(node, builder, "close", {"auctions": sorted(node.boxes)})
+        # Transport test only: opaque serialized values are never reconstructed in Python.
+        plan["signingRequest"]["tx"]["inputs"][0]["extension"]["127"] = "0300"
+        expected = copy.deepcopy(plan["signingRequest"])
+        ra.sign_plan(node, plan)
+        self.assertEqual(next(data for path, data in node.calls if path == "/wallet/transaction/sign"), expected)
+        self.assertEqual(set(expected["tx"]["inputs"][0]["extension"]), {"0", "1", "2", "127"})
+
+    def test_merge_fee_is_native_and_unfunded_remainder_is_explicit(self):
+        node, builder = self.deposits(1)
+        result = ra.merge_due(node, self.index, builder, self.directory.name, execute=True)
+        self.assertEqual(result[0]["unfunded"], [f"{0:064x}"])
+        self.assertEqual(result[0]["mergeBudget"], 1000000)
+        self.assertEqual(len([c for c in node.calls if c[0] == "/transactions"]), 0)
+
+    def test_merge_batches_avoid_an_unnecessary_unfunded_singleton(self):
+        node, builder = self.deposits(11)
+        result = ra.merge_due(node, self.index, builder, self.directory.name, execute=True)
+        self.assertEqual([len(r["deposits"]) for r in result], [9, 2])
+        self.assertEqual([r["fee"] for r in result], [9000000, 2000000])
+        requests = [r for r in builder.requests if r["action"] == "merge"]
+        self.assertNotEqual(requests[0]["reserve"]["boxId"], requests[1]["reserve"]["boxId"])
+
+    def test_dry_run_defers_dependent_merges_and_never_reuses_old_reserve(self):
+        node, builder = self.deposits(12)
+        result = ra.merge_due(node, self.index, builder, self.directory.name)
+        self.assertEqual(len(result[1]["deferred"]), 2)
+        self.assertEqual(len([r for r in builder.requests if r["action"] == "merge"]), 1)
+
+    def test_spent_reserve_reports_producer_rebuild(self):
+        node, builder = self.deposits(2)
+        del node.boxes["ff" * 32]
+        result = ra.merge_due(node, self.index, builder, self.directory.name, execute=True)
+        self.assertIn("reserve spent", result[0]["reason"])
+        self.assertFalse(any(c[0] == "/transactions" for c in node.calls))
+
+    def test_collection_preserves_explicit_bundle_collector_and_large_amount(self):
+        node, _ = self.lots(20)
+        partition = [[{"tokenId": "ee" * 32, "amount": 9223372036854775807}]]
+        request = ra.make_request(node, "collect", {"sources": sorted(node.boxes),
+            "collector": "collector-tree", "lots": partition})
+        self.assertEqual(request["schemaVersion"], 2)
+        self.assertEqual(len(request["sources"]), 20)
+        self.assertEqual(request["collector"], "collector-tree")
+        self.assertEqual(request["lots"], partition)
+        with self.assertRaisesRegex(ValueError, "collector"):
+            ra.make_request(node, "collect", {"sources": []})
+        with self.assertRaisesRegex(ValueError, "schemaVersion 2"):
+            ra.make_request(node, "collect", {"schemaVersion": 1})
+
+    def test_wallet_cannot_strip_extensions_even_when_claiming_the_same_id(self):
+        node, builder = self.lots(1)
+        plan = ra.prepare_current(node, builder, "close", {"auctions": sorted(node.boxes)})
+        node.signed = copy.deepcopy(node.signed)
+        node.signed["inputs"][0]["spendingProof"]["extension"].pop("2")
+        with self.assertRaisesRegex(ValueError, "context extensions"):
+            ra.sign_plan(node, plan)
 
 
 if __name__ == "__main__":

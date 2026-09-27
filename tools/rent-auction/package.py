@@ -22,6 +22,7 @@ NEW_FILES = [
     "src/test/scala/org/ergoplatform/tools/RentAuctionCliSpec.scala",
     "src/test/scala/org/ergoplatform/nodeView/state/RentAuctionStateSpec.scala",
     "src/test/scala/org/ergoplatform/modifiers/mempool/RentAuctionBlockSpec.scala",
+    "src/test/scala/org/ergoplatform/modifiers/mempool/RentAuctionEconomicsSpec.scala",
 ]
 
 

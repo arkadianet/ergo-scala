@@ -37,6 +37,7 @@ The queue contains one `HEIGHT.json` envelope:
 
 ```json
 {
+  "schemaVersion": 2,
   "height": 2100001,
   "transaction": { "id": "SIGNED_TRANSACTION_ID", "inputs": [], "outputs": [] }
 }
@@ -44,8 +45,18 @@ The queue contains one `HEIGHT.json` envelope:
 
 The transaction above is a schema illustration, not a valid claim. Generate the
 real file using `rent_auction.py lithos-queue PLAN SIGNED DIRECTORY`. That command
-preserves proofs/extensions and writes atomically. A single collection transaction
-can include multiple source boxes and lots.
+requires a schema-2 plan, preserves proofs/extensions and writes atomically. Prepare
+collections with an explicit `collector` ErgoTree as well as `beneficiary` and
+`change`. The Scala builder bundles tokens across fully consumed sources by default;
+optional `lots` partitions can separate valuable tokens. The fresh lot records the
+collector in R9 and the collection commitment in R4. Repeated var-127 output indices
+are valid for fully consumed inputs: they are baseline rent witnesses, not lot IDs.
+The adapter transports these fields without decoding or reassigning them.
+
+Only one collection is accepted per queue file. Ordinary bids, `auctions[]` batch
+closes and native-fee deposit merges use the node transaction path, not this queue.
+The operator's close worker sorts IDs, batches at most 32, and reduces batches by its
+byte/cost budgets. There is no `--closer`: the collector return is fixed in R9.
 
 The adapter reads asynchronously through Lithos's existing preparation worker,
 accepts only the requested height, limits files to 4 MiB, checks basic rent shape,
@@ -66,6 +77,18 @@ Rent pays the configured recipient directly. This first adapter does not create
 Lithos `CapitalEntry` records or automatically put rent into holding top-ups. No
 transaction in the queue is broadcast to the ordinary mempool by this adapter.
 
-Validation: the adapter was compiled inside the pinned real client, and its four
-queue/admission tests ran with 35 existing rent tests. A live pool/Stratum/lender
-deployment is a separate qualification step.
+The adapter suite has six transport/admission tests. Its fixture,
+`test/resources/rent-auction/schema2-collection.json`, is emitted by the node's
+`RentAuctionEconomicsSpec` after native `statefulValidity` and activated
+`ErgoState.execTransactions` both accept the collection. It contains twenty 114-byte
+aged P2PK sources, one True-script funding input, one 20-token lot with R9, and twenty
+identical `127: "0300"` extensions (serialized `ShortConstant(0)`). Empty proofs are
+valid for these aged sources and the True funding input; no wallet signature is
+fabricated. The adapter suite checks exact transaction JSON preservation.
+
+To regenerate the fixture, run the node's `testOnly *RentAuctionEconomicsSpec`, then
+copy `target/rent-auction-bundled-collection.json` into the fixture path in the pinned
+Lithos checkout. Re-run the three suites above and regenerate the patch, including
+this untracked fixture. The node test is consensus evidence; the Lithos tests only
+prove transport and admission. A live pool/Stratum/lender deployment remains a
+separate qualification step.
