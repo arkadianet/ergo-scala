@@ -1,0 +1,28 @@
+{
+  "createdUtc": "2026-09-27T08:40:45.848173+00:00",
+  "nodeBaseline": "5528ef569a41ebccbc8658212e6ee3c97d990b96",
+  "scalaTestsPassed": 158,
+  "scalaTestsIgnored": 1,
+  "pythonTestsPassed": 64,
+  "lithosTestsPassed": 41,
+  "lithosBaseline": "88bb1822022bf9521c281314c060a8943521d0f6",
+  "assemblyBuilt": true,
+  "commands": [
+    "set Test / parallelExecution := false",
+    "ergoCore/testOnly *RentAuction*Spec org.ergoplatform.reemission.ReemissionRulesSpec",
+    "testOnly *RentAuction*Spec org.ergoplatform.modifiers.mempool.ExpirationSpecification",
+    "ergoWallet/testOnly *ErgoProvingInterpreterSpec",
+    "testOnly *CandidateGeneratorSpec *CandidateGeneratorPropSpec *ErgoWalletServiceSpec",
+    "assembly"
+  ],
+  "limitations": [
+    "Synthetic UTXO snapshots and fake PoW",
+    "No mainnet activation or real-funds tests",
+    "No live Lithos pool/collateral-lender deployment",
+    "No independent security audit"
+  ],
+  "jar": "ergo-6.0.5-11-2a50d0f3-20260927-1839-SNAPSHOT.jar",
+  "jarSha256": "4305ec792416883f42c577e4577b1f8a1a7c69ca26da3dbac91733650c0c914e",
+  "standaloneCliMatchesScalaVector": true,
+  "sourceFingerprintSha256": "29d344ae537b857c1a74296e5a5118860c2b37d73ddbf82eb0b87e7dd8f4c310"
+}
