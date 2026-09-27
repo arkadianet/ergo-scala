@@ -56,7 +56,11 @@ trait UtxoStateReader extends ErgoStateReader with UtxoSetSnapshotPersistence {
 
     tx.statelessValidity().flatMap { _ =>
       val boxesToSpend = tx.inputs.flatMap(i => boxById(i.boxId))
-      val rules = if (context.chainSettings.rentAuctionsActive(context.currentHeight)) {
+      val dataBoxes = tx.dataInputs.flatMap(i => boxById(i.boxId))
+      // Rent rules pair boxes with inputs by position, so they run only when every input
+      // resolves; otherwise native validation reports the missing boxes (rules 113/114).
+      val rules = if (boxesToSpend.size == tx.inputs.size &&
+        context.chainSettings.rentAuctionsActive(context.currentHeight)) {
         Some(new RentAuctionRules(context.chainSettings.rentAuctionContracts,
           context.currentParameters, context.validationSettings))
       } else None
@@ -70,7 +74,7 @@ trait UtxoStateReader extends ErgoStateReader with UtxoSetSnapshotPersistence {
       else if (proposal.isLeft) Failure(new IllegalArgumentException(proposal.left.get))
       else tx.statefulValidity(
         boxesToSpend,
-        tx.dataInputs.flatMap(i => boxById(i.boxId)),
+        dataBoxes,
         context,
         accumulatedCost = extra)(verifier) match {
         case Success(txCost) if txCost > costLimit =>

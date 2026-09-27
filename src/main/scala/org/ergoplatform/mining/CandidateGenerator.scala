@@ -724,8 +724,14 @@ object CandidateGenerator extends ScorexLogging {
           val rules = new RentAuctionRules(ergoSettings.chainSettings.rentAuctionContracts,
             upcomingContext.currentParameters, upcomingContext.validationSettings)
           val withTransactions = state.withTransactions(transactions)
-          val resolved = transactions.map(tx =>
-            tx -> tx.inputs.flatMap(i => withTransactions.boxById(i.boxId)))
+          val resolved = transactions.map { tx =>
+            tx -> tx.inputs.map { i =>
+              withTransactions.boxById(i.boxId).getOrElse {
+                throw new IllegalArgumentException(
+                  s"Transaction ${tx.id}: missing input box ${Base16.encode(i.boxId)}")
+              }
+            }
+          }
           extensionCandidate ++ rules.extension(resolved,
             upcomingContext.currentHeight, rentBeneficiary)
         }

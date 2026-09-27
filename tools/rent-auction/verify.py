@@ -81,8 +81,10 @@ def verify_lithos_tree(checkout, patch):
             paths.add(record[3:])
             if "R" in record[:2] or "C" in record[:2]:
                 paths.add(next(records))
+    # Build output and the Play application log that running the Lithos tests writes.
     paths = {name for name in paths
-             if not {"target", ".bsp", ".idea"}.intersection(Path(name).parts)}
+             if not {"target", ".bsp", ".idea"}.intersection(Path(name).parts)
+             and Path(name).parts[0] != "logs"}
     with tempfile.TemporaryDirectory(prefix="rent-auction-lithos-") as directory:
         expected = Path(directory)
         archive = subprocess.check_output(["git", "archive", LITHOS_BASE], cwd=checkout)

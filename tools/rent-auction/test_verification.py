@@ -172,7 +172,7 @@ class LithosTests(RepositoryTests):
 
     def test_lithos_exact_patch_and_build_output_accepted_without_changes(self):
         for name in ("target/classes/new.class", "project/target/file", ".bsp/file", ".idea/file",
-                     "local.ignored"):
+                     "local.ignored", "logs/application.log"):
             self.write(name, "build output")
         before = self.git("status", "--porcelain", "--untracked-files=all")
         self.check_tree()

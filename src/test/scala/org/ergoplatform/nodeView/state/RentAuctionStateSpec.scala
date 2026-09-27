@@ -2,6 +2,7 @@ package org.ergoplatform.nodeView.state
 
 import java.nio.file.Files
 
+import org.ergoplatform.DataInput
 import org.ergoplatform.ErgoBox
 import org.ergoplatform.mining.CandidateGenerator
 import org.ergoplatform.modifiers.ErgoFullBlock
@@ -46,8 +47,11 @@ class RentAuctionStateSpec extends ErgoCorePropertyTest with RentAuctionFixture 
     val parent = sc.lastHeaderOpt.orElse(Some(
       defaultHeaderGen.sample.get.copy(height = height - 1)))
     val algorithms = new NipopowAlgos(chain)
+    // A block on the synthetic snapshot has no parent extension, so its interlinks are not
+    // validated; seeding them with the synthetic parent lets later blocks pass rule 402.
     val interlinks = algorithms.interlinksToExtension(
-      algorithms.updateInterlinks(sc.lastHeaderOpt, sc.lastExtensionOpt))
+      if (sc.lastHeaderOpt.isEmpty) parent.toSeq.map(_.id)
+      else algorithms.updateInterlinks(sc.lastHeaderOpt, sc.lastExtensionOpt))
     val extension = params.toExtensionCandidate ++
       sc.validationSettings.toExtensionCandidate ++ interlinks ++ rent
     val (proof, digest) = us.proofsForTransactions(txs).get
@@ -130,6 +134,89 @@ class RentAuctionStateSpec extends ErgoCorePropertyTest with RentAuctionFixture 
       chain.rentAuctionsActive(height) shouldBe false
       settings().chainSettings.rentAuctionsActive(height - 1) shouldBe false
       settings().chainSettings.rentAuctionsActive(height) shouldBe true
+    } finally us.store.close()
+  }
+
+  property("persistent states validate each block's own rent extension") {
+    val first = collectPlan()
+    val second = collectPlan(at = height + 1)
+    val ordinary = box(1000000L)
+    val noClaim = transaction(IndexedSeq(ordinary),
+      IndexedSeq(output(ordinary.value, h = height + 1)))
+    val s = settings()
+    val us = state(first.boxes ++ second.boxes :+ ordinary, s)
+    val ds = DigestState.recover(us.version, us.rootDigest, us.stateContext,
+      Files.createTempDirectory("rent-extension-digest-").toFile, s).get
+    val rules = new RentAuctionRules(contracts, params, validation)
+    val beneficiary = Blake2b256(owner.bytes)
+    val firstFields = rules.extension(Seq(first.transaction -> first.boxes),
+      height, beneficiary)
+    val secondFields = rules.extension(Seq(second.transaction -> second.boxes),
+      height + 1, beneficiary)
+    val emptyFields = ExtensionCandidate(Seq.empty)
+    val extensionError = "missing, duplicated or incorrect rent extension fields"
+    try {
+      val firstBlock = block(us, Seq(first.transaction), firstFields)
+      val nextU = us.applyModifier(firstBlock, None)(_ => ()).get
+      val nextD = ds.applyModifier(firstBlock, None)(_ => ()).get
+      nextU.stateContext.lastExtensionOpt.get.fields.exists {
+        case (key, _) => key.sameElements(RentAuctionRules.ATTESTATION_KEY)
+      } shouldBe true
+      nextD.stateContext.lastExtensionOpt.get.fields.exists {
+        case (key, _) => key.sameElements(RentAuctionRules.ATTESTATION_KEY)
+      } shouldBe true
+
+      def rejected(txs: Seq[ErgoTransaction], fields: ExtensionCandidate,
+        reason: String): Unit = {
+        val invalid = block(nextU, txs, fields)
+        nextU.applyModifier(invalid, None)(_ => ()).failed.get.getMessage should include(reason)
+        nextD.applyModifier(invalid, None)(_ => ()).failed.get.getMessage should include(reason)
+      }
+
+      // A claim without any rent fields fails the beneficiary check first.
+      rejected(Seq(second.transaction), emptyFields,
+        "rent requires a producer-designated beneficiary")
+      rejected(Seq(second.transaction), ExtensionCandidate(Seq(
+        RentAuctionRules.BENEFICIARY_KEY -> beneficiary)), extensionError)
+      rejected(Seq(second.transaction), firstFields, extensionError)
+      rejected(Seq(noClaim), firstFields, extensionError)
+
+      val valid = block(nextU, Seq(second.transaction), secondFields)
+      val finalU = nextU.applyModifier(valid, None)(_ => ()).get
+      val finalD = nextD.applyModifier(valid, None)(_ => ()).get
+      finalU.stateContext.currentHeight shouldBe height + 1
+      finalD.stateContext.currentHeight shouldBe height + 1
+      finalU.rootDigest.toSeq shouldBe finalD.rootDigest.toSeq
+    } finally {
+      us.store.close()
+      ds.close()
+    }
+  }
+
+  property("unresolved spending and data inputs keep the native rejection, not the rent policy") {
+    val plan = collectPlan()
+    val sc = context(height).copy()(settings().chainSettings)
+    plan.boxes.foreach { missing =>
+      val us = state(plan.boxes.filterNot(_.id.sameElements(missing.id)), settings())
+      try {
+        val failure = us.validateWithCost(plan.transaction, sc, params.maxBlockCost,
+          None).failed.get.getMessage
+        failure should include(plan.transaction.id)
+        failure should include("Every input of the transaction should be in UTXO")
+        failure should not include "Rent claims must be submitted"
+      } finally us.store.close()
+    }
+
+    val missing = box(1000000L)
+    val tx = ErgoTransaction(plan.transaction.inputs, IndexedSeq(DataInput(missing.id)),
+      plan.transaction.outputCandidates)
+    val us = state(plan.boxes, settings())
+    try {
+      // The rent policy admits the claim, so native validation reports the missing data box.
+      val failure = us.validateWithCost(tx, sc, params.maxBlockCost, None,
+        Some(Blake2b256(owner.bytes)), allowRent = true).failed.get.getMessage
+      failure should include(tx.id)
+      failure should include("Every data input of the transaction should be in UTXO")
     } finally us.store.close()
   }
 }

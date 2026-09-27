@@ -4,15 +4,20 @@ import org.ergoplatform.ErgoBox.{NonMandatoryRegisterId, R1}
 import org.ergoplatform._
 import org.ergoplatform.db.DBSpec
 import org.ergoplatform.modifiers.mempool.{ErgoTransaction, UnconfirmedTransaction}
+import org.ergoplatform.modifiers.mempool.UnsignedErgoTransaction
 import org.ergoplatform.nodeView.mempool.ErgoMemPoolReader
+import org.ergoplatform.nodeView.state.ErgoStateContext
+import org.ergoplatform.nodeView.state.VotingData
 import org.ergoplatform.nodeView.wallet.WalletScanLogic.ScanResults
 import org.ergoplatform.nodeView.wallet.persistence.{OffChainRegistry, WalletRegistry, WalletStorage}
 import org.ergoplatform.nodeView.wallet.requests.{AssetIssueRequest, BurnTokensRequest, PaymentRequest}
 import org.ergoplatform.nodeView.wallet.scanning.{EqualsScanningPredicate, ScanRequest, ScanWalletInteraction}
 import org.ergoplatform.sdk.SecretString
 import org.ergoplatform.sdk.wallet.secrets.{DerivationPath, ExtendedSecretKey}
+import org.ergoplatform.settings.Constants
 import org.ergoplatform.settings.Constants.TrueTree
 import org.ergoplatform.settings.ErgoSettings
+import org.ergoplatform.settings.Parameters
 import org.ergoplatform.utils.fixtures.WalletFixture
 import org.ergoplatform.utils.generators.ErgoNodeTransactionGenerators.validErgoTransactionGen
 import org.ergoplatform.utils.{ErgoCorePropertyTest, MempoolTestHelpers, WalletTestOps}
@@ -20,7 +25,9 @@ import org.ergoplatform.wallet.Constants.{PaymentsScanId, ScanId}
 import org.ergoplatform.wallet.boxes.BoxSelector.BoxSelectionResult
 import org.ergoplatform.wallet.boxes.{ErgoBoxSerializer, ReplaceCompactCollectBoxSelector, TrackedBox}
 import org.ergoplatform.wallet.crypto.ErgoSignature
+import org.ergoplatform.wallet.interpreter.ErgoInterpreter
 import org.ergoplatform.wallet.interpreter.ErgoProvingInterpreter
+import org.ergoplatform.wallet.interpreter.TransactionHintsBag
 import org.ergoplatform.wallet.mnemonic.Mnemonic
 import org.scalacheck.Gen
 import org.scalatest.BeforeAndAfterAll
@@ -28,6 +35,8 @@ import scorex.db.{LDBKVStore, LDBVersionedStore}
 import scorex.util.encode.Base16
 import sigma.Extensions.ArrayOps
 import sigma.ast.{ByteArrayConstant, EvaluatedValue, FalseLeaf, SType}
+import sigma.ast.ShortConstant
+import sigma.interpreter.ContextExtension
 import sigmastate.eval.Extensions._
 import sigmastate.helpers.TestingHelpers.testBox
 
@@ -72,6 +81,48 @@ class ErgoWalletServiceSpec
       maxInputsToUse = 1000,
       rescanInProgress = false
     )
+  }
+
+  property("rent signing uses the supplied upcoming parameters at a voting boundary") {
+    val epoch = settings.chainSettings.voting.votingLength
+    val nextHeight = (Constants.StoragePeriod / epoch + 2) * epoch
+    val signingChain = settings.chainSettings.copy(
+      rentAuctionActivationHeight = Some(nextHeight))
+    val parentParameters = new Parameters(nextHeight - epoch,
+      parameters.parametersTable.updated(Parameters.BlockVersion, 4), emptyVSUpdate)
+    val parent = new ErgoStateContext(
+      Seq(defaultHeaderGen.sample.get.copy(height = nextHeight - 1, version = 4)),
+      None, genesisStateDigest, parentParameters, validationSettings,
+      VotingData(Array(Parameters.StorageFeeFactorIncrease -> epoch)))(signingChain)
+    val upcoming = parent.simplifiedUpcoming()
+    val upcomingParameters = upcoming.currentParameters
+    upcoming.currentHeight shouldBe nextHeight
+    signingChain.rentAuctionsActive(nextHeight) shouldBe true
+    upcomingParameters.storageFeeFactor shouldBe
+      parentParameters.storageFeeFactor + Parameters.StorageFeeFactorStep
+
+    val source = testBox(1000000000L, Constants.FalseTree,
+      nextHeight - Constants.StoragePeriod)
+    val fee = upcomingParameters.storageFeeFactor * source.bytes.length
+    val recreation = new ErgoBoxCandidate(source.value - fee, source.ergoTree,
+      nextHeight, source.additionalTokens, source.additionalRegisters)
+    val payment = new ErgoBoxCandidate(fee.toLong, TrueTree, nextHeight)
+    val extension = ContextExtension(Map(Constants.StorageIndexVarId -> ShortConstant(0)))
+    val unsigned = UnsignedErgoTransaction(
+      IndexedSeq(new UnsignedInput(source.id, extension)),
+      IndexedSeq(recreation, payment))
+    val service = new ErgoWalletServiceImpl(settings)
+    def sign(p: Parameters): scala.util.Try[ErgoTransaction] =
+      service.signTransaction(None, unsigned, Seq.empty, TransactionHintsBag.empty,
+        Some(Seq(source)), Some(Seq.empty), p, upcoming)(_ => None)
+
+    sign(parentParameters).isFailure shouldBe true
+    val signed = sign(upcomingParameters).get
+    signed.inputs.head.spendingProof.proof shouldBe empty
+    signed.inputs.head.spendingProof.extension shouldBe extension
+    signed.statelessValidity().isSuccess shouldBe true
+    signed.statefulValidity(IndexedSeq(source), IndexedSeq.empty, upcoming)(
+      ErgoInterpreter(upcomingParameters)).isSuccess shouldBe true
   }
 
   property("restoring wallet should fail if pruning is enabled") {

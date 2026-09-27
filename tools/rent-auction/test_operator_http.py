@@ -73,7 +73,8 @@ class OperatorHttpTests(unittest.TestCase):
 
     def test_live_parameters_and_boxes_replace_stale_offline_values(self):
         request = ra.make_request(self.node, "collect", {
-            "collector": "00", "height": 1, "parameters": {}, "sources": [dict(self.live, value=1)]})
+            "collector": "00", "height": 1, "parameters": {},
+            "sources": [dict(self.live, value=1)]}, 1024)
         self.assertEqual(request["height"], 101)
         self.assertEqual(request["parameters"]["storageFeeFactor"], 1250000)
         self.assertEqual(request["parameters"]["disabledRules"], [])

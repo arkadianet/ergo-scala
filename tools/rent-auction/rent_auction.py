@@ -244,10 +244,14 @@ class Builder:
             return read_json(output)
 
 
-def current_parameters(node):
+def current_parameters(node, voting_length=None):
     info = node.request("/info")
+    height = info["fullHeight"] + 1
+    if voting_length is not None and height % voting_length == 0:
+        raise StalePlan(f"parameters may change at voting-epoch boundary height {height}; "
+                        "retry at the next block")
     parameters = info["parameters"]
-    return info["fullHeight"] + 1, {
+    return height, {
         "storageFeeFactor": parameters["storageFeeFactor"],
         "minValuePerByte": parameters["minValuePerByte"],
         "disabledRules": sorted(node.disabled_rules),
@@ -261,7 +265,7 @@ def require_schema2(value):
 
 def ensure_current(node, plan):
     require_schema2(plan)
-    height, parameters = current_parameters(node)
+    height, parameters = current_parameters(node, plan.get("votingLength"))
     if height != plan["height"] or parameters != plan.get("operatorParameters", parameters):
         raise StalePlan("Height or parameters changed; rebuild the batch")
 
@@ -294,14 +298,14 @@ def sign_plan(node, plan):
     return signed
 
 
-def make_request(node, action, fields):
+def make_request(node, action, fields, voting_length):
     if fields.get("schemaVersion", 2) != 2:
         raise ValueError("Only schemaVersion 2 requests are supported")
     if action not in ("collect", "bid", "close", "merge", "inspect"):
         raise ValueError("Expected collect, bid, close, merge, or inspect")
     if action == "collect" and not fields.get("collector"):
         raise ValueError("Collection requires the collector return ErgoTree")
-    height, parameters = current_parameters(node)
+    height, parameters = current_parameters(node, voting_length)
     request = dict(fields, schemaVersion=2, action=action, height=height, parameters=parameters)
     for name in ("auction", "reserve", "sponsor"):
         if request.get(name) is not None:
@@ -315,19 +319,23 @@ def make_request(node, action, fields):
 
 
 def prepare_current(node, builder, action, fields):
-    request = make_request(node, action, fields)
+    manifest = builder.run("manifest")
+    require_schema2(manifest)
+    voting_length = manifest["votingLength"]
+    request = make_request(node, action, fields, voting_length)
     if action == "close" and request.get("fee") is None:
-        # Use the same parameter snapshot as the builder, including during a vote transition.
+        # Fee selection and the builder use the same parameter snapshot.
         request["fee"] = 1000000 if request["parameters"]["minValuePerByte"] <= 360 else 2000000
     try:
         plan = builder.run("prepare", request)
     except (RuntimeError, ValueError) as error:
-        height, parameters = current_parameters(node)
+        height, parameters = current_parameters(node, voting_length)
         if height != request["height"] or parameters != request["parameters"]:
             raise StalePlan("Height or parameters changed during preparation; rebuild the batch") from error
         raise
     require_schema2(plan)
     plan["operatorParameters"] = request["parameters"]
+    plan["votingLength"] = voting_length
     ensure_current(node, plan)
     return plan
 
@@ -372,7 +380,7 @@ def settle_due(node, index, builder, output_dir, execute=False, fee=None,
                max_bytes=None, max_cost=None):
     manifest = builder.run("manifest")
     require_schema2(manifest)
-    height, parameters = current_parameters(node)
+    height, parameters = current_parameters(node, manifest["votingLength"])
     boxes = index.boxes(tree=manifest["auction"]["ergoTree"])
     rows = []
     for offset in range(0, len(boxes), 100):
@@ -529,11 +537,12 @@ def main(argv=None):
                 index.sync(node)
                 if args.command == "rent-candidates":
                     manifest = builder.run("manifest")
-                    height, parameters = current_parameters(node)
+                    require_schema2(manifest)
+                    height, parameters = current_parameters(node, manifest["votingLength"])
                     boxes = index.boxes(created_before=height - manifest["storagePeriod"])
                     rows = []
                     for offset in range(0, len(boxes), 100):
-                        rows.extend(builder.run("prepare", {"action": "inspect",
+                        rows.extend(builder.run("prepare", {"schemaVersion": 2, "action": "inspect",
                             "height": height, "parameters": parameters,
                             "boxes": boxes[offset:offset + 100]})["boxes"])
                     result = {"height": height, "boxes": rows}

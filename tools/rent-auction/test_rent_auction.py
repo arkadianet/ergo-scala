@@ -199,7 +199,7 @@ class WorkerBuilder:
         self.manifest = {"schemaVersion": 2, "auction": {"ergoTree": "auction"},
                          "deposit": {"ergoTree": "deposit"}, "reserve": {"ergoTree": "reserve"},
                          "reserveNft": "nft", "maxCloseLots": 32, "maxMergeDeposits": 10,
-                         "mergeBudget": 1000000}
+                         "mergeBudget": 1000000, "votingLength": 1024}
         self.after_build = lambda: None
 
     def run(self, command, request=None):
@@ -261,6 +261,67 @@ class BatchTests(unittest.TestCase):
         requests = [r for r in builder.requests if r["action"] == "close"]
         self.assertEqual([b["boxId"] for r in requests for b in r["auctions"]], sorted(node.boxes))
         self.assertTrue(all("closer" not in r and r["schemaVersion"] == 2 for r in requests))
+
+    def test_preparation_defers_every_action_at_manifest_voting_boundary(self):
+        node, builder = self.lots(1)
+        builder.manifest["votingLength"] = 17
+        node.height = 101
+        reason = "parameters may change at voting-epoch boundary height 102; retry at the next block"
+        for action in ("collect", "bid", "close", "merge", "inspect"):
+            with self.subTest(action=action), self.assertRaisesRegex(ra.StalePlan, reason):
+                ra.prepare_current(node, builder, action, {"collector": "collector-tree"})
+        self.assertEqual(builder.requests, [])
+
+    def test_parameters_are_available_on_either_side_of_voting_boundary(self):
+        node, builder = self.lots(1)
+        builder.manifest["votingLength"] = 17
+        for parent_height, price, storage_fee in ((100, 360, 1250000), (102, 400, 1275000)):
+            node.height = parent_height
+            node.parameters.update(minValuePerByte=price, storageFeeFactor=storage_fee)
+            plan = ra.prepare_current(node, builder, "close", {"auctions": sorted(node.boxes)})
+            self.assertEqual(plan["height"], parent_height + 1)
+            self.assertEqual(plan["votingLength"], 17)
+            self.assertEqual(plan["operatorParameters"]["minValuePerByte"], price)
+            self.assertEqual(plan["operatorParameters"]["storageFeeFactor"], storage_fee)
+            ra.ensure_current(node, plan)
+
+    def test_settlement_defers_before_inspection_at_voting_boundary(self):
+        node, builder = self.lots(1)
+        node.height = builder.manifest["votingLength"] - 1
+        with self.assertRaisesRegex(ra.StalePlan, "voting-epoch boundary height 1024"):
+            ra.settle_due(node, self.index, builder, self.directory.name, execute=True)
+        self.assertEqual(builder.requests, [])
+        self.assertFalse(any(path != "/info" for path, _ in node.calls))
+
+    def test_rent_candidate_listing_defers_before_inspection_at_voting_boundary(self):
+        node, builder = self.lots(1)
+        node.height = builder.manifest["votingLength"] - 1
+        with patch.object(ra, "Node", return_value=node), \
+                patch.object(ra, "Builder", return_value=builder), \
+                patch.object(ra.Index, "sync"), \
+                self.assertRaisesRegex(ra.StalePlan, "voting-epoch boundary height 1024"):
+            ra.main(["--disabled-rules", "none", "--jar", "unused.jar", "--db",
+                     str(Path(self.directory.name) / "listing.sqlite"), "rent-candidates"])
+        self.assertEqual(builder.requests, [])
+
+    def test_merge_defers_without_preparing_or_signing_at_voting_boundary(self):
+        node, builder = self.deposits(2)
+        node.height = builder.manifest["votingLength"] - 1
+        result = ra.merge_due(node, self.index, builder, self.directory.name, execute=True)
+        self.assertEqual(result[0]["deferred"], [f"{i:064x}" for i in range(2)])
+        self.assertIn("voting-epoch boundary height 1024", result[0]["reason"])
+        self.assertEqual(builder.requests, [])
+        self.assertFalse(any(path != "/info" for path, _ in node.calls))
+
+    def test_boundary_reached_during_preparation_stops_before_signing(self):
+        node, builder = self.lots(1)
+        builder.manifest["votingLength"] = 102
+        builder.after_build = lambda: setattr(node, "height", 101)
+        result = ra.settle_due(node, self.index, builder, self.directory.name, execute=True)
+        self.assertIn("voting-epoch boundary height 102", result[0]["error"])
+        self.assertEqual(len([r for r in builder.requests if r["action"] == "close"]), 1)
+        self.assertFalse(any(path != "/info" for path, _ in node.calls))
+        self.assertEqual(list(Path(self.directory.name).glob("*.json")), [])
 
     def test_additional_cost_headroom_reduces_batches_deterministically(self):
         node, builder = self.lots(20)
@@ -406,15 +467,15 @@ class BatchTests(unittest.TestCase):
         node, _ = self.lots(20)
         partition = [[{"tokenId": "ee" * 32, "amount": 9223372036854775807}]]
         request = ra.make_request(node, "collect", {"sources": sorted(node.boxes),
-            "collector": "collector-tree", "lots": partition})
+            "collector": "collector-tree", "lots": partition}, 1024)
         self.assertEqual(request["schemaVersion"], 2)
         self.assertEqual(len(request["sources"]), 20)
         self.assertEqual(request["collector"], "collector-tree")
         self.assertEqual(request["lots"], partition)
         with self.assertRaisesRegex(ValueError, "collector"):
-            ra.make_request(node, "collect", {"sources": []})
+            ra.make_request(node, "collect", {"sources": []}, 1024)
         with self.assertRaisesRegex(ValueError, "schemaVersion 2"):
-            ra.make_request(node, "collect", {"schemaVersion": 1})
+            ra.make_request(node, "collect", {"schemaVersion": 1}, 1024)
 
     def test_wallet_cannot_strip_extensions_even_when_claiming_the_same_id(self):
         node, builder = self.lots(1)
