@@ -107,6 +107,9 @@ class DeliveryTracker(cacheSettings: NetworkCacheSettings,
     else if (!NetworkObjectTypeId.isTypeKnown(modifierTypeId)) UnknownStatus
     else Unknown
 
+  def receivedFrom(id: ModifierId, typeId: NetworkObjectTypeId.Value): Option[ConnectedPeer] =
+    received.get(typeId).flatMap(_.get(id))
+
   // Write ERR message about incorrect transition into the log, so devs will find it eventually
   private def checkStatusTransition(oldStatus: ModifiersStatus, expectedStatues: ModifiersStatus): Unit = {
     if (!isCorrectTransition(oldStatus, expectedStatues)) {
